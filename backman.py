@@ -258,6 +258,42 @@ def _dir_size_bytes(path: str) -> Tuple[Optional[int], str]:
 
     return None, "unknown"
 
+def _bulk_dir_sizes_via_du(root: str) -> Tuple[Dict[str, int], str]:
+    """
+    Single-pass directory sizing.
+
+    This is dramatically faster than calling `du -sb` repeatedly for many nested
+    directories because it walks the filesystem once and reports all subdir totals.
+    """
+    root = os.path.abspath(root)
+    try:
+        proc = subprocess.run(
+            ["du", "-b", root],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {}, "unknown"
+        out: Dict[str, int] = {}
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # GNU du output: "<bytes>\t<path>"
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            b_s, p = parts
+            try:
+                b = int(b_s)
+            except Exception:
+                continue
+            out[os.path.abspath(p)] = b
+        return out, "du"
+    except Exception:
+        return {}, "unknown"
+
 def _is_ancestor_dir(parent: str, child: str) -> bool:
     parent = os.path.abspath(parent)
     child = os.path.abspath(child)
@@ -304,10 +340,21 @@ def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
         children[k].sort()
 
     # Compute sizes (total sizes; parents include children).
+    # Important: many export roots can exist (e.g. split exports). Computing each
+    # size with separate `du -sb <dir>` calls is extremely slow because it rescans
+    # overlapping subtrees. Use a single-pass `du -b <root>` and then look up
+    # sizes for the nodes we care about.
     size_cache: Dict[str, Tuple[Optional[int], str]] = {}
     tools: Set[str] = set()
+    bulk_map, bulk_tool = _bulk_dir_sizes_via_du(root)
+    if bulk_map:
+        tools.add(bulk_tool)
     for n in nodes:
-        size_cache[n] = _dir_size_bytes(n)
+        b = bulk_map.get(n)
+        if b is not None:
+            size_cache[n] = (b, bulk_tool)
+        else:
+            size_cache[n] = _dir_size_bytes(n)
         tools.add(size_cache[n][1])
 
     def label(n: str) -> str:
