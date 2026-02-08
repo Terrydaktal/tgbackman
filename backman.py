@@ -20,6 +20,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
@@ -40,9 +42,9 @@ HTML_MSG_TS_RE = re.compile(
     r'<div class="pull_right date details" title="'
     r'(\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2}):(\d{2})(?: UTC([+-]\d{2}):(\d{2}))?'
 )
-# Message blocks have ids like id="message12345". Date separators are id="message-1".
-HTML_MSG_ID_MARKER = 'id="message'
-HTML_DAY_SEP_ID_MARKER = 'id="message-'
+HTML_DIV_MESSAGE_MARKER = '<div class="message'
+# Day separators are service blocks like: <div class="message service" id="message-94">
+HTML_DAY_SEPARATOR_MARKER = '<div class="message service" id="message-'
 HTML_DAY_SEP_RE = re.compile(r"^(\d{1,2}) ([A-Za-z]+) (\d{4})$")
 
 _MONTHS = {
@@ -100,6 +102,149 @@ class ExportReport:
     first_message_source: Optional[str]  # file path (HTML) or JSON file
     last_message_source: Optional[str]   # file path (HTML) or JSON file
     date_range_basis: Optional[str]      # "message_timestamps" | "day_separators" | None
+
+def _format_bytes(n: int) -> str:
+    # IEC-ish, compact.
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    v = float(n)
+    for u in units:
+        if v < 1024 or u == units[-1]:
+            if u == "B":
+                return f"{int(v)}B"
+            if v >= 100:
+                return f"{v:0.0f}{u}"
+            if v >= 10:
+                return f"{v:0.1f}{u}"
+            return f"{v:0.2f}{u}"
+        v /= 1024.0
+    return f"{n}B"
+
+def _dir_size_bytes(path: str) -> Tuple[Optional[int], str]:
+    """
+    Returns (bytes, tool_used). Prefers `dust` (fast) when available.
+
+    Note: On some systems `dust` is installed as a snap, which may not work in
+    sandboxed environments; we fallback to `du -sb` in that case.
+    """
+    p = os.path.abspath(path)
+
+    dust = shutil.which("dust")
+    if dust:
+        # `-b` forces raw bytes, making parsing stable; depth 0 = only total.
+        # Keep it simple and robust: parse the first integer token.
+        try:
+            proc = subprocess.run(
+                [dust, "-b", "-d", "0", "--no-color", p],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                m = re.search(r"^\s*(\d+)", proc.stdout)
+                if m:
+                    return int(m.group(1)), "dust"
+        except Exception:
+            pass
+
+    # Fallback: GNU coreutils du.
+    try:
+        proc = subprocess.run(
+            ["du", "-sb", p],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            m = re.search(r"^\s*(\d+)\s+", proc.stdout)
+            if m:
+                return int(m.group(1)), "du"
+    except Exception:
+        pass
+
+    return None, "unknown"
+
+def _is_ancestor_dir(parent: str, child: str) -> bool:
+    parent = os.path.abspath(parent)
+    child = os.path.abspath(child)
+    if parent == child:
+        return True
+    try:
+        rel = os.path.relpath(child, parent)
+    except Exception:
+        return False
+    return rel != os.pardir and not rel.startswith(os.pardir + os.sep)
+
+def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
+    root = os.path.abspath(root)
+
+    # Nodes are: input root + each export root.
+    nodes: List[str] = [root]
+    for r in reports:
+        p = os.path.abspath(r.export_root)
+        if p not in nodes:
+            nodes.append(p)
+
+    # Map export_root -> report for labels (root may or may not be in reports).
+    report_by_root: Dict[str, ExportReport] = {os.path.abspath(r.export_root): r for r in reports}
+
+    # Build parent pointers: closest containing node.
+    parents: Dict[str, Optional[str]] = {n: None for n in nodes}
+    for n in nodes:
+        if n == root:
+            continue
+        best: Optional[str] = None
+        for cand in nodes:
+            if cand == n:
+                continue
+            if _is_ancestor_dir(cand, n):
+                if best is None or len(cand) > len(best):
+                    best = cand
+        parents[n] = best or root
+
+    children: Dict[str, List[str]] = {n: [] for n in nodes}
+    for n, p in parents.items():
+        if p and n != root:
+            children[p].append(n)
+    for k in children:
+        children[k].sort()
+
+    # Compute sizes (total sizes; parents include children).
+    size_cache: Dict[str, Tuple[Optional[int], str]] = {}
+    tools: Set[str] = set()
+    for n in nodes:
+        size_cache[n] = _dir_size_bytes(n)
+        tools.add(size_cache[n][1])
+
+    def label(n: str) -> str:
+        rel = os.path.relpath(n, root)
+        name = "." if rel == "." else rel
+        r = report_by_root.get(n)
+        if r:
+            return f"{name} [{r.kind}]"
+        return name
+
+    def size_s(n: str) -> str:
+        b, _tool = size_cache[n]
+        return "?" if b is None else _format_bytes(b)
+
+    lines: List[str] = []
+    lines.append("Export tree (sizes are total directory sizes; parents include children):")
+    lines.append(f"{size_s(root):>8}  {label(root)}")
+
+    def walk(parent: str, prefix: str):
+        kids = children.get(parent, [])
+        for i, k in enumerate(kids):
+            last = i == (len(kids) - 1)
+            branch = "└── " if last else "├── "
+            lines.append(f"{prefix}{branch}{size_s(k):>8}  {label(k)}")
+            walk(k, prefix + ("    " if last else "│   "))
+
+    walk(root, "")
+
+    tool_note = ", ".join(sorted(t for t in tools if t != "unknown"))
+    if tool_note:
+        lines.append(f"(size tool: {tool_note})")
+    return "\n".join(lines)
 
 def find_result_jsons(root: str) -> List[str]:
     hits: List[str] = []
@@ -334,9 +479,10 @@ def _scan_html_message_files(
                 expect_day_sep = False
                 for line in f:
                     # Telegram's own per-chat count in lists/chats.html matches the number of
-                    # message blocks (id="message<digits>"), excluding day separators
-                    # (id="message-<n>"). Count that here to match Telegram's totals.
-                    msg_count += line.count(HTML_MSG_ID_MARKER) - line.count(HTML_DAY_SEP_ID_MARKER)
+                    # message blocks, excluding day separators. Day separators are always
+                    # "message service" with an id like message-<n>, while real messages may
+                    # have ids with or without '-' (e.g. negative ids in some exports).
+                    msg_count += line.count(HTML_DIV_MESSAGE_MARKER) - line.count(HTML_DAY_SEPARATOR_MARKER)
 
                     if expect_day_sep:
                         expect_day_sep = False
@@ -526,6 +672,9 @@ def main() -> int:
 
         if len(reports) > 1:
             print("Nested/multiple exports detected (more than one export root under the given path).")
+
+        print()
+        print(_render_export_tree(root, reports))
 
     return 0
 
