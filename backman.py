@@ -298,51 +298,128 @@ def _chunks(items: List[str], n: int) -> Iterable[List[str]]:
     for i in range(0, len(items), n):
         yield items[i : i + n]
 
-def _bulk_dir_sizes_via_dust(paths: List[str]) -> Tuple[Dict[str, int], str]:
+def _dust_call(args: List[str]) -> Optional[str]:
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            return None
+        return proc.stdout
+    except Exception:
+        return None
+
+def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
     """
-    Get total sizes for multiple directories using a small number of dust invocations.
+    Parse `dust -b` output. We map whatever "path label" dust prints back to an
+    absolute path under `root`.
+    """
+    root = os.path.abspath(root)
+    out: Dict[str, int] = {}
 
-    This avoids `du -b <root>` (which can emit huge output and be slow to parse) and
-    also avoids spawning dust once per directory.
+    # Reconstruct full relative paths using tree indentation, because dust prints
+    # basenames at deeper depths (like `tree`), not full relative paths.
+    stack: List[str] = []
+    for raw in stdout.splitlines():
+        line = raw.rstrip("\n")
+        if not line.strip():
+            continue
 
-    Requires dust to output absolute paths when given absolute paths; most builds do.
+        m = re.search(r"(\d+)", line)
+        if not m:
+            continue
+        try:
+            b = int(m.group(1))
+        except Exception:
+            continue
+
+        # Find tree branch marker if present.
+        idx = -1
+        marker = ""
+        for mk in ("├── ", "└── "):
+            j = line.find(mk)
+            if j != -1:
+                idx = j
+                marker = mk
+                break
+
+        if idx == -1:
+            # Root line: dust commonly uses "." for the input root.
+            out[root] = b
+            continue
+
+        # Determine depth by counting 4-char indent blocks right before the marker.
+        depth_prefix = 0
+        j = idx
+        while j >= 4:
+            chunk = line[j - 4 : j]
+            if chunk in ("│   ", "    "):
+                depth_prefix += 1
+                j -= 4
+                continue
+            break
+        depth = depth_prefix + 1
+
+        name = line[idx + len(marker) :].strip()
+        name = name.rstrip("/")
+        if not name:
+            continue
+
+        # Maintain a stack of path components at each depth.
+        if depth <= 0:
+            continue
+        if len(stack) >= depth:
+            stack = stack[: depth - 1]
+        while len(stack) < depth - 1:
+            # If the output is malformed, pad to avoid IndexError.
+            stack.append("_")
+        stack.append(name)
+
+        rel = os.path.join(*stack) if stack else "."
+        p = os.path.abspath(os.path.join(root, rel))
+        if _is_ancestor_dir(root, p):
+            out[p] = b
+
+    return out
+
+def _bulk_dir_sizes_via_dust_tree(root: str, max_depth: int) -> Tuple[Dict[str, int], str]:
+    """
+    One dust invocation over `root`, returning directory totals for paths under it.
+    This matches the speed profile of running `dust <root>` manually.
     """
     dust = shutil.which("dust")
     if not dust:
         return {}, "unknown"
 
-    out: Dict[str, int] = {}
-    abs_paths = [os.path.abspath(p) for p in paths]
+    root = os.path.abspath(root)
+    max_depth = max(0, int(max_depth))
 
-    # Keep argv size reasonable.
-    for chunk in _chunks(abs_paths, 128):
-        try:
-            # We only need totals, not a full subtree.
-            # `--no-color` is optional (some builds don't support it); try both.
-            for args in (
-                [dust, "-b", "-d", "0", "--no-color", *chunk],
-                [dust, "-b", "-d", "0", *chunk],
-            ):
-                proc = subprocess.run(args, capture_output=True, text=True, check=False)
-                if proc.returncode != 0:
-                    continue
-
-                for line in proc.stdout.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    m = re.match(r"^\s*(\d+)\s+.*\s(/.+)$", line)
-                    if not m:
-                        continue
-                    b = int(m.group(1))
-                    p = os.path.abspath(m.group(2))
-                    if p in abs_paths:
-                        out[p] = b
-                break
-        except Exception:
+    for args in (
+        [dust, "-b", "-d", str(max_depth), "--no-color", root],
+        [dust, "-b", "-d", str(max_depth), root],
+    ):
+        stdout = _dust_call(args)
+        if stdout is None:
             continue
+        m = _parse_dust_tree(stdout, root)
+        if m:
+            return m, "dust"
+    return {}, "unknown"
 
-    return out, "dust"
+def _dir_size_bytes_dust_only(path: str) -> Optional[int]:
+    dust = shutil.which("dust")
+    if not dust:
+        return None
+    p = os.path.abspath(path)
+    for args in (
+        [dust, "-b", "-d", "0", "--no-color", p],
+        [dust, "-b", "-d", "0", p],
+    ):
+        stdout = _dust_call(args)
+        if not stdout:
+            continue
+        b = _parse_dust_total(stdout, p)
+        if b is not None:
+            return b
+    return None
 
 def _is_ancestor_dir(parent: str, child: str) -> bool:
     parent = os.path.abspath(parent)
@@ -390,21 +467,28 @@ def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
         children[k].sort()
 
     # Compute sizes (total sizes; parents include children).
-    # Prefer dust for speed. We intentionally avoid `du -b <root>` because it can
-    # emit enormous output on large trees and be slow to parse.
+    # Prefer dust for speed. Run dust once on the root at a depth large enough to
+    # include all export roots, then map the printed labels back to absolute paths.
     size_cache: Dict[str, Tuple[Optional[int], str]] = {}
     tools: Set[str] = set()
-    dust_map, dust_tool = _bulk_dir_sizes_via_dust(nodes)
+    max_depth = 0
+    for n in nodes:
+        if n == root:
+            continue
+        rel = os.path.relpath(n, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > max_depth:
+            max_depth = depth
+
+    dust_map, dust_tool = _bulk_dir_sizes_via_dust_tree(root, max_depth=max_depth)
     if dust_map:
         tools.add(dust_tool)
 
     for n in nodes:
         b = dust_map.get(n)
-        if b is not None:
-            size_cache[n] = (b, dust_tool)
-        else:
-            # Fall back to whatever works for this node (dust -> du).
-            size_cache[n] = _dir_size_bytes(n)
+        if b is None:
+            b = _dir_size_bytes_dust_only(n)
+        size_cache[n] = (b, "dust" if b is not None else "unknown")
         tools.add(size_cache[n][1])
 
     def label(n: str) -> str:
