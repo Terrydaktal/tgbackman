@@ -393,12 +393,23 @@ def _iter_html_message_files(export_root: str, kind: str) -> Iterable[str]:
         chats_dir = os.path.join(export_root, "chats")
         if not os.path.isdir(chats_dir):
             return []
+        # Important: only include the multi-export chat folders (chat_001, chat_002, ...).
+        # Some users may also have nested single-chat exports under chats/ (e.g. chats/alex/)
+        # which should not be counted as part of the multi-export.
         out: List[str] = []
-        for dirpath, _, filenames in os.walk(chats_dir):
-            for fn in filenames:
-                if fn.startswith("messages") and fn.endswith(".html"):
-                    out.append(os.path.join(dirpath, fn))
-        return sorted(out)
+        for name in sorted(os.listdir(chats_dir)):
+            if not name.startswith("chat_"):
+                continue
+            chat_dir = os.path.join(chats_dir, name)
+            if not os.path.isdir(chat_dir):
+                continue
+            try:
+                for fn in sorted(os.listdir(chat_dir)):
+                    if fn.startswith("messages") and fn.endswith(".html"):
+                        out.append(os.path.join(chat_dir, fn))
+            except Exception:
+                continue
+        return out
 
     # html_single_chat_export: message pages live in export_root itself.
     out2: List[str] = []
