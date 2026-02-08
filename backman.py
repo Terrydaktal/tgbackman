@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
@@ -46,6 +47,7 @@ HTML_DIV_MESSAGE_MARKER = '<div class="message'
 # Day separators are service blocks like: <div class="message service" id="message-94">
 HTML_DAY_SEPARATOR_MARKER = '<div class="message service" id="message-'
 HTML_DAY_SEP_RE = re.compile(r"^(\d{1,2}) ([A-Za-z]+) (\d{4})$")
+HTML_CHAT_NAME_RE = re.compile(r'<div class="text bold">\s*(.*?)\s*</div>', re.DOTALL)
 
 _MONTHS = {
     "January": 1,
@@ -382,6 +384,76 @@ def _rewrite_chat_html_for_standalone(chat_root: str, chat_id: Optional[str] = N
             with open(p, "w", encoding="utf-8") as f:
                 f.write(s2)
 
+def _sanitize_dirname(name: str, max_len: int = 120) -> str:
+    # Keep readable names, but avoid path separators and control chars.
+    s = name.strip()
+    s = s.replace("/", "_").replace("\\", "_")
+    s = re.sub(r"[\x00-\x1f\x7f]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        s = "unknown_chat"
+    # Avoid trailing dots/spaces (Windows-hostile).
+    s = s.rstrip(" .")
+    if len(s) > max_len:
+        s = s[:max_len].rstrip(" .")
+    return s or "unknown_chat"
+
+def _extract_chat_name_from_messages_html(messages_html_path: str) -> Optional[str]:
+    try:
+        with open(messages_html_path, "r", encoding="utf-8", errors="ignore") as f:
+            # Read a bounded chunk; header is near the top.
+            chunk = f.read(64 * 1024)
+    except Exception:
+        return None
+
+    m = HTML_CHAT_NAME_RE.search(chunk)
+    if not m:
+        return None
+    raw = m.group(1)
+    # Remove nested tags if any (rare, but keep the plain text).
+    raw = re.sub(r"<[^>]+>", "", raw)
+    raw = html.unescape(raw)
+    raw = raw.strip()
+    return raw or None
+
+def _fmt_dt_for_dir(d: Optional[datetime]) -> str:
+    if not d:
+        return "unknown"
+    # Use UTC and filesystem-safe format (no colons).
+    du = d.astimezone(timezone.utc)
+    return du.strftime("%Y-%m-%dT%H-%M-%SZ")
+
+def _scan_first_last_message_ts(paths: Iterable[str]) -> Tuple[Optional[datetime], Optional[datetime]]:
+    first: Optional[datetime] = None
+    last: Optional[datetime] = None
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    for m in HTML_MSG_TS_RE.finditer(line):
+                        dd = int(m.group(1))
+                        mm = int(m.group(2))
+                        yyyy = int(m.group(3))
+                        hh = int(m.group(4))
+                        mi = int(m.group(5))
+                        ss = int(m.group(6))
+                        tz_h_s = m.group(7)
+                        tz_m_s = m.group(8)
+                        tz_h = int(tz_h_s) if tz_h_s else 0
+                        tz_m = int(tz_m_s) if tz_m_s else 0
+                        try:
+                            offset = timezone(timedelta(hours=tz_h, minutes=(tz_m if tz_h >= 0 else -tz_m)))
+                        except Exception:
+                            offset = timezone.utc
+                        d2 = datetime(yyyy, mm, dd, hh, mi, ss, tzinfo=offset).astimezone(timezone.utc)
+                        if first is None or d2 < first:
+                            first = d2
+                        if last is None or d2 > last:
+                            last = d2
+        except Exception:
+            continue
+    return first, last
+
 def _copy_tree(src: str, dst: str) -> None:
     # copytree is fast enough and preserves metadata via copy2
     shutil.copytree(src, dst, dirs_exist_ok=True, copy_function=shutil.copy2)
@@ -416,6 +488,7 @@ def split_multi_html_export_to_single_chat_exports(
     # Shared assets needed for HTML rendering.
     shared_dirs = ["css", "js", "images", "profile_pictures"]
 
+    # First pass: determine stable, unique destination names per chat.
     chat_names = sorted(
         name for name in os.listdir(chats_dir)
         if name.startswith("chat_") and os.path.isdir(os.path.join(chats_dir, name))
@@ -423,6 +496,18 @@ def split_multi_html_export_to_single_chat_exports(
     if only_chats:
         want = set(only_chats)
         chat_names = [n for n in chat_names if n in want]
+
+    dst_name_by_chat: Dict[str, str] = {}
+    used: Set[str] = set()
+    for chat_id in chat_names:
+        src_messages = os.path.join(chats_dir, chat_id, "messages.html")
+        title = _extract_chat_name_from_messages_html(src_messages) or chat_id
+        base = _sanitize_dirname(title)
+        dst = base
+        if dst in used:
+            dst = f"{base} ({chat_id})"
+        used.add(dst)
+        dst_name_by_chat[chat_id] = dst
 
     if dry_run:
         return out_root
@@ -432,8 +517,19 @@ def split_multi_html_export_to_single_chat_exports(
     # Copy each chat folder into its own export root and add shared assets.
     for i, chat_id in enumerate(chat_names, start=1):
         src_chat = os.path.join(chats_dir, chat_id)
-        dst_chat = os.path.join(out_root, chat_id)
-        os.makedirs(dst_chat, exist_ok=False)
+        dst_chat_parent = os.path.join(out_root, dst_name_by_chat[chat_id])
+
+        # Compute date range from the source chat (first/last message in this backup).
+        src_msg_files = sorted(
+            os.path.join(src_chat, fn)
+            for fn in os.listdir(src_chat)
+            if fn.startswith("messages") and fn.endswith(".html")
+        )
+        first_dt, last_dt = _scan_first_last_message_ts(src_msg_files)
+        range_dir = f"{_fmt_dt_for_dir(first_dt)}__{_fmt_dt_for_dir(last_dt)}"
+        dst_chat = os.path.join(dst_chat_parent, range_dir)
+
+        os.makedirs(dst_chat, exist_ok=True)
 
         # Copy chat-local content (messages + media folders).
         for name in os.listdir(src_chat):
@@ -454,7 +550,7 @@ def split_multi_html_export_to_single_chat_exports(
 
         # Progress every so often for large exports.
         if i == 1 or i % 25 == 0 or i == len(chat_names):
-            print(f"[split] {i}/{len(chat_names)}: {chat_id}", file=sys.stderr)
+            print(f"[split] {i}/{len(chat_names)}: {chat_id} -> {dst_name_by_chat[chat_id]}/{range_dir}", file=sys.stderr)
 
     return out_root
 
