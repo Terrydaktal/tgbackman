@@ -119,6 +119,87 @@ def _format_bytes(n: int) -> str:
         v /= 1024.0
     return f"{n}B"
 
+def _parse_human_bytes(tok: str) -> Optional[int]:
+    """
+    Parses tokens like: 1234, 49.4MiB, 1.09GiB, 726MB, 177G, 4B.
+    Returns bytes or None.
+    """
+    s = tok.strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d+", s):
+        try:
+            return int(s)
+        except Exception:
+            return None
+
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([A-Za-z]+)", s)
+    if not m:
+        return None
+    num_s, unit = m.group(1), m.group(2)
+    try:
+        num = float(num_s)
+    except Exception:
+        return None
+
+    unit = unit.strip()
+    # Normalize common dust/du-ish units.
+    unit_map_1024 = {
+        "B": 1,
+        "K": 1024,
+        "KB": 1000,
+        "KiB": 1024,
+        "M": 1024**2,
+        "MB": 1000**2,
+        "MiB": 1024**2,
+        "G": 1024**3,
+        "GB": 1000**3,
+        "GiB": 1024**3,
+        "T": 1024**4,
+        "TB": 1000**4,
+        "TiB": 1024**4,
+        "P": 1024**5,
+        "PB": 1000**5,
+        "PiB": 1024**5,
+    }
+    mult = unit_map_1024.get(unit)
+    if mult is None:
+        # Some tools use lowercase suffixes.
+        mult = unit_map_1024.get(unit.capitalize())
+    if mult is None:
+        return None
+    try:
+        return int(num * mult)
+    except Exception:
+        return None
+
+def _parse_dust_total(stdout: str, path: str) -> Optional[int]:
+    """
+    Try to extract the total size for `path` from dust's output.
+    Prefer lines that contain the (absolute) path.
+    """
+    p = os.path.abspath(path)
+    lines = [ln.strip("\n") for ln in stdout.splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    # Prefer exact path matches in-line (dust typically prints the input path).
+    candidates = [ln for ln in lines if p in ln]
+    # Fallback: last line is often the total for -d 0.
+    if not candidates:
+        candidates = [lines[-1]]
+
+    for ln in candidates:
+        # Strip simple tree glyphs / bars to make tokenization easier.
+        cleaned = ln.replace("│", " ").replace("█", " ").replace("▉", " ").replace("▊", " ").replace("▌", " ")
+        parts = [x for x in cleaned.split() if x]
+        # Find the first token that parses as a size.
+        for tok in parts:
+            b = _parse_human_bytes(tok)
+            if b is not None:
+                return b
+    return None
+
 def _dir_size_bytes(path: str) -> Tuple[Optional[int], str]:
     """
     Returns (bytes, tool_used). Prefers `dust` (fast) when available.
@@ -131,7 +212,6 @@ def _dir_size_bytes(path: str) -> Tuple[Optional[int], str]:
     dust = shutil.which("dust")
     if dust:
         # `-b` forces raw bytes, making parsing stable; depth 0 = only total.
-        # Keep it simple and robust: parse the first integer token.
         try:
             for args in ([dust, "-b", "-d", "0", "--no-color", p], [dust, "-b", "-d", "0", p]):
                 proc = subprocess.run(
@@ -142,9 +222,17 @@ def _dir_size_bytes(path: str) -> Tuple[Optional[int], str]:
                 )
                 if proc.returncode != 0:
                     continue
-                m = re.search(r"^\s*(\d+)", proc.stdout)
-                if m:
-                    return int(m.group(1)), "dust"
+                b = _parse_dust_total(proc.stdout, p)
+                if b is not None:
+                    # Sanity: if dust returns tiny sizes for a directory that clearly has entries,
+                    # it's likely parsing/behavior mismatch; fall back to du for correctness.
+                    try:
+                        has_entries = any(True for _ in os.scandir(p))
+                    except Exception:
+                        has_entries = False
+                    if has_entries and b < 1024:
+                        break
+                    return b, "dust"
         except Exception:
             pass
 
