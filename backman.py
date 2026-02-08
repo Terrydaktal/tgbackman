@@ -133,13 +133,15 @@ def _dir_size_bytes(path: str) -> Tuple[Optional[int], str]:
         # `-b` forces raw bytes, making parsing stable; depth 0 = only total.
         # Keep it simple and robust: parse the first integer token.
         try:
-            proc = subprocess.run(
-                [dust, "-b", "-d", "0", "--no-color", p],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if proc.returncode == 0:
+            for args in ([dust, "-b", "-d", "0", "--no-color", p], [dust, "-b", "-d", "0", p]):
+                proc = subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    continue
                 m = re.search(r"^\s*(\d+)", proc.stdout)
                 if m:
                     return int(m.group(1)), "dust"
