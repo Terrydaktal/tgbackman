@@ -294,6 +294,56 @@ def _bulk_dir_sizes_via_du(root: str) -> Tuple[Dict[str, int], str]:
     except Exception:
         return {}, "unknown"
 
+def _chunks(items: List[str], n: int) -> Iterable[List[str]]:
+    for i in range(0, len(items), n):
+        yield items[i : i + n]
+
+def _bulk_dir_sizes_via_dust(paths: List[str]) -> Tuple[Dict[str, int], str]:
+    """
+    Get total sizes for multiple directories using a small number of dust invocations.
+
+    This avoids `du -b <root>` (which can emit huge output and be slow to parse) and
+    also avoids spawning dust once per directory.
+
+    Requires dust to output absolute paths when given absolute paths; most builds do.
+    """
+    dust = shutil.which("dust")
+    if not dust:
+        return {}, "unknown"
+
+    out: Dict[str, int] = {}
+    abs_paths = [os.path.abspath(p) for p in paths]
+
+    # Keep argv size reasonable.
+    for chunk in _chunks(abs_paths, 128):
+        try:
+            # We only need totals, not a full subtree.
+            # `--no-color` is optional (some builds don't support it); try both.
+            for args in (
+                [dust, "-b", "-d", "0", "--no-color", *chunk],
+                [dust, "-b", "-d", "0", *chunk],
+            ):
+                proc = subprocess.run(args, capture_output=True, text=True, check=False)
+                if proc.returncode != 0:
+                    continue
+
+                for line in proc.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    m = re.match(r"^\s*(\d+)\s+.*\s(/.+)$", line)
+                    if not m:
+                        continue
+                    b = int(m.group(1))
+                    p = os.path.abspath(m.group(2))
+                    if p in abs_paths:
+                        out[p] = b
+                break
+        except Exception:
+            continue
+
+    return out, "dust"
+
 def _is_ancestor_dir(parent: str, child: str) -> bool:
     parent = os.path.abspath(parent)
     child = os.path.abspath(child)
@@ -340,20 +390,20 @@ def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
         children[k].sort()
 
     # Compute sizes (total sizes; parents include children).
-    # Important: many export roots can exist (e.g. split exports). Computing each
-    # size with separate `du -sb <dir>` calls is extremely slow because it rescans
-    # overlapping subtrees. Use a single-pass `du -b <root>` and then look up
-    # sizes for the nodes we care about.
+    # Prefer dust for speed. We intentionally avoid `du -b <root>` because it can
+    # emit enormous output on large trees and be slow to parse.
     size_cache: Dict[str, Tuple[Optional[int], str]] = {}
     tools: Set[str] = set()
-    bulk_map, bulk_tool = _bulk_dir_sizes_via_du(root)
-    if bulk_map:
-        tools.add(bulk_tool)
+    dust_map, dust_tool = _bulk_dir_sizes_via_dust(nodes)
+    if dust_map:
+        tools.add(dust_tool)
+
     for n in nodes:
-        b = bulk_map.get(n)
+        b = dust_map.get(n)
         if b is not None:
-            size_cache[n] = (b, bulk_tool)
+            size_cache[n] = (b, dust_tool)
         else:
+            # Fall back to whatever works for this node (dust -> du).
             size_cache[n] = _dir_size_bytes(n)
         tools.add(size_cache[n][1])
 
