@@ -922,10 +922,60 @@ def inspect_html_export(export_root: str) -> ExportReport:
         date_range_basis=basis,
     )
 
+def summarize_html_export(export_root: str) -> ExportReport:
+    """
+    Fast classification for HTML exports without scanning message bodies.
+    """
+    export_root = os.path.abspath(export_root)
+    entrypoint = None
+    for n in HTML_MULTI_ROOT_NAMES:
+        p = os.path.join(export_root, n)
+        if os.path.exists(p):
+            entrypoint = p
+            break
+    kind = "html_multi_chat_export" if entrypoint else "html_single_chat_export"
+    if entrypoint is None:
+        entrypoint = os.path.join(export_root, HTML_SINGLE_ROOT_NAME)
+
+    chat_count: Optional[int]
+    if kind == "html_multi_chat_export":
+        chats_dir = os.path.join(export_root, "chats")
+        if os.path.isdir(chats_dir):
+            chat_count = sum(
+                1
+                for name in os.listdir(chats_dir)
+                if name.startswith("chat_") and os.path.isdir(os.path.join(chats_dir, name))
+            )
+        else:
+            chat_count = None
+    else:
+        chat_count = 1
+
+    return ExportReport(
+        export_root=export_root,
+        result_json=entrypoint,
+        fmt="html",
+        kind=kind,
+        top_level_keys=[],
+        inferred_export_date=infer_export_date_from_path(export_root),
+        chats_backed_up=chat_count,
+        messages_backed_up=None,
+        first_message_utc=None,
+        last_message_utc=None,
+        first_message_source=None,
+        last_message_source=None,
+        date_range_basis=None,
+    )
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("path", help="Telegram export folder (will be scanned recursively)")
     ap.add_argument("--json", action="store_true", help="Output JSON (machine-readable)")
+    ap.add_argument(
+        "--no-inspect",
+        action="store_true",
+        help="Skip scanning message bodies for counts/date ranges (much faster).",
+    )
     ap.add_argument(
         "--split-multi-html",
         action="store_true",
@@ -975,11 +1025,35 @@ def main() -> int:
     reports: List[ExportReport] = []
     json_hits = find_result_jsons(root)
     if json_hits:
-        reports.extend(inspect_streaming_ijson(p) for p in json_hits)
+        if args.no_inspect:
+            for p in json_hits:
+                export_root = os.path.dirname(p)
+                reports.append(
+                    ExportReport(
+                        export_root=export_root,
+                        result_json=p,
+                        fmt="json",
+                        kind="unknown",
+                        top_level_keys=[],
+                        inferred_export_date=infer_export_date_from_path(p),
+                        chats_backed_up=None,
+                        messages_backed_up=None,
+                        first_message_utc=None,
+                        last_message_utc=None,
+                        first_message_source=None,
+                        last_message_source=None,
+                        date_range_basis=None,
+                    )
+                )
+        else:
+            reports.extend(inspect_streaming_ijson(p) for p in json_hits)
 
     html_roots = find_html_export_roots(root)
     if html_roots:
-        reports.extend(inspect_html_export(r) for r in html_roots)
+        if args.no_inspect:
+            reports.extend(summarize_html_export(r) for r in html_roots)
+        else:
+            reports.extend(inspect_html_export(r) for r in html_roots)
 
     if not reports:
         print("No Telegram exports found under the given path.", file=sys.stderr)
