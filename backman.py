@@ -230,7 +230,10 @@ def _dir_size_bytes(path: str) -> Tuple[Optional[int], str]:
                         has_entries = any(True for _ in os.scandir(p))
                     except Exception:
                         has_entries = False
-                    if has_entries and b < 1024:
+                    # Some dust builds (notably snap-confined) can report only the directory
+                    # entry size (4KiB) when they can't traverse contents. Treat that as
+                    # suspicious when the directory has entries.
+                    if has_entries and b <= 16 * 1024:
                         break
                     return b, "dust"
         except Exception:
