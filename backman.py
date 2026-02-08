@@ -339,6 +339,125 @@ def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
         lines.append(f"(size tool: {tool_note})")
     return "\n".join(lines)
 
+def _rewrite_chat_html_for_standalone(chat_root: str, chat_id: Optional[str] = None) -> None:
+    """
+    Make a chat folder self-contained by fixing references to shared assets that used to
+    live two levels up in a multi-export (../../css, ../../js, ../../images, ...).
+    """
+    for fn in os.listdir(chat_root):
+        if not (fn.startswith("messages") and fn.endswith(".html")):
+            continue
+        p = os.path.join(chat_root, fn)
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                s = f.read()
+        except Exception:
+            continue
+
+        # Assets: multi-export chats use ../../css and ../../js.
+        s2 = s
+        s2 = s2.replace('href="../../css/', 'href="css/')
+        s2 = s2.replace('href="../css/', 'href="css/')
+        s2 = s2.replace('src="../../js/', 'src="js/')
+        s2 = s2.replace('src="../js/', 'src="js/')
+        s2 = s2.replace('src="../../images/', 'src="images/')
+        s2 = s2.replace('href="../../images/', 'href="images/')
+        s2 = s2.replace('src="../../profile_pictures/', 'src="profile_pictures/')
+        s2 = s2.replace('href="../../profile_pictures/', 'href="profile_pictures/')
+
+        # Back-links to the multi-export chat list. Point to the first page in this folder.
+        s2 = s2.replace('href="../../lists/chats.html"', 'href="messages.html"')
+        s2 = s2.replace('href="../../lists/chats.html#allow_back"', 'href="messages.html"')
+        s2 = s2.replace('href="../lists/chats.html"', 'href="messages.html"')
+        s2 = s2.replace('href="../lists/chats.html#allow_back"', 'href="messages.html"')
+
+        # Media references: multi-export chats often reference their own media via
+        # ../../chats/chat_XXX/<media> even when the HTML lives in chats/chat_XXX/.
+        # Make those paths local so the chat folder is portable.
+        if chat_id:
+            s2 = s2.replace(f'../../chats/{chat_id}/', '')
+            s2 = s2.replace(f'../chats/{chat_id}/', '')
+
+        if s2 != s:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(s2)
+
+def _copy_tree(src: str, dst: str) -> None:
+    # copytree is fast enough and preserves metadata via copy2
+    shutil.copytree(src, dst, dirs_exist_ok=True, copy_function=shutil.copy2)
+
+def split_multi_html_export_to_single_chat_exports(
+    export_root: str,
+    out_root: Optional[str] = None,
+    only_chats: Optional[Set[str]] = None,
+    dry_run: bool = False,
+) -> str:
+    """
+    Turn a multi-chat HTML export into per-chat self-contained HTML exports.
+    Output is created under `out_root` (or default under parent of export_root).
+    """
+    export_root = os.path.abspath(export_root)
+
+    if out_root is None:
+        parent = os.path.dirname(export_root.rstrip(os.sep))
+        base = os.path.basename(export_root.rstrip(os.sep))
+        out_root = os.path.join(parent, f"{base}_single_chats")
+    out_root = os.path.abspath(out_root)
+
+    if not os.path.isfile(os.path.join(export_root, "export_results.html")):
+        raise ValueError(f"Not a multi-chat HTML export root (missing export_results.html): {export_root}")
+    chats_dir = os.path.join(export_root, "chats")
+    if not os.path.isdir(chats_dir):
+        raise ValueError(f"Not a multi-chat HTML export root (missing chats/): {export_root}")
+
+    if os.path.exists(out_root):
+        raise FileExistsError(f"Output directory already exists: {out_root}")
+
+    # Shared assets needed for HTML rendering.
+    shared_dirs = ["css", "js", "images", "profile_pictures"]
+
+    chat_names = sorted(
+        name for name in os.listdir(chats_dir)
+        if name.startswith("chat_") and os.path.isdir(os.path.join(chats_dir, name))
+    )
+    if only_chats:
+        want = set(only_chats)
+        chat_names = [n for n in chat_names if n in want]
+
+    if dry_run:
+        return out_root
+
+    os.makedirs(out_root, exist_ok=False)
+
+    # Copy each chat folder into its own export root and add shared assets.
+    for i, chat_id in enumerate(chat_names, start=1):
+        src_chat = os.path.join(chats_dir, chat_id)
+        dst_chat = os.path.join(out_root, chat_id)
+        os.makedirs(dst_chat, exist_ok=False)
+
+        # Copy chat-local content (messages + media folders).
+        for name in os.listdir(src_chat):
+            sp = os.path.join(src_chat, name)
+            dp = os.path.join(dst_chat, name)
+            if os.path.isdir(sp):
+                _copy_tree(sp, dp)
+            else:
+                shutil.copy2(sp, dp)
+
+        # Copy shared assets into the chat root.
+        for d in shared_dirs:
+            sp = os.path.join(export_root, d)
+            if os.path.isdir(sp):
+                _copy_tree(sp, os.path.join(dst_chat, d))
+
+        _rewrite_chat_html_for_standalone(dst_chat, chat_id=chat_id)
+
+        # Progress every so often for large exports.
+        if i == 1 or i % 25 == 0 or i == len(chat_names):
+            print(f"[split] {i}/{len(chat_names)}: {chat_id}", file=sys.stderr)
+
+    return out_root
+
 def find_result_jsons(root: str) -> List[str]:
     hits: List[str] = []
     for dirpath, _, filenames in os.walk(root):
@@ -711,12 +830,51 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("path", help="Telegram export folder (will be scanned recursively)")
     ap.add_argument("--json", action="store_true", help="Output JSON (machine-readable)")
+    ap.add_argument(
+        "--split-multi-html",
+        action="store_true",
+        help="Convert a multi-chat HTML export into per-chat self-contained exports (copies data).",
+    )
+    ap.add_argument(
+        "--split-out",
+        default=None,
+        help="Output directory for --split-multi-html (default: <parent>/<basename>_single_chats).",
+    )
+    ap.add_argument(
+        "--split-chat",
+        action="append",
+        default=[],
+        help="Limit --split-multi-html to specific chat folders (repeatable), e.g. --split-chat chat_001",
+    )
+    ap.add_argument(
+        "--split-dry-run",
+        action="store_true",
+        help="With --split-multi-html: only print planned output directory and exit.",
+    )
     args = ap.parse_args()
 
     root = os.path.abspath(args.path)
     if not os.path.exists(root):
         print(f"Path does not exist: {root}", file=sys.stderr)
         return 2
+
+    if args.split_multi_html:
+        only = set(args.split_chat) if args.split_chat else None
+        try:
+            out = split_multi_html_export_to_single_chat_exports(
+                root,
+                out_root=args.split_out,
+                only_chats=only,
+                dry_run=args.split_dry_run,
+            )
+        except Exception as e:
+            print(f"Split failed: {e}", file=sys.stderr)
+            return 3
+        if args.split_dry_run:
+            print(out)
+            return 0
+        print(f"Wrote per-chat exports to: {out}")
+        return 0
 
     reports: List[ExportReport] = []
     json_hits = find_result_jsons(root)
