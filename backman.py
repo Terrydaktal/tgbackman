@@ -34,8 +34,11 @@ EXPORT_DATE_RE = re.compile(
 HTML_MULTI_ROOT_NAMES = ("export_results.html",)
 HTML_SINGLE_ROOT_NAME = "messages.html"
 
-HTML_TITLE_TS_RE = re.compile(
-    r'title="(\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2}):(\d{2})(?: UTC([+-]\d{2}):(\d{2}))?'
+# Message timestamp for a chat message. Important: forwarded messages include their own
+# embedded "date details" spans, which we intentionally do NOT use for chat date ranges.
+HTML_MSG_TS_RE = re.compile(
+    r'<div class="pull_right date details" title="'
+    r'(\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2}):(\d{2})(?: UTC([+-]\d{2}):(\d{2}))?'
 )
 HTML_DAY_SEP_RE = re.compile(r"^(\d{1,2}) ([A-Za-z]+) (\d{4})$")
 
@@ -315,7 +318,7 @@ def _scan_html_message_files(paths: Iterable[str]) -> Tuple[int, Optional[dateti
                         # Telegram's day separator is typically the next line after this div.
                         expect_day_sep = True
 
-                    for m in HTML_TITLE_TS_RE.finditer(line):
+                    for m in HTML_MSG_TS_RE.finditer(line):
                         dd = int(m.group(1))
                         mm = int(m.group(2))
                         yyyy = int(m.group(3))
