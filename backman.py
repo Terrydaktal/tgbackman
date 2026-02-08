@@ -94,6 +94,9 @@ class ExportReport:
     messages_backed_up: Optional[int]
     first_message_utc: Optional[str]     # ISO
     last_message_utc: Optional[str]      # ISO
+    first_message_source: Optional[str]  # file path (HTML) or JSON file
+    last_message_source: Optional[str]   # file path (HTML) or JSON file
+    date_range_basis: Optional[str]      # "message_timestamps" | "day_separators" | None
 
 def find_result_jsons(root: str) -> List[str]:
     hits: List[str] = []
@@ -200,6 +203,9 @@ def inspect_streaming_ijson(path: str) -> ExportReport:
         messages_backed_up=msg_count,
         first_message_utc=first_dt.isoformat() if first_dt else None,
         last_message_utc=last_dt.isoformat() if last_dt else None,
+        first_message_source=path if first_dt else None,
+        last_message_source=path if last_dt else None,
+        date_range_basis="message_timestamps" if (first_dt or last_dt) else None,
     )
 
 def inspect_via_json_load(path: str) -> ExportReport:
@@ -271,6 +277,9 @@ def inspect_via_json_load(path: str) -> ExportReport:
         messages_backed_up=msg_count,
         first_message_utc=first_dt.isoformat() if first_dt else None,
         last_message_utc=last_dt.isoformat() if last_dt else None,
+        first_message_source=path if first_dt else None,
+        last_message_source=path if last_dt else None,
+        date_range_basis="message_timestamps" if (first_dt or last_dt) else None,
     )
 
 def _upd_range(first_dt: Optional[datetime], last_dt: Optional[datetime], d: Optional[datetime]) -> Tuple[Optional[datetime], Optional[datetime]]:
@@ -297,10 +306,24 @@ def _parse_html_day_sep(line: str) -> Optional[datetime]:
     except Exception:
         return None
 
-def _scan_html_message_files(paths: Iterable[str]) -> Tuple[int, Optional[datetime], Optional[datetime]]:
+def _scan_html_message_files(
+    paths: Iterable[str],
+) -> Tuple[
+    int,
+    Optional[datetime],
+    Optional[datetime],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
     msg_count = 0
-    first_dt: Optional[datetime] = None
-    last_dt: Optional[datetime] = None
+    first_msg_dt: Optional[datetime] = None
+    last_msg_dt: Optional[datetime] = None
+    first_msg_src: Optional[str] = None
+    last_msg_src: Optional[str] = None
+
+    first_day_dt: Optional[datetime] = None
+    last_day_dt: Optional[datetime] = None
 
     for p in paths:
         try:
@@ -313,7 +336,7 @@ def _scan_html_message_files(paths: Iterable[str]) -> Tuple[int, Optional[dateti
                     if expect_day_sep:
                         expect_day_sep = False
                         d = _parse_html_day_sep(line)
-                        first_dt, last_dt = _upd_range(first_dt, last_dt, d)
+                        first_day_dt, last_day_dt = _upd_range(first_day_dt, last_day_dt, d)
                     if 'class="body details"' in line:
                         # Telegram's day separator is typically the next line after this div.
                         expect_day_sep = True
@@ -334,11 +357,20 @@ def _scan_html_message_files(paths: Iterable[str]) -> Tuple[int, Optional[dateti
                         except Exception:
                             offset = timezone.utc
                         d2 = datetime(yyyy, mm, dd, hh, mi, ss, tzinfo=offset).astimezone(timezone.utc)
-                        first_dt, last_dt = _upd_range(first_dt, last_dt, d2)
+                        if first_msg_dt is None or d2 < first_msg_dt:
+                            first_msg_dt = d2
+                            first_msg_src = p
+                        if last_msg_dt is None or d2 > last_msg_dt:
+                            last_msg_dt = d2
+                            last_msg_src = p
         except Exception:
             continue
 
-    return msg_count, first_dt, last_dt
+    # Prefer real message timestamps for "first message" semantics. Day separators are
+    # coarse and can skew to midnight even if the first message is later that day.
+    if first_msg_dt or last_msg_dt:
+        return msg_count, first_msg_dt, last_msg_dt, first_msg_src, last_msg_src, "message_timestamps"
+    return msg_count, first_day_dt, last_day_dt, None, None, ("day_separators" if (first_day_dt or last_day_dt) else None)
 
 def find_html_export_roots(root: str) -> List[str]:
     roots: Set[str] = set()
@@ -402,7 +434,7 @@ def inspect_html_export(export_root: str) -> ExportReport:
         chat_count = 1
 
     msg_files = list(_iter_html_message_files(export_root, kind))
-    msg_count, first_dt, last_dt = _scan_html_message_files(msg_files)
+    msg_count, first_dt, last_dt, first_src, last_src, basis = _scan_html_message_files(msg_files)
 
     return ExportReport(
         export_root=export_root,
@@ -415,6 +447,9 @@ def inspect_html_export(export_root: str) -> ExportReport:
         messages_backed_up=msg_count,
         first_message_utc=first_dt.isoformat() if first_dt else None,
         last_message_utc=last_dt.isoformat() if last_dt else None,
+        first_message_source=first_src,
+        last_message_source=last_src,
+        date_range_basis=basis,
     )
 
 def main() -> int:
@@ -465,6 +500,12 @@ def main() -> int:
             if r.messages_backed_up is not None:
                 print(f"  messages backed up: {r.messages_backed_up}")
             print(f"  date range (UTC): {r.first_message_utc}  →  {r.last_message_utc}")
+            if r.date_range_basis:
+                print(f"  date range basis: {r.date_range_basis}")
+            if r.first_message_source:
+                print(f"  first message source: {r.first_message_source}")
+            if r.last_message_source:
+                print(f"  last message source: {r.last_message_source}")
             print()
 
         if len(reports) > 1:
