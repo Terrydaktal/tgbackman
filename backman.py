@@ -40,6 +40,9 @@ HTML_MSG_TS_RE = re.compile(
     r'<div class="pull_right date details" title="'
     r'(\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2}):(\d{2})(?: UTC([+-]\d{2}):(\d{2}))?'
 )
+# Message blocks have ids like id="message12345". Date separators are id="message-1".
+HTML_MSG_ID_MARKER = 'id="message'
+HTML_DAY_SEP_ID_MARKER = 'id="message-'
 HTML_DAY_SEP_RE = re.compile(r"^(\d{1,2}) ([A-Za-z]+) (\d{4})$")
 
 _MONTHS = {
@@ -330,8 +333,10 @@ def _scan_html_message_files(
             with open(p, "r", encoding="utf-8", errors="ignore") as f:
                 expect_day_sep = False
                 for line in f:
-                    # Counts both "default" and "service" messages.
-                    msg_count += line.count('<div class="message')
+                    # Telegram's own per-chat count in lists/chats.html matches the number of
+                    # message blocks (id="message<digits>"), excluding day separators
+                    # (id="message-<n>"). Count that here to match Telegram's totals.
+                    msg_count += line.count(HTML_MSG_ID_MARKER) - line.count(HTML_DAY_SEP_ID_MARKER)
 
                     if expect_day_sep:
                         expect_day_sep = False
