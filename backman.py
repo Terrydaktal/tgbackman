@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import urllib.parse
@@ -32,6 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 RESULT_NAMES = ("result.json", "results.json")
+UNOFFICIAL_SQLITE_NAMES = ("database.sqlite",)
 
 class _Ansi:
     RESET = "\033[0m"
@@ -1401,6 +1403,90 @@ def find_result_jsons(root: str) -> List[str]:
                 hits.append(os.path.join(dirpath, fn))
     return sorted(set(hits))
 
+def _is_unofficial_telegram_sqlite_db(db_path: str) -> bool:
+    """
+    Heuristic detector for the unofficial Telegram backup DB used by pre-export tools.
+    We only look for expected tables.
+    """
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except Exception:
+        return False
+    try:
+        cur = con.cursor()
+        cur.execute("select name from sqlite_master where type='table'")
+        tables = {r[0] for r in cur.fetchall()}
+        return {"messages", "chats", "users"}.issubset(tables)
+    except Exception:
+        return False
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+def find_unofficial_telegram_sqlite_dbs(root: str) -> List[str]:
+    hits: List[str] = []
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if fn in UNOFFICIAL_SQLITE_NAMES:
+                p = os.path.join(dirpath, fn)
+                if _is_unofficial_telegram_sqlite_db(p):
+                    hits.append(p)
+    return sorted(set(hits))
+
+def inspect_unofficial_telegram_sqlite(db_path: str, *, no_inspect: bool) -> ExportReport:
+    export_root = os.path.abspath(os.path.dirname(db_path))
+    src = os.path.abspath(db_path)
+
+    if no_inspect:
+        return ExportReport(
+            export_root=export_root,
+            result_json=src,
+            fmt="sqlite",
+            kind="sqlite_unofficial_backup",
+            top_level_keys=[],
+            inferred_export_date=infer_export_date_from_path(export_root),
+            chats_backed_up=None,
+            messages_backed_up=None,
+            first_message_utc=None,
+            last_message_utc=None,
+            first_message_source=None,
+            last_message_source=None,
+            date_range_basis=None,
+        )
+
+    con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    try:
+        cur = con.cursor()
+        cur.execute("select count(*) from chats")
+        chats = int(cur.fetchone()[0])
+        cur.execute("select count(*) from messages")
+        msgs = int(cur.fetchone()[0])
+        cur.execute("select min(time), max(time) from messages")
+        mn, mx = cur.fetchone()
+    finally:
+        con.close()
+
+    first_dt = _parse_unixtime(mn) if mn is not None else None
+    last_dt = _parse_unixtime(mx) if mx is not None else None
+
+    return ExportReport(
+        export_root=export_root,
+        result_json=src,
+        fmt="sqlite",
+        kind="sqlite_unofficial_backup",
+        top_level_keys=[],
+        inferred_export_date=infer_export_date_from_path(export_root),
+        chats_backed_up=chats,
+        messages_backed_up=msgs,
+        first_message_utc=first_dt.isoformat() if first_dt else None,
+        last_message_utc=last_dt.isoformat() if last_dt else None,
+        first_message_source=src,
+        last_message_source=src,
+        date_range_basis="message_timestamps",
+    )
+
 def infer_export_date_from_path(p: str) -> Optional[str]:
     # Looks for DataExport_dd_mm_yyyy or ChatExport_dd_mm_yyyy in any path segment
     m = EXPORT_DATE_RE.search(p)
@@ -1899,11 +1985,16 @@ def main() -> int:
         else:
             reports.extend(inspect_html_export(r) for r in html_roots)
 
+    sqlite_hits = find_unofficial_telegram_sqlite_dbs(root)
+    if sqlite_hits:
+        reports.extend(inspect_unofficial_telegram_sqlite(p, no_inspect=args.no_inspect) for p in sqlite_hits)
+
     if not reports:
         print("No Telegram exports found under the given path.", file=sys.stderr)
         print("Expected either:", file=sys.stderr)
         print("- JSON exports: result.json/results.json", file=sys.stderr)
         print("- HTML exports: export_results.html (multi-chat) or messages.html + css/ + js/ (single-chat)", file=sys.stderr)
+        print("- Unofficial SQLite backups: database.sqlite (with chats/messages/users tables)", file=sys.stderr)
         return 1
 
     # Nested export detection: multiple export roots under the input root
