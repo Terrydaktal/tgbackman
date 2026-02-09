@@ -86,6 +86,58 @@ _SKIP_SCHEMES = (
     "tel:",
 )
 
+MEDIA_DIRS = {
+    # Common Telegram export media dirs (varies by export type / version).
+    "photos",
+    "files",
+    "video_files",
+    "voice_messages",
+    "audio_files",
+    "documents",
+    "sticker_files",
+    "stickers",
+    "animations",
+    "round_video_messages",
+    "profile_pictures",
+    "images",
+}
+
+MEDIA_EXTS = {
+    # Images
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".heic",
+    ".avif",
+    # Video
+    ".mp4",
+    ".m4v",
+    ".mov",
+    ".mkv",
+    ".webm",
+    ".avi",
+    ".3gp",
+    # Audio
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".flac",
+    # Docs / archives (often shared as files)
+    ".pdf",
+    ".txt",
+    ".zip",
+    ".rar",
+    ".7z",
+}
+
 
 def _iter_html_files(root: str) -> Iterator[str]:
     for dirpath, _dirnames, filenames in os.walk(root):
@@ -142,11 +194,34 @@ def _resolve_local_ref(
         note = None
 
     root_abs = os.path.abspath(root)
-    if not os.path.commonpath([root_abs, abs_p]).startswith(root_abs):
+    try:
+        within = os.path.commonpath([root_abs, abs_p]) == root_abs
+    except Exception:
+        within = False
+    if not within:
         # This can happen with ../../.. links that escape root; still validate existence.
         note = (note + ",outside-root") if note else "outside-root"
 
     return abs_p, note
+
+def _is_media_url(url: str) -> bool:
+    """
+    Heuristic: treat as "media" if the URL points into common Telegram media dirs or has a
+    media-like extension.
+    """
+    if _should_skip_url(url):
+        return False
+    u = _normalize_url_to_fs_path(url)
+    if not u:
+        return False
+    # Normalize separators for splitting.
+    seg0 = u.replace("\\", "/").lstrip("/").split("/", 1)[0]
+    if seg0 in MEDIA_DIRS:
+        return True
+    ext = os.path.splitext(u)[1].lower()
+    if ext in MEDIA_EXTS:
+        return True
+    return False
 
 
 def _iter_srcset_urls(val: str) -> Iterator[str]:
@@ -171,14 +246,27 @@ class MissingRef:
     note: Optional[str] = None
 
 
-def scan_html_file_for_missing_refs(html_path: str, root: str) -> Tuple[int, int, int, List[MissingRef]]:
+def scan_html_file_for_bad_refs(
+    html_path: str,
+    root: str,
+    *,
+    scope: str,
+    allow_outside_root: bool,
+    max_keep: int,
+) -> Tuple[int, int, int, int, List[MissingRef], int, List[MissingRef]]:
     """
-    Returns: (total_refs, skipped_refs, ok_refs, missing_refs)
+    Returns:
+      total_refs, skipped_refs, ok_refs,
+      missing_total, missing_kept,
+      outside_total, outside_kept
     """
     total = 0
     skipped = 0
     ok = 0
-    missing: List[MissingRef] = []
+    missing_total = 0
+    outside_total = 0
+    missing_kept: List[MissingRef] = []
+    outside_kept: List[MissingRef] = []
 
     try:
         with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -196,44 +284,98 @@ def scan_html_file_for_missing_refs(html_path: str, root: str) -> Tuple[int, int
                 for m in ATTR_URL_RE.finditer(line):
                     url = m.group("url")
                     total += 1
+                    if scope == "media" and not _is_media_url(url):
+                        skipped += 1
+                        continue
                     resolved, note = _resolve_local_ref(url, html_path, root)
                     if resolved is None:
                         skipped += 1
                         continue
-                    if os.path.exists(resolved):
+                    is_outside = bool(note and "outside-root" in note)
+                    exists = os.path.exists(resolved)
+                    if is_outside and not allow_outside_root:
+                        outside_total += 1
+                        if len(outside_kept) < max_keep:
+                            outside_kept.append(
+                                MissingRef(
+                                    html_path,
+                                    ln,
+                                    m.group(0).split("=", 1)[0].strip(),
+                                    url,
+                                    resolved,
+                                    note,
+                                )
+                            )
+                        continue
+                    if exists:
                         ok += 1
                         continue
-                    missing.append(MissingRef(html_path, ln, m.group(0).split("=", 1)[0].strip(), url, resolved, note))
+                    missing_total += 1
+                    if len(missing_kept) < max_keep:
+                        missing_kept.append(
+                            MissingRef(
+                                html_path,
+                                ln,
+                                m.group(0).split("=", 1)[0].strip(),
+                                url,
+                                resolved,
+                                note,
+                            )
+                        )
 
                 for m in ATTR_SRCSET_RE.finditer(line):
                     val = m.group("val")
                     for url in _iter_srcset_urls(val):
                         total += 1
+                        if scope == "media" and not _is_media_url(url):
+                            skipped += 1
+                            continue
                         resolved, note = _resolve_local_ref(url, html_path, root)
                         if resolved is None:
                             skipped += 1
                             continue
-                        if os.path.exists(resolved):
+                        is_outside = bool(note and "outside-root" in note)
+                        exists = os.path.exists(resolved)
+                        if is_outside and not allow_outside_root:
+                            outside_total += 1
+                            if len(outside_kept) < max_keep:
+                                outside_kept.append(MissingRef(html_path, ln, "srcset", url, resolved, note))
+                            continue
+                        if exists:
                             ok += 1
                             continue
-                        missing.append(MissingRef(html_path, ln, "srcset", url, resolved, note))
+                        missing_total += 1
+                        if len(missing_kept) < max_keep:
+                            missing_kept.append(MissingRef(html_path, ln, "srcset", url, resolved, note))
 
                 for m in CSS_URL_RE.finditer(line):
                     url = m.group("url")
                     total += 1
+                    if scope == "media" and not _is_media_url(url):
+                        skipped += 1
+                        continue
                     resolved, note = _resolve_local_ref(url, html_path, root)
                     if resolved is None:
                         skipped += 1
                         continue
-                    if os.path.exists(resolved):
+                    is_outside = bool(note and "outside-root" in note)
+                    exists = os.path.exists(resolved)
+                    if is_outside and not allow_outside_root:
+                        outside_total += 1
+                        if len(outside_kept) < max_keep:
+                            outside_kept.append(MissingRef(html_path, ln, "url(...)", url, resolved, note))
+                        continue
+                    if exists:
                         ok += 1
                         continue
-                    missing.append(MissingRef(html_path, ln, "url(...)", url, resolved, note))
+                    missing_total += 1
+                    if len(missing_kept) < max_keep:
+                        missing_kept.append(MissingRef(html_path, ln, "url(...)", url, resolved, note))
     except Exception:
         # Treat unreadable files as having no refs; the caller can decide whether to care.
-        return 0, 0, 0, []
+        return 0, 0, 0, 0, [], 0, []
 
-    return total, skipped, ok, missing
+    return total, skipped, ok, missing_total, missing_kept, outside_total, outside_kept
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -241,6 +383,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("path", help="Root folder to scan (recursively)")
     ap.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     ap.add_argument("--max-missing", type=int, default=200, help="Limit missing refs printed (default: 200)")
+    ap.add_argument(
+        "--scope",
+        choices=("all", "media"),
+        default="all",
+        help="Which refs to validate: all local refs, or only media-like refs (default: all).",
+    )
+    ap.add_argument(
+        "--allow-outside-root",
+        action="store_true",
+        help="Treat refs that resolve outside the provided root as OK if they exist on disk (default: fail them).",
+    )
     ap.add_argument(
         "--fail-fast",
         action="store_true",
@@ -259,17 +412,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     total_refs = 0
     skipped_refs = 0
     ok_refs = 0
-    missing_refs: List[MissingRef] = []
+    missing_total = 0
+    outside_total = 0
+    missing_kept: List[MissingRef] = []
+    outside_kept: List[MissingRef] = []
 
     for p in html_files:
-        t, s, ok, missing = scan_html_file_for_missing_refs(p, root)
+        t, s, ok, m_total, m_kept, o_total, o_kept = scan_html_file_for_bad_refs(
+            p,
+            root,
+            scope=args.scope,
+            allow_outside_root=args.allow_outside_root,
+            max_keep=args.max_missing,
+        )
         total_refs += t
         skipped_refs += s
         ok_refs += ok
-        if missing:
-            missing_refs.extend(missing)
-            if args.fail_fast:
+        missing_total += m_total
+        outside_total += o_total
+        # Keep a bounded sample list across all files.
+        for m in m_kept:
+            if len(missing_kept) >= args.max_missing:
                 break
+            missing_kept.append(m)
+        for m in o_kept:
+            if len(outside_kept) >= args.max_missing:
+                break
+            outside_kept.append(m)
+
+        if (m_total or o_total) and args.fail_fast:
+            break
 
     if args.json:
         out = {
@@ -278,6 +450,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "total_refs": total_refs,
             "skipped_refs": skipped_refs,
             "ok_refs": ok_refs,
+            "outside_root_refs": [
+                {
+                    "html_file": m.html_file,
+                    "line_no": m.line_no,
+                    "attr": m.attr,
+                    "url": m.url,
+                    "resolved_path": m.resolved_path,
+                    "note": m.note,
+                }
+                for m in outside_kept
+            ],
+            "outside_root_refs_total": outside_total,
             "missing_refs": [
                 {
                     "html_file": m.html_file,
@@ -287,37 +471,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "resolved_path": m.resolved_path,
                     "note": m.note,
                 }
-                for m in missing_refs[: args.max_missing]
+                for m in missing_kept
             ],
-            "missing_refs_total": len(missing_refs),
+            "missing_refs_total": missing_total,
         }
         print(json.dumps(out, indent=2, ensure_ascii=False))
-        return 1 if missing_refs else 0
+        return 1 if (missing_total or outside_total) else 0
 
     print(_c(f"Root: {root}", _Ansi.BOLD))
     print(f"HTML files scanned: {len(html_files)}")
-    print(f"Refs: total={total_refs} ok={ok_refs} skipped={skipped_refs} missing={len(missing_refs)}")
+    scope_note = f"scope={args.scope}"
+    print(
+        f"Refs: total={total_refs} ok={ok_refs} skipped={skipped_refs} "
+        f"outside_root={outside_total} missing={missing_total} ({scope_note})"
+    )
 
-    if not missing_refs:
+    if not missing_total and not outside_total:
         print()
         print(_c("All local references resolved.", _Ansi.GREEN))
         return 0
 
     print()
-    print(_c("Missing local references:", _Ansi.RED))
-    lim = args.max_missing
-    for i, m in enumerate(missing_refs[:lim], start=1):
-        rel_html = os.path.relpath(m.html_file, root)
-        note = f" [{m.note}]" if m.note else ""
-        print(
-            f"{i:>4}. {rel_html}:{m.line_no} {m.attr}=\"{m.url}\" -> {m.resolved_path}{note}"
-        )
-    if len(missing_refs) > lim:
-        print(_c(f"... and {len(missing_refs) - lim} more", _Ansi.DIM))
+    if outside_total:
+        print(_c("References that resolve outside the provided root:", _Ansi.YELLOW))
+        lim = args.max_missing
+        for i, m in enumerate(outside_kept[:lim], start=1):
+            rel_html = os.path.relpath(m.html_file, root)
+            note = f" [{m.note}]" if m.note else ""
+            print(
+                f"{i:>4}. {rel_html}:{m.line_no} {m.attr}=\"{m.url}\" -> {m.resolved_path}{note}"
+            )
+        if outside_total > len(outside_kept):
+            print(_c(f"... and {outside_total - len(outside_kept)} more", _Ansi.DIM))
+        print()
+
+    if missing_total:
+        print(_c("Missing local references:", _Ansi.RED))
+        lim = args.max_missing
+        for i, m in enumerate(missing_kept[:lim], start=1):
+            rel_html = os.path.relpath(m.html_file, root)
+            note = f" [{m.note}]" if m.note else ""
+            print(
+                f"{i:>4}. {rel_html}:{m.line_no} {m.attr}=\"{m.url}\" -> {m.resolved_path}{note}"
+            )
+        if missing_total > len(missing_kept):
+            print(_c(f"... and {missing_total - len(missing_kept)} more", _Ansi.DIM))
 
     return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
