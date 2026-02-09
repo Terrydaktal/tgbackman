@@ -2129,11 +2129,11 @@ def main() -> int:
         help="Do not compute on-disk sizes for discovered exports (faster on slow disks).",
     )
     ap.add_argument(
-        "--include-unofficial-db-copies",
+        "--dedupe-unofficial-sqlite",
         action="store_true",
         help=(
-            "For unofficial SQLite backups: also list database.sqlite files outside .telegram_backup/ "
-            "even if a .telegram_backup database exists under the same folder."
+            "For unofficial SQLite backups: suppress database.sqlite files outside .telegram_backup/ "
+            "when a .telegram_backup DB exists under the same folder (avoids duplicates)."
         ),
     )
     ap.add_argument(
@@ -2217,7 +2217,7 @@ def main() -> int:
 
     sqlite_hits = find_unofficial_telegram_sqlite_dbs(root)
     if sqlite_hits:
-        if not args.include_unofficial_db_copies:
+        if args.dedupe_unofficial_sqlite:
             # Many unofficial backups include both:
             # - <root>/database.sqlite (often a copied/derived view)
             # - <root>/**/.telegram_backup/<account>/database.sqlite (canonical backing store)
