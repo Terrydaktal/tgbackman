@@ -32,6 +32,29 @@ ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 RESULT_NAMES = ("result.json", "results.json")
 
+class _Ansi:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    CYAN = "\033[36m"
+    MAGENTA = "\033[35m"
+    BLUE = "\033[34m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+
+def _use_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb")
+    except Exception:
+        return False
+
+def _c(s: str, code: str) -> str:
+    if not _use_color():
+        return s
+    return f"{code}{s}{_Ansi.RESET}"
+
 EXPORT_DATE_RE = re.compile(
     r"(?:DataExport|ChatExport)[_-](\d{2})[._-](\d{2})[._-](\d{4})"
 )
@@ -1653,51 +1676,94 @@ def main() -> int:
     if args.json:
         print(json.dumps([asdict(r) for r in reports], indent=2, ensure_ascii=False))
     else:
-        print(f"Found {len(reports)} Telegram export(s) under: {root}\n")
+        # Pre-compute sizes once (dust, with du fallback) for all export roots.
         size_tool_used: Set[str] = set()
         size_by_export_root: Dict[str, Optional[int]] = {}
-
         if not args.no_sizes:
             export_roots = [r.export_root for r in reports]
             size_by_export_root, tool = _bulk_export_sizes_once(root, export_roots)
             if tool:
                 size_tool_used.add(tool)
 
-        for r in reports:
-            print(f"- Export root: {r.export_root}")
-            if r.fmt == "json":
-                print(f"  result.json: {r.result_json}")
-            else:
-                print(f"  html entrypoint: {r.result_json}")
-            print(f"  format: {r.fmt}")
-            print(f"  kind: {r.kind}")
-            if r.inferred_export_date:
-                print(f"  inferred export folder date: {r.inferred_export_date}")
-            if r.chats_backed_up is not None:
-                print(f"  chats backed up: {r.chats_backed_up}")
-            if r.messages_backed_up is not None:
-                print(f"  messages backed up: {r.messages_backed_up}")
-            print(f"  date range (UTC): {r.first_message_utc}  →  {r.last_message_utc}")
-            if r.date_range_basis:
-                print(f"  date range basis: {r.date_range_basis}")
-            if r.first_message_source:
-                print(f"  first message source: {r.first_message_source}")
-            if r.last_message_source:
-                print(f"  last message source: {r.last_message_source}")
-            if not args.no_sizes:
-                b = size_by_export_root.get(os.path.abspath(r.export_root))
-                print(f"  size on disk: {'?' if b is None else _format_bytes(b)}")
-            print()
+        # Collection mode: lots of single-chat exports under a container directory
+        # (common for the split output layout: ChatName/START__END).
+        def _is_collection_mode() -> bool:
+            if len(reports) < 5:
+                return False
+            if not all(r.kind == "html_single_chat_export" for r in reports):
+                return False
+            try:
+                for r in reports:
+                    rel = os.path.relpath(r.export_root, root)
+                    if rel == ".":
+                        return False
+                    # Expect at least ChatName/START__END
+                    if rel.count(os.sep) < 1:
+                        return False
+            except Exception:
+                return False
+            return True
 
-        if len(reports) > 1:
-            print("Nested/multiple exports detected (more than one export root under the given path).")
+        collection_mode = _is_collection_mode()
+
+        def _fmt_int(v: Optional[int]) -> str:
+            return "?" if v is None else str(v)
+
+        def _fmt_size(p: str) -> str:
+            if args.no_sizes:
+                return "?"
+            b = size_by_export_root.get(os.path.abspath(p))
+            return "?" if b is None else _format_bytes(b)
+
+        def _line_for_report(r: ExportReport) -> str:
+            rel = os.path.relpath(r.export_root, root)
+            parts = [] if rel == "." else rel.split(os.sep)
+            if collection_mode and len(parts) >= 2:
+                chat = parts[0]
+                sub = " ".join(parts[1:])
+            else:
+                chat = parts[0] if parts else os.path.basename(r.export_root)
+                sub = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+            left = _c(chat, _Ansi.CYAN)
+            if sub:
+                left += " " + _c(sub, _Ansi.DIM)
+
+            fmt = _c(r.fmt, _Ansi.MAGENTA)
+            chats_s = _c(_fmt_int(r.chats_backed_up), _Ansi.YELLOW)
+            msgs_s = _c(_fmt_int(r.messages_backed_up), _Ansi.YELLOW)
+            size_s = _c(_fmt_size(r.export_root), _Ansi.GREEN)
+            kind = _c(r.kind, _Ansi.BLUE)
+
+            return (
+                f"{left} {fmt} chats:{chats_s} messages:{msgs_s} "
+                f"size on disk: {size_s} {kind}"
+            )
+
+        # Grouping by "export root": if collection mode, show a single section for the
+        # scanned root; otherwise, show one section per discovered export root.
+        if collection_mode:
+            print(_c(f"Export root: {root}", _Ansi.BOLD))
+            print()
+            for r in sorted(
+                reports,
+                key=lambda x: os.path.relpath(x.export_root, root),
+            ):
+                print(_line_for_report(r))
+        else:
+            # One section per report.export_root (keeps output useful when scanning a parent folder).
+            for i, r in enumerate(sorted(reports, key=lambda x: x.export_root)):
+                if i:
+                    print()
+                print(_c(f"Export root: {r.export_root}", _Ansi.BOLD))
+                print()
+                print(_line_for_report(r))
 
         if not args.no_sizes and size_tool_used:
             tool_note = ", ".join(sorted(t for t in size_tool_used if t != "unknown"))
             if tool_note:
-                print(f"(size tool: {tool_note})")
-        print()
-        # Export tree removed; it was both slow and a poor fit for dust's output across versions.
+                print()
+                print(_c(f"(size tool: {tool_note})", _Ansi.DIM))
 
     return 0
 
