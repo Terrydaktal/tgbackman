@@ -2129,6 +2129,14 @@ def main() -> int:
         help="Do not compute on-disk sizes for discovered exports (faster on slow disks).",
     )
     ap.add_argument(
+        "--include-unofficial-db-copies",
+        action="store_true",
+        help=(
+            "For unofficial SQLite backups: also list database.sqlite files outside .telegram_backup/ "
+            "even if a .telegram_backup database exists under the same folder."
+        ),
+    )
+    ap.add_argument(
         "--split-multi-html",
         action="store_true",
         help="Convert a multi-chat HTML export into per-chat self-contained exports (copies data).",
@@ -2209,6 +2217,29 @@ def main() -> int:
 
     sqlite_hits = find_unofficial_telegram_sqlite_dbs(root)
     if sqlite_hits:
+        if not args.include_unofficial_db_copies:
+            # Many unofficial backups include both:
+            # - <root>/database.sqlite (often a copied/derived view)
+            # - <root>/**/.telegram_backup/<account>/database.sqlite (canonical backing store)
+            # When both exist under the same folder, prefer the .telegram_backup DB to avoid duplicates.
+            canon = [
+                p
+                for p in sqlite_hits
+                if f"{os.sep}.telegram_backup{os.sep}" in os.path.abspath(p)
+            ]
+            if canon:
+                filtered: List[str] = []
+                for p in sqlite_hits:
+                    ap_p = os.path.abspath(p)
+                    if ap_p in canon:
+                        filtered.append(p)
+                        continue
+                    d = os.path.dirname(ap_p)
+                    # Suppress this DB if there's any canonical DB nested under the same folder.
+                    if any(os.path.commonpath([d, os.path.abspath(q)]) == d for q in canon):
+                        continue
+                    filtered.append(p)
+                sqlite_hits = filtered
         reports.extend(inspect_unofficial_telegram_sqlite(p, no_inspect=args.no_inspect) for p in sqlite_hits)
 
     if not reports:
