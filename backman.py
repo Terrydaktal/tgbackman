@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -87,6 +88,26 @@ _MONTHS = {
     "October": 10,
     "November": 11,
     "December": 12,
+}
+
+# Local URL extraction for HTML (messages.html).
+HTML_ATTR_URL_RE = re.compile(
+    r'(?P<prefix>\b(?:src|href)\s*=\s*)(?P<q>["\'])(?P<url>[^"\']+)(?P=q)',
+    re.IGNORECASE,
+)
+HTML_CSS_URL_RE = re.compile(
+    r'url\(\s*(?P<q>["\']?)(?P<url>[^"\')]+)(?P=q)\s*\)',
+    re.IGNORECASE,
+)
+
+_SKIP_SHARED_MEDIA_TOPLEVEL = {
+    # These are copied separately as shared assets for standalone rendering.
+    "css",
+    "js",
+    "images",
+    "profile_pictures",
+    # Not media; avoid copying navigation pages.
+    "lists",
 }
 
 def _parse_iso(dt_s: str) -> Optional[datetime]:
@@ -988,6 +1009,181 @@ def _rewrite_chat_html_for_standalone(chat_root: str, chat_id: Optional[str] = N
             with open(p, "w", encoding="utf-8") as f:
                 f.write(s2)
 
+def _should_skip_url(url: str) -> bool:
+    u = url.strip()
+    if not u:
+        return True
+    if u.startswith("#"):
+        return True
+    lu = u.lower()
+    if lu.startswith(("http://", "https://", "mailto:", "javascript:", "data:", "tg:", "tel:")):
+        return True
+    # Schemes like "file:" are not expected in Telegram exports; ignore any scheme-ish URLs.
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", u):
+        return True
+    return False
+
+def _resolve_local_url_to_export_file(
+    url: str,
+    src_html_dir: str,
+    export_root: str,
+) -> Optional[Tuple[str, str]]:
+    """
+    Resolve a local URL (href/src/url(...)) to an existing file under export_root.
+    Returns (abs_path, rel_path_from_export_root) or None.
+    """
+    if _should_skip_url(url):
+        return None
+
+    u = html.unescape(url).strip()
+    # Strip query/fragment, which browsers ignore for local file lookups anyway.
+    u = u.split("#", 1)[0].split("?", 1)[0].strip()
+    if not u:
+        return None
+
+    # Telegram exports sometimes use percent-encoding in paths.
+    u_fs = urllib.parse.unquote(u)
+    abs_p = os.path.abspath(os.path.normpath(os.path.join(src_html_dir, u_fs)))
+    if not _is_ancestor_dir(export_root, abs_p):
+        return None
+    if not os.path.isfile(abs_p):
+        return None
+
+    rel = os.path.relpath(abs_p, export_root)
+    top = rel.split(os.sep, 1)[0]
+    if top in _SKIP_SHARED_MEDIA_TOPLEVEL:
+        return None
+    return abs_p, rel
+
+def _copy_and_localize_shared_media_for_chat(
+    export_root: str,
+    src_chat: str,
+    dst_chat: str,
+    chat_id: str,
+) -> None:
+    """
+    Copy any "shared" media referenced by a chat's messages*.html (typically ../../photos/...,
+    ../../files/..., etc.) into dst_chat/media/<relative-from-export-root>/ and rewrite the
+    HTML to point to media/... so the chat export is portable.
+
+    Safety: never deletes or modifies the source export.
+    """
+    export_root = os.path.abspath(export_root)
+    src_chat = os.path.abspath(src_chat)
+    dst_chat = os.path.abspath(dst_chat)
+
+    src_msg_files = sorted(
+        os.path.join(src_chat, fn)
+        for fn in os.listdir(src_chat)
+        if fn.startswith("messages") and fn.endswith(".html")
+    )
+    if not src_msg_files:
+        return
+
+    abs_to_media_url: Dict[str, str] = {}
+
+    # First pass: scan source HTML for referenced files under export_root (excluding chat-local content).
+    for src_html in src_msg_files:
+        src_html_dir = os.path.dirname(src_html)
+        try:
+            with open(src_html, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    # Fast path: skip regexes on most lines.
+                    if "href=" not in line and "src=" not in line and "url(" not in line:
+                        continue
+                    for m in HTML_ATTR_URL_RE.finditer(line):
+                        url = m.group("url")
+                        resolved = _resolve_local_url_to_export_file(url, src_html_dir, export_root)
+                        if not resolved:
+                            continue
+                        abs_p, rel = resolved
+                        if _is_ancestor_dir(src_chat, abs_p):
+                            continue  # chat-local; already copied with the chat folder
+                        rel_posix = rel.replace(os.sep, "/")
+                        abs_to_media_url[abs_p] = f"media/{rel_posix}"
+
+                    for m in HTML_CSS_URL_RE.finditer(line):
+                        url = m.group("url")
+                        resolved = _resolve_local_url_to_export_file(url, src_html_dir, export_root)
+                        if not resolved:
+                            continue
+                        abs_p, rel = resolved
+                        if _is_ancestor_dir(src_chat, abs_p):
+                            continue
+                        rel_posix = rel.replace(os.sep, "/")
+                        abs_to_media_url[abs_p] = f"media/{rel_posix}"
+        except Exception:
+            continue
+
+    if not abs_to_media_url:
+        return
+
+    # Copy referenced media into dst_chat/media/<relpath>.
+    media_root = os.path.join(dst_chat, "media")
+    for abs_p, media_url in abs_to_media_url.items():
+        rel = media_url[len("media/") :].replace("/", os.sep)
+        dp = os.path.join(media_root, rel)
+        os.makedirs(os.path.dirname(dp), exist_ok=True)
+        try:
+            shutil.copy2(abs_p, dp)
+        except Exception:
+            # Best-effort: missing/unreadable files should not abort the entire split.
+            continue
+
+    # Second pass: rewrite the copied HTML files in dst_chat to point at media/... paths.
+    for src_html in src_msg_files:
+        src_html_dir = os.path.dirname(src_html)
+        dst_html = os.path.join(dst_chat, os.path.basename(src_html))
+        if not os.path.isfile(dst_html):
+            continue
+
+        tmp = dst_html + ".tmp"
+
+        def _rewrite_url(url: str) -> Optional[str]:
+            resolved = _resolve_local_url_to_export_file(url, src_html_dir, export_root)
+            if not resolved:
+                return None
+            abs_p, _rel = resolved
+            if _is_ancestor_dir(src_chat, abs_p):
+                return None
+            return abs_to_media_url.get(abs_p)
+
+        def _sub_attr(m: re.Match) -> str:
+            prefix = m.group("prefix")
+            q = m.group("q")
+            url = m.group("url")
+            nu = _rewrite_url(url)
+            if not nu:
+                return m.group(0)
+            return f"{prefix}{q}{nu}{q}"
+
+        def _sub_css(m: re.Match) -> str:
+            q = m.group("q")
+            url = m.group("url")
+            nu = _rewrite_url(url)
+            if not nu:
+                return m.group(0)
+            return f"url({q}{nu}{q})"
+
+        try:
+            with open(dst_html, "r", encoding="utf-8", errors="ignore") as rf, open(
+                tmp, "w", encoding="utf-8"
+            ) as wf:
+                for line in rf:
+                    if "href=" not in line and "src=" not in line and "url(" not in line:
+                        wf.write(line)
+                        continue
+                    line2 = HTML_ATTR_URL_RE.sub(_sub_attr, line)
+                    line2 = HTML_CSS_URL_RE.sub(_sub_css, line2)
+                    wf.write(line2)
+            os.replace(tmp, dst_html)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
 def _sanitize_dirname(name: str, max_len: int = 120) -> str:
     # Keep readable names, but avoid path separators and control chars.
     s = name.strip()
@@ -1151,6 +1347,7 @@ def split_multi_html_export_to_single_chat_exports(
                 _copy_tree(sp, os.path.join(dst_chat, d))
 
         _rewrite_chat_html_for_standalone(dst_chat, chat_id=chat_id)
+        _copy_and_localize_shared_media_for_chat(export_root, src_chat, dst_chat, chat_id=chat_id)
 
         # Progress every so often for large exports.
         if i == 1 or i % 25 == 0 or i == len(chat_names):
