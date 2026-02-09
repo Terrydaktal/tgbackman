@@ -2294,6 +2294,15 @@ def main() -> int:
             b = size_by_export_root.get(os.path.abspath(p))
             return "?" if b is None else _format_bytes(b)
 
+        def _fmt_iso_utc(s: Optional[str]) -> str:
+            if not s:
+                return "?"
+            d = _parse_iso(s)
+            if not d:
+                return "?"
+            du = d.astimezone(timezone.utc)
+            return du.strftime("%Y-%m-%dT%H:%M:%SZ")
+
         def _line_for_report(r: ExportReport) -> str:
             rel = os.path.relpath(r.export_root, root)
             parts = [] if rel == "." else rel.split(os.sep)
@@ -2314,9 +2323,19 @@ def main() -> int:
             size_s = _c(_fmt_size(r.export_root), _Ansi.GREEN)
             kind = _c(r.kind, _Ansi.BLUE)
 
+            range_s = ""
+            if r.kind in ("html_single_chat_export", "single_chat_export"):
+                range_s = (
+                    " "
+                    + _c("range:", _Ansi.DIM)
+                    + _c(_fmt_iso_utc(r.first_message_utc), _Ansi.DIM)
+                    + _c(" → ", _Ansi.DIM)
+                    + _c(_fmt_iso_utc(r.last_message_utc), _Ansi.DIM)
+                )
+
             return (
                 f"{left} {fmt} chats:{chats_s} messages:{msgs_s} "
-                f"size on disk: {size_s} {kind}"
+                f"size on disk: {size_s} {kind}{range_s}"
             )
 
         def _print_chat_summaries(r: ExportReport) -> None:
