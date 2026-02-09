@@ -138,6 +138,14 @@ def _parse_unixtime(v: Any) -> Optional[datetime]:
         return None
 
 @dataclass
+class ChatSummary:
+    name: str
+    messages_backed_up: Optional[int]
+    first_message_utc: Optional[str]
+    last_message_utc: Optional[str]
+
+
+@dataclass
 class ExportReport:
     export_root: str                 # directory containing result.json
     result_json: str                 # full path to result.json (or HTML entrypoint)
@@ -152,6 +160,7 @@ class ExportReport:
     first_message_source: Optional[str]  # file path (HTML) or JSON file
     last_message_source: Optional[str]   # file path (HTML) or JSON file
     date_range_basis: Optional[str]      # "message_timestamps" | "day_separators" | None
+    chat_summaries: Optional[List[ChatSummary]] = None
 
 def _format_bytes(n: int) -> str:
     # IEC-ish, compact.
@@ -1456,15 +1465,108 @@ def inspect_unofficial_telegram_sqlite(db_path: str, *, no_inspect: bool) -> Exp
             date_range_basis=None,
         )
 
+    def _table_cols(con, table: str) -> Set[str]:
+        cur2 = con.cursor()
+        cur2.execute(f"pragma table_info({table})")
+        return {str(r[1]) for r in cur2.fetchall()}
+
+    def _pick_name_cols(cols: Set[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        # Returns (name_col, first_col, last_col)
+        if "name" in cols:
+            return "name", None, None
+        first = "first_name" if "first_name" in cols else None
+        last = "last_name" if "last_name" in cols else None
+        if first or last:
+            return None, first, last
+        for c in ("title", "username", "phone", "phone_number"):
+            if c in cols:
+                return c, None, None
+        return None, None, None
+
     con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    chat_summaries: List[ChatSummary] = []
     try:
         cur = con.cursor()
-        cur.execute("select count(*) from chats")
-        chats = int(cur.fetchone()[0])
         cur.execute("select count(*) from messages")
         msgs = int(cur.fetchone()[0])
         cur.execute("select min(time), max(time) from messages")
         mn, mx = cur.fetchone()
+
+        # Group by source_type/source_id: maps to users (dialogs) and chats (groups).
+        cur.execute(
+            """
+            select source_type, source_id, count(*) as msgs, min(time) as mn, max(time) as mx
+            from messages
+            where source_type is not null and source_id is not null
+            group by source_type, source_id
+            order by msgs desc
+            """
+        )
+        rows = cur.fetchall()
+
+        u_name = u_first = u_last = None
+        c_name = c_first = c_last = None
+        try:
+            user_cols = _table_cols(con, "users")
+            chat_cols = _table_cols(con, "chats")
+            u_name, u_first, u_last = _pick_name_cols(user_cols)
+            c_name, c_first, c_last = _pick_name_cols(chat_cols)
+        except Exception:
+            pass
+
+        u_stmt = None
+        if u_name:
+            u_stmt = f"select {u_name} from users where id = ?"
+        elif u_first or u_last:
+            cols = ", ".join(c for c in (u_first, u_last) if c)
+            u_stmt = f"select {cols} from users where id = ?"
+
+        c_stmt = None
+        if c_name:
+            c_stmt = f"select {c_name} from chats where id = ?"
+        elif c_first or c_last:
+            cols = ", ".join(c for c in (c_first, c_last) if c)
+            c_stmt = f"select {cols} from chats where id = ?"
+
+        def _lookup(stmt: Optional[str], source_id: int) -> Optional[str]:
+            if not stmt:
+                return None
+            try:
+                cur3 = con.cursor()
+                cur3.execute(stmt, (source_id,))
+                r = cur3.fetchone()
+            except Exception:
+                return None
+            if not r:
+                return None
+            if len(r) == 1:
+                v = r[0]
+                return (str(v).strip() if v is not None else None) or None
+            parts = [str(x).strip() for x in r if x is not None and str(x).strip()]
+            return (" ".join(parts).strip() or None) if parts else None
+
+        for source_type, source_id, mcount, mn2, mx2 in rows:
+            try:
+                sid = int(source_id)
+            except Exception:
+                continue
+            st = str(source_type)
+            nm = None
+            if st == "dialog":
+                nm = _lookup(u_stmt, sid)
+            elif st == "group":
+                nm = _lookup(c_stmt, sid)
+            name = nm or f"{st}:{sid}"
+            first_dt2 = _parse_unixtime(mn2) if mn2 is not None else None
+            last_dt2 = _parse_unixtime(mx2) if mx2 is not None else None
+            chat_summaries.append(
+                ChatSummary(
+                    name=name,
+                    messages_backed_up=int(mcount),
+                    first_message_utc=first_dt2.isoformat() if first_dt2 else None,
+                    last_message_utc=last_dt2.isoformat() if last_dt2 else None,
+                )
+            )
     finally:
         con.close()
 
@@ -1478,13 +1580,14 @@ def inspect_unofficial_telegram_sqlite(db_path: str, *, no_inspect: bool) -> Exp
         kind="sqlite_unofficial_backup",
         top_level_keys=[],
         inferred_export_date=infer_export_date_from_path(export_root),
-        chats_backed_up=chats,
+        chats_backed_up=len(chat_summaries) if chat_summaries else None,
         messages_backed_up=msgs,
         first_message_utc=first_dt.isoformat() if first_dt else None,
         last_message_utc=last_dt.isoformat() if last_dt else None,
         first_message_source=src,
         last_message_source=src,
         date_range_basis="message_timestamps",
+        chat_summaries=chat_summaries if chat_summaries else None,
     )
 
 def infer_export_date_from_path(p: str) -> Optional[str]:
@@ -1537,6 +1640,27 @@ def inspect_streaming_ijson(path: str) -> ExportReport:
     msg_count: int = 0
     first_dt: Optional[datetime] = None
     last_dt: Optional[datetime] = None
+    chat_summaries: List[ChatSummary] = []
+
+    cur_chat_id: Optional[str] = None
+    cur_chat_name: Optional[str] = None
+    cur_chat_msgs: int = 0
+    cur_first: Optional[datetime] = None
+    cur_last: Optional[datetime] = None
+
+    def _flush_chat():
+        nonlocal cur_chat_id, cur_chat_name, cur_chat_msgs, cur_first, cur_last
+        if cur_chat_id is None:
+            return
+        nm = cur_chat_name or f"chat_{cur_chat_id}"
+        chat_summaries.append(
+            ChatSummary(
+                name=nm,
+                messages_backed_up=cur_chat_msgs,
+                first_message_utc=cur_first.isoformat() if cur_first else None,
+                last_message_utc=cur_last.isoformat() if cur_last else None,
+            )
+        )
 
     # One full streaming pass: count chats, count messages, track min/max time.
     with open(path, "rb") as f:
@@ -1545,12 +1669,24 @@ def inspect_streaming_ijson(path: str) -> ExportReport:
             if kind == "multi_chat_export":
                 # Chat objects: chats.list.item.id (distinct from message IDs which are chats.list.item.messages.item.id)
                 if prefix == "chats.list.item.id" and event in ("number", "string"):
+                    if cur_chat_id is not None:
+                        _flush_chat()
+                    cur_chat_id = str(value)
+                    cur_chat_name = None
+                    cur_chat_msgs = 0
+                    cur_first = None
+                    cur_last = None
                     chat_count = (chat_count or 0) + 1
+
+                if prefix == "chats.list.item.name" and event == "string":
+                    cur_chat_name = str(value)
 
             # Count messages by message id field (avoid reply_to_message_id etc.)
             if prefix.endswith(".messages.item.id") or prefix == "messages.item.id":
                 if event in ("number", "string"):
                     msg_count += 1
+                    if kind == "multi_chat_export" and prefix.startswith("chats.list.item.messages.item."):
+                        cur_chat_msgs += 1
 
             # Prefer unixtime if present
             if prefix.endswith(".messages.item.date_unixtime") or prefix == "messages.item.date_unixtime":
@@ -1561,6 +1697,8 @@ def inspect_streaming_ijson(path: str) -> ExportReport:
                             first_dt = d
                         if last_dt is None or d > last_dt:
                             last_dt = d
+                        if kind == "multi_chat_export" and prefix.startswith("chats.list.item.messages.item."):
+                            cur_first, cur_last = _upd_range(cur_first, cur_last, d)
 
             # Fallback to ISO date strings
             if prefix.endswith(".messages.item.date") or prefix == "messages.item.date":
@@ -1571,6 +1709,11 @@ def inspect_streaming_ijson(path: str) -> ExportReport:
                             first_dt = d
                         if last_dt is None or d > last_dt:
                             last_dt = d
+                        if kind == "multi_chat_export" and prefix.startswith("chats.list.item.messages.item."):
+                            cur_first, cur_last = _upd_range(cur_first, cur_last, d)
+
+    if kind == "multi_chat_export" and cur_chat_id is not None:
+        _flush_chat()
 
     export_root = os.path.dirname(path)
     return ExportReport(
@@ -1587,6 +1730,7 @@ def inspect_streaming_ijson(path: str) -> ExportReport:
         first_message_source=path if first_dt else None,
         last_message_source=path if last_dt else None,
         date_range_basis="message_timestamps" if (first_dt or last_dt) else None,
+        chat_summaries=chat_summaries if chat_summaries else None,
     )
 
 def inspect_via_json_load(path: str) -> ExportReport:
@@ -1623,20 +1767,44 @@ def inspect_via_json_load(path: str) -> ExportReport:
     if kind == "multi_chat_export" and isinstance(chats, list):
         chat_count = len(chats)
         msg_count = 0
+        chat_summaries: List[ChatSummary] = []
         for c in chats:
             if not isinstance(c, dict):
                 continue
+            cname = (
+                (str(c.get("name")).strip() if c.get("name") is not None else None)
+                or (str(c.get("title")).strip() if c.get("title") is not None else None)
+                or (f"chat_{c.get('id')}" if c.get("id") is not None else None)
+                or "unknown_chat"
+            )
+            c_msg = 0
+            c_first: Optional[datetime] = None
+            c_last: Optional[datetime] = None
             for m in c.get("messages", []) or []:
                 if not isinstance(m, dict):
                     continue
                 msg_count += 1
+                c_msg += 1
                 if "date_unixtime" in m:
-                    upd(_parse_unixtime(m["date_unixtime"]))
+                    d = _parse_unixtime(m["date_unixtime"])
+                    upd(d)
+                    c_first, c_last = _upd_range(c_first, c_last, d)
                 if "date" in m:
-                    upd(_parse_iso(str(m["date"])))
+                    d = _parse_iso(str(m["date"]))
+                    upd(d)
+                    c_first, c_last = _upd_range(c_first, c_last, d)
+            chat_summaries.append(
+                ChatSummary(
+                    name=cname,
+                    messages_backed_up=c_msg,
+                    first_message_utc=c_first.isoformat() if c_first else None,
+                    last_message_utc=c_last.isoformat() if c_last else None,
+                )
+            )
     elif kind == "single_chat_export" and isinstance(messages, list):
         chat_count = 1
         msg_count = 0
+        chat_summaries = []
         for m in messages:
             if not isinstance(m, dict):
                 continue
@@ -1661,6 +1829,7 @@ def inspect_via_json_load(path: str) -> ExportReport:
         first_message_source=path if first_dt else None,
         last_message_source=path if last_dt else None,
         date_range_basis="message_timestamps" if (first_dt or last_dt) else None,
+        chat_summaries=chat_summaries if (kind == "multi_chat_export" and chat_summaries) else None,
     )
 
 def _upd_range(first_dt: Optional[datetime], last_dt: Optional[datetime], d: Optional[datetime]) -> Tuple[Optional[datetime], Optional[datetime]]:
@@ -1828,8 +1997,60 @@ def inspect_html_export(export_root: str) -> ExportReport:
     else:
         chat_count = 1
 
-    msg_files = list(_iter_html_message_files(export_root, kind))
-    msg_count, first_dt, last_dt, first_src, last_src, basis = _scan_html_message_files(msg_files)
+    chat_summaries: List[ChatSummary] = []
+    if kind == "html_multi_chat_export":
+        # One pass: compute per-chat summaries and aggregate totals/range.
+        msg_count = 0
+        first_dt: Optional[datetime] = None
+        last_dt: Optional[datetime] = None
+        first_src: Optional[str] = None
+        last_src: Optional[str] = None
+        basis: Optional[str] = None
+
+        chats_dir = os.path.join(export_root, "chats")
+        if os.path.isdir(chats_dir):
+            for name in sorted(os.listdir(chats_dir)):
+                if not name.startswith("chat_"):
+                    continue
+                chat_dir = os.path.join(chats_dir, name)
+                if not os.path.isdir(chat_dir):
+                    continue
+                try:
+                    msg_files = [
+                        os.path.join(chat_dir, fn)
+                        for fn in sorted(os.listdir(chat_dir))
+                        if fn.startswith("messages") and fn.endswith(".html")
+                    ]
+                except Exception:
+                    continue
+                c_count, c_first, c_last, c_first_src, c_last_src, c_basis = _scan_html_message_files(msg_files)
+                title = _extract_chat_name_from_messages_html(os.path.join(chat_dir, "messages.html")) or name
+                chat_summaries.append(
+                    ChatSummary(
+                        name=title,
+                        messages_backed_up=c_count,
+                        first_message_utc=c_first.isoformat() if c_first else None,
+                        last_message_utc=c_last.isoformat() if c_last else None,
+                    )
+                )
+                msg_count += c_count
+                if c_first and (first_dt is None or c_first < first_dt):
+                    first_dt = c_first
+                    first_src = c_first_src
+                if c_last and (last_dt is None or c_last > last_dt):
+                    last_dt = c_last
+                    last_src = c_last_src
+                if c_basis == "message_timestamps":
+                    basis = "message_timestamps"
+                elif basis is None:
+                    basis = c_basis
+        else:
+            first_dt = last_dt = None
+            first_src = last_src = None
+            basis = None
+    else:
+        msg_files2 = list(_iter_html_message_files(export_root, kind))
+        msg_count, first_dt, last_dt, first_src, last_src, basis = _scan_html_message_files(msg_files2)
 
     return ExportReport(
         export_root=export_root,
@@ -1845,6 +2066,7 @@ def inspect_html_export(export_root: str) -> ExportReport:
         first_message_source=first_src,
         last_message_source=last_src,
         date_range_basis=basis,
+        chat_summaries=chat_summaries if (kind == "html_multi_chat_export" and chat_summaries) else None,
     )
 
 def summarize_html_export(export_root: str) -> ExportReport:
@@ -2066,6 +2288,29 @@ def main() -> int:
                 f"size on disk: {size_s} {kind}"
             )
 
+        def _print_chat_summaries(r: ExportReport) -> None:
+            if not r.chat_summaries:
+                return
+            # Sorted by message count desc; unknowns last.
+            def _k(cs: ChatSummary) -> Tuple[int, str]:
+                m = cs.messages_backed_up
+                return (-(m if m is not None else -1), cs.name)
+
+            for cs in sorted(r.chat_summaries, key=_k):
+                fd = _parse_iso(cs.first_message_utc) if cs.first_message_utc else None
+                ld = _parse_iso(cs.last_message_utc) if cs.last_message_utc else None
+                rng = f"{_fmt_dt_for_dir(fd)}__{_fmt_dt_for_dir(ld)}"
+                msgs = "?" if cs.messages_backed_up is None else str(cs.messages_backed_up)
+                line = (
+                    "  "
+                    + _c(cs.name, _Ansi.CYAN)
+                    + " "
+                    + _c(rng, _Ansi.DIM)
+                    + " messages:"
+                    + _c(msgs, _Ansi.YELLOW)
+                )
+                print(line)
+
         # Grouping by "export root": if collection mode, show a single section for the
         # scanned root; otherwise, show one section per discovered export root.
         if collection_mode:
@@ -2079,6 +2324,7 @@ def main() -> int:
 
             for r in sorted(reports, key=_sort_key):
                 print(_line_for_report(r))
+                _print_chat_summaries(r)
         else:
             # One section per report.export_root (keeps output useful when scanning a parent folder).
             def _sort_key(x: ExportReport) -> tuple:
@@ -2091,6 +2337,7 @@ def main() -> int:
                 print(_c(f"Export root: {r.export_root}", _Ansi.BOLD))
                 print()
                 print(_line_for_report(r))
+                _print_chat_summaries(r)
 
         if not args.no_sizes and size_tool_used:
             tool_note = ", ".join(sorted(t for t in size_tool_used if t != "unknown"))
