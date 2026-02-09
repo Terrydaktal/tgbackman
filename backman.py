@@ -315,6 +315,13 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
     root = os.path.abspath(root)
     out: Dict[str, int] = {}
 
+    def _strip_dust_columns(s: str) -> str:
+        # Many dust versions append a bar/percent table separated by the box-drawing
+        # vertical bar. Chat names can contain ASCII '|' so we only split on '│'.
+        if "│" in s:
+            s = s.split("│", 1)[0]
+        return s.strip().rstrip("/")
+
     # dust output format varies a bit between versions/configs. It may print:
     # - absolute paths (common)
     # - basenames with tree indentation (like `tree`)
@@ -373,6 +380,8 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
         for pat in (
             r"├──\s+",
             r"└──\s+",
+            r"├─┬\s+",
+            r"└─┬\s+",
             r"\|--\s+",
             r"\+--\s+",
             r"`--\s+",
@@ -399,7 +408,7 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
             if rel_tok is not None:
                 idx = line.find(rel_tok)
                 if idx != -1:
-                    path_label = line[idx:].strip().rstrip("/")
+                    path_label = _strip_dust_columns(line[idx:])
                     if path_label in (".", "./."):
                         p = root
                     else:
@@ -424,8 +433,7 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
             continue
 
         idx = marker_match.start()
-        name = line[marker_match.end() :].strip()
-        name = name.rstrip("/")
+        name = _strip_dust_columns(line[marker_match.end() :])
         if not name:
             continue
 
@@ -447,6 +455,12 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
 
         # Map label -> absolute path under root.
         p: Optional[str] = None
+        if not out:
+            # First line may be shown as "└─┬ <basename>" with bars. Treat it as root.
+            if name == os.path.basename(root):
+                out[root] = b
+                stack = []
+                continue
         if name == ".":
             p = root
             stack = []
@@ -504,12 +518,14 @@ def _bulk_dir_sizes_via_dust_tree(root: str, max_depth: int, max_lines: Optional
     # For export roots with hundreds of chat folders, we must raise the limit or
     # we'll miss many sizes and print '?'.
     arg_sets: List[List[str]] = []
-    base0 = [dust, "-b", "-d", str(max_depth), "--no-color", root]
+    base0 = [dust, "-b", "-d", str(max_depth), "--no-colors", root]
     base1 = [dust, "-b", "-d", str(max_depth), root]
     if n_lines is not None:
-        arg_sets.append([dust, "-b", "-d", str(max_depth), "-n", str(n_lines), "--no-color", root])
+        arg_sets.append([dust, "-b", "-d", str(max_depth), "-n", str(n_lines), "--no-colors", root])
         arg_sets.append([dust, "-b", "-d", str(max_depth), "-n", str(n_lines), root])
     arg_sets.append(base0)
+    # Compat: some builds use --no-color (singular). Try it too.
+    arg_sets.append([dust, "-b", "-d", str(max_depth), "--no-color", root])
     arg_sets.append(base1)
 
     for args in arg_sets:
