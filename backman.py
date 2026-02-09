@@ -215,7 +215,20 @@ def _dir_size_bytes(path: str) -> Tuple[Optional[int], str]:
     if dust:
         # `-b` forces raw bytes, making parsing stable; depth 0 = only total.
         try:
-            for args in ([dust, "-b", "-d", "0", "--no-color", p], [dust, "-b", "-d", "0", p]):
+            for args in (
+                # Newer dust uses --no-colors (plural); keep --no-color for compat.
+                [dust, "-b", "--depth", "0", "--no-colors", p],
+                [dust, "-b", "-d", "0", "--no-colors", p],
+                [dust, "-b", "--depth", "0", "--no-color", p],
+                [dust, "-b", "-d", "0", "--no-color", p],
+                [dust, "-b", "--depth", "0", p],
+                [dust, "-b", "-d", "0", p],
+                # Fallback to human output if -b isn't supported.
+                [dust, "--depth", "0", "--no-colors", p],
+                [dust, "-d", "0", "--no-colors", p],
+                [dust, "--depth", "0", p],
+                [dust, "-d", "0", p],
+            ):
                 proc = subprocess.run(
                     args,
                     capture_output=True,
@@ -1422,6 +1435,11 @@ def main() -> int:
         help="Skip scanning message bodies for counts/date ranges (much faster).",
     )
     ap.add_argument(
+        "--no-sizes",
+        action="store_true",
+        help="Do not compute on-disk sizes for discovered exports (faster on slow disks).",
+    )
+    ap.add_argument(
         "--split-multi-html",
         action="store_true",
         help="Convert a multi-chat HTML export into per-chat self-contained exports (copies data).",
@@ -1513,6 +1531,7 @@ def main() -> int:
         print(json.dumps([asdict(r) for r in reports], indent=2, ensure_ascii=False))
     else:
         print(f"Found {len(reports)} Telegram export(s) under: {root}\n")
+        size_tool_used: Set[str] = set()
         for r in reports:
             print(f"- Export root: {r.export_root}")
             if r.fmt == "json":
@@ -1534,13 +1553,21 @@ def main() -> int:
                 print(f"  first message source: {r.first_message_source}")
             if r.last_message_source:
                 print(f"  last message source: {r.last_message_source}")
+            if not args.no_sizes:
+                b, tool = _dir_size_bytes(r.export_root)
+                size_tool_used.add(tool)
+                print(f"  size on disk: {'?' if b is None else _format_bytes(b)}")
             print()
 
         if len(reports) > 1:
             print("Nested/multiple exports detected (more than one export root under the given path).")
 
+        if not args.no_sizes and size_tool_used:
+            tool_note = ", ".join(sorted(t for t in size_tool_used if t != "unknown"))
+            if tool_note:
+                print(f"(size tool: {tool_note})")
         print()
-        print(_render_export_tree(root, reports))
+        # Export tree removed; it was both slow and a poor fit for dust's output across versions.
 
     return 0
 
