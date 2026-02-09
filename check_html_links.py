@@ -327,6 +327,14 @@ class MissingRef:
     note: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class SchemeRef:
+    html_file: str
+    line_no: int
+    attr: str  # src/href/poster/srcset
+    url: str
+
+
 def scan_html_file_for_bad_refs(
     html_path: str,
     root: str,
@@ -336,13 +344,16 @@ def scan_html_file_for_bad_refs(
     check_split_leftovers: bool,
     is_multi_export_root: bool,
     max_keep: int,
-) -> Tuple[int, int, int, int, List[MissingRef], int, List[MissingRef], int, List[MissingRef]]:
+    scheme_prefixes: Optional[Tuple[str, ...]] = None,
+    max_keep_schemes: int = 200,
+) -> Tuple[int, int, int, int, List[MissingRef], int, List[MissingRef], int, List[MissingRef], int, List[SchemeRef]]:
     """
     Returns:
       total_refs, skipped_refs, ok_refs,
       missing_total, missing_kept,
       outside_total, outside_kept,
-      split_leftover_total, split_leftover_kept
+      split_leftover_total, split_leftover_kept,
+      scheme_total, scheme_kept
     """
     total = 0
     skipped = 0
@@ -353,7 +364,24 @@ def scan_html_file_for_bad_refs(
     missing_kept: List[MissingRef] = []
     outside_kept: List[MissingRef] = []
     split_leftover_kept: List[MissingRef] = []
+    scheme_total = 0
+    scheme_kept: List[SchemeRef] = []
     in_style_block = False
+
+    scheme_prefixes_l = tuple((scheme_prefixes or ()))
+
+    def _maybe_keep_scheme(ln: int, attr: str, url: str) -> None:
+        nonlocal scheme_total
+        if not scheme_prefixes_l:
+            return
+        u = url.strip()
+        if not u:
+            return
+        lu = u.lower()
+        if any(lu.startswith(p) for p in scheme_prefixes_l):
+            scheme_total += 1
+            if len(scheme_kept) < max_keep_schemes:
+                scheme_kept.append(SchemeRef(html_path, ln, attr, u))
 
     try:
         with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -411,6 +439,7 @@ def scan_html_file_for_bad_refs(
                 for m in ATTR_URL_RE.finditer(line):
                     url = m.group("url")
                     total += 1
+                    _maybe_keep_scheme(ln, m.group(0).split("=", 1)[0].strip(), url)
                     if scope == "media" and not _is_media_url(url):
                         skipped += 1
                         continue
@@ -454,6 +483,7 @@ def scan_html_file_for_bad_refs(
                     val = m.group("val")
                     for url in _iter_srcset_urls(val):
                         total += 1
+                        _maybe_keep_scheme(ln, "srcset", url)
                         if scope == "media" and not _is_media_url(url):
                             skipped += 1
                             continue
@@ -507,7 +537,7 @@ def scan_html_file_for_bad_refs(
                     in_style_block = False
     except Exception:
         # Treat unreadable files as having no refs; the caller can decide whether to care.
-        return 0, 0, 0, 0, [], 0, [], 0, []
+        return 0, 0, 0, 0, [], 0, [], 0, [], 0, []
 
     return (
         total,
@@ -519,6 +549,8 @@ def scan_html_file_for_bad_refs(
         outside_kept,
         split_leftover_total,
         split_leftover_kept,
+        scheme_total,
+        scheme_kept,
     )
 
 
@@ -549,6 +581,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Stop after the first missing ref (useful for quick checks).",
     )
     ap.add_argument(
+        "--list-schemes",
+        default="",
+        help='Comma-separated scheme names to list when they appear in HTML attributes (href/src/poster/srcset), e.g. "file,tg".',
+    )
+    ap.add_argument(
+        "--max-schemes",
+        type=int,
+        default=200,
+        help="Limit scheme refs printed (default: 200).",
+    )
+    ap.add_argument(
         "--count-media-files",
         action="store_true",
         help="Also count on-disk media files: shared under each chat's media/ vs chat-local media dirs.",
@@ -574,12 +617,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     missing_total = 0
     outside_total = 0
     split_leftover_total = 0
+    scheme_total = 0
     missing_kept: List[MissingRef] = []
     outside_kept: List[MissingRef] = []
     split_leftover_kept: List[MissingRef] = []
+    scheme_kept: List[SchemeRef] = []
+
+    scheme_prefixes: Optional[Tuple[str, ...]]
+    scheme_names = [s.strip().lower() for s in args.list_schemes.split(",") if s.strip()]
+    if scheme_names:
+        scheme_prefixes = tuple(f"{s}:" for s in scheme_names)
+    else:
+        scheme_prefixes = None
 
     for p in html_files:
-        t, s, ok, m_total, m_kept, o_total, o_kept, sl_total, sl_kept = scan_html_file_for_bad_refs(
+        t, s, ok, m_total, m_kept, o_total, o_kept, sl_total, sl_kept, sc_total, sc_kept = scan_html_file_for_bad_refs(
             p,
             root,
             scope=args.scope,
@@ -587,6 +639,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             check_split_leftovers=(not args.no_split_leftovers_check),
             is_multi_export_root=is_multi_export_root,
             max_keep=args.max_missing,
+            scheme_prefixes=scheme_prefixes,
+            max_keep_schemes=args.max_schemes,
         )
         total_refs += t
         skipped_refs += s
@@ -594,6 +648,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         missing_total += m_total
         outside_total += o_total
         split_leftover_total += sl_total
+        scheme_total += sc_total
         # Keep a bounded sample list across all files.
         for m in m_kept:
             if len(missing_kept) >= args.max_missing:
@@ -607,6 +662,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if len(split_leftover_kept) >= args.max_missing:
                 break
             split_leftover_kept.append(m)
+        for m in sc_kept:
+            if len(scheme_kept) >= args.max_schemes:
+                break
+            scheme_kept.append(m)
 
         if (m_total or o_total or sl_total) and args.fail_fast:
             break
@@ -638,6 +697,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "total_refs": total_refs,
             "skipped_refs": skipped_refs,
             "ok_refs": ok_refs,
+            "scheme_refs_total": scheme_total if scheme_prefixes else None,
+            "scheme_refs": [
+                {
+                    "html_file": m.html_file,
+                    "line_no": m.line_no,
+                    "attr": m.attr,
+                    "url": m.url,
+                }
+                for m in scheme_kept
+            ]
+            if scheme_prefixes
+            else [],
             "shared_media_files": shared_media_files if args.count_media_files else None,
             "chat_local_media_files": chat_local_media_files if args.count_media_files else None,
             "split_leftover_refs": [
@@ -692,6 +763,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"shared_in_media_dir={shared_media_files} "
             f"chat_local_in_dirs={chat_local_media_files}"
         )
+    if scheme_prefixes:
+        print(f"Scheme refs (in HTML attrs): total={scheme_total} ({', '.join(scheme_names)})")
 
     if not missing_total and not outside_total and not split_leftover_total:
         print()
@@ -733,6 +806,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         if missing_total > len(missing_kept):
             print(_c(f"... and {missing_total - len(missing_kept)} more", _Ansi.DIM))
+
+    if scheme_prefixes and scheme_total:
+        print()
+        print(_c("Scheme refs found in HTML attributes:", _Ansi.CYAN))
+        lim = args.max_schemes
+        for i, m in enumerate(scheme_kept[:lim], start=1):
+            rel_html = os.path.relpath(m.html_file, root)
+            print(f"{i:>4}. {rel_html}:{m.line_no} {m.attr}=\"{m.url}\"")
+        if scheme_total > len(scheme_kept):
+            print(_c(f"... and {scheme_total - len(scheme_kept)} more", _Ansi.DIM))
 
     return 1
 
