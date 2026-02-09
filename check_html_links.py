@@ -100,6 +100,8 @@ MEDIA_DIRS = {
     "round_video_messages",
     "profile_pictures",
     "images",
+    # Used by backman split to localize shared media
+    "media",
 }
 
 MEDIA_EXTS = {
@@ -164,8 +166,20 @@ def _should_skip_url(url: str) -> bool:
 def _normalize_url_to_fs_path(url: str) -> str:
     u = _html.unescape(url).strip()
     u = u.split("#", 1)[0].split("?", 1)[0].strip()
-    u = urllib.parse.unquote(u)
     return u
+
+
+def _strip_leading_dot_segments(p: str) -> str:
+    # Collapse leading "./" and "../" for classification; does not resolve on disk.
+    s = p.replace("\\", "/")
+    out: List[str] = []
+    for seg in s.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            continue
+        out.append(seg)
+    return "/".join(out)
 
 
 def _resolve_local_ref(
@@ -180,46 +194,65 @@ def _resolve_local_ref(
     if _should_skip_url(url):
         return None, None
 
-    u = _normalize_url_to_fs_path(url)
-    if not u:
+    u0 = _normalize_url_to_fs_path(url)
+    if not u0:
         return None, None
 
-    src_dir = os.path.dirname(src_html_path)
-    if os.path.isabs(u):
-        # Treat absolute paths as suspicious; still check if they exist.
-        abs_p = os.path.abspath(os.path.normpath(u))
-        note = "absolute"
-    else:
-        abs_p = os.path.abspath(os.path.normpath(os.path.join(src_dir, u)))
-        note = None
-
-    root_abs = os.path.abspath(root)
+    # Telegram exports sometimes keep percent-encoding in on-disk filenames; try both.
+    u_candidates = [u0]
     try:
-        within = os.path.commonpath([root_abs, abs_p]) == root_abs
+        uq = urllib.parse.unquote(u0)
+        if uq and uq != u0:
+            u_candidates.append(uq)
     except Exception:
-        within = False
-    if not within:
-        # This can happen with ../../.. links that escape root; still validate existence.
-        note = (note + ",outside-root") if note else "outside-root"
+        pass
 
-    return abs_p, note
+    src_dir = os.path.dirname(src_html_path)
+    root_abs = os.path.abspath(root)
+    chosen_abs: Optional[str] = None
+    chosen_note: Optional[str] = None
+
+    for u in u_candidates:
+        if not u:
+            continue
+        if os.path.isabs(u):
+            abs_p = os.path.abspath(os.path.normpath(u))
+            note = "absolute"
+        else:
+            abs_p = os.path.abspath(os.path.normpath(os.path.join(src_dir, u)))
+            note = None
+
+        try:
+            within = os.path.commonpath([root_abs, abs_p]) == root_abs
+        except Exception:
+            within = False
+        if not within:
+            note = (note + ",outside-root") if note else "outside-root"
+
+        if os.path.exists(abs_p):
+            return abs_p, note
+
+        if chosen_abs is None:
+            chosen_abs = abs_p
+            chosen_note = note
+
+    return chosen_abs, chosen_note
 
 def _is_media_url(url: str) -> bool:
     """
-    Heuristic: treat as "media" if the URL points into common Telegram media dirs or has a
-    media-like extension.
+    Media in Telegram exports is almost always stored under specific directories. For a
+    "media-only" scan, we restrict to those directories to avoid false positives from
+    pasted code snippets and linkified domains.
     """
     if _should_skip_url(url):
         return False
     u = _normalize_url_to_fs_path(url)
     if not u:
         return False
-    # Normalize separators for splitting.
-    seg0 = u.replace("\\", "/").lstrip("/").split("/", 1)[0]
-    if seg0 in MEDIA_DIRS:
-        return True
-    ext = os.path.splitext(u)[1].lower()
-    if ext in MEDIA_EXTS:
+    # Normalize separators for splitting, ignoring leading ../ and ./ segments.
+    u2 = _strip_leading_dot_segments(u)
+    parts = [p for p in u2.replace("\\", "/").lstrip("/").split("/") if p]
+    if any(p in MEDIA_DIRS for p in parts):
         return True
     return False
 
@@ -267,18 +300,32 @@ def scan_html_file_for_bad_refs(
     outside_total = 0
     missing_kept: List[MissingRef] = []
     outside_kept: List[MissingRef] = []
+    in_style_block = False
 
     try:
         with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
             for ln, line in enumerate(f, start=1):
+                line_l = line.lower()
+                # Track <style> blocks so we only treat url(...) in real CSS contexts.
+                if "<style" in line_l:
+                    in_style_block = True
+                if "</style" in line_l:
+                    # Note: if both <style and </style are on the same line, we'll still
+                    # process the line as CSS context.
+                    end_style_after = True
+                else:
+                    end_style_after = False
+
                 # Avoid heavy regex work on most lines.
                 if (
-                    "href" not in line
-                    and "src" not in line
-                    and "poster" not in line
-                    and "srcset" not in line
-                    and "url(" not in line
+                    "href" not in line_l
+                    and "src" not in line_l
+                    and "poster" not in line_l
+                    and "srcset" not in line_l
+                    and "url(" not in line_l
                 ):
+                    if end_style_after:
+                        in_style_block = False
                     continue
 
                 for m in ATTR_URL_RE.finditer(line):
@@ -351,6 +398,10 @@ def scan_html_file_for_bad_refs(
                 for m in CSS_URL_RE.finditer(line):
                     url = m.group("url")
                     total += 1
+                    # Only consider url(...) inside actual CSS contexts (style="..." or <style> blocks).
+                    if not in_style_block and 'style="' not in line_l and "style='" not in line_l:
+                        skipped += 1
+                        continue
                     if scope == "media" and not _is_media_url(url):
                         skipped += 1
                         continue
@@ -371,6 +422,9 @@ def scan_html_file_for_bad_refs(
                     missing_total += 1
                     if len(missing_kept) < max_keep:
                         missing_kept.append(MissingRef(html_path, ln, "url(...)", url, resolved, note))
+
+                if end_style_after:
+                    in_style_block = False
     except Exception:
         # Treat unreadable files as having no refs; the caller can decide whether to care.
         return 0, 0, 0, 0, [], 0, []
