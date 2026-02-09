@@ -626,12 +626,13 @@ def _bulk_export_sizes_once(scan_root: str, export_roots: List[str]) -> Tuple[Di
         depth = 0 if rel == "." else rel.count(os.sep) + 1
         max_depth = max(max_depth, depth)
 
-    # Ensure we don't truncate output at the top-level. This is cheap compared to a full size walk.
+    # Ensure we don't truncate output. Some dust builds apply the line limit globally,
+    # so for depth>1 we may need roughly (top-level dirs + export roots) lines.
     try:
         top_dirs = sum(1 for e in os.scandir(scan_root) if e.is_dir(follow_symlinks=False))
     except Exception:
         top_dirs = max(200, len(abs_roots))
-    max_lines = max(200, top_dirs + 50)
+    max_lines = max(200, 1 + top_dirs + len(abs_roots) + 100)
 
     dust_map, tool = _bulk_dir_sizes_via_dust_tree(scan_root, max_depth=max_depth, max_lines=max_lines)
     if not dust_map:
