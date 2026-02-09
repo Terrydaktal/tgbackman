@@ -1745,14 +1745,21 @@ def main() -> int:
         if collection_mode:
             print(_c(f"Export root: {root}", _Ansi.BOLD))
             print()
-            for r in sorted(
-                reports,
-                key=lambda x: os.path.relpath(x.export_root, root),
-            ):
+            def _sort_key(x: ExportReport) -> tuple:
+                # Primary: messages descending (unknowns last). Secondary: stable path ordering.
+                msgs = x.messages_backed_up
+                rel = os.path.relpath(x.export_root, root)
+                return (-(msgs if msgs is not None else -1), rel)
+
+            for r in sorted(reports, key=_sort_key):
                 print(_line_for_report(r))
         else:
             # One section per report.export_root (keeps output useful when scanning a parent folder).
-            for i, r in enumerate(sorted(reports, key=lambda x: x.export_root)):
+            def _sort_key(x: ExportReport) -> tuple:
+                msgs = x.messages_backed_up
+                return (-(msgs if msgs is not None else -1), x.export_root)
+
+            for i, r in enumerate(sorted(reports, key=_sort_key)):
                 if i:
                     print()
                 print(_c(f"Export root: {r.export_root}", _Ansi.BOLD))
