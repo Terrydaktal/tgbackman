@@ -605,6 +605,43 @@ def _bulk_dir_sizes_via_dust_tree(root: str, max_depth: int, max_lines: Optional
             return m, "dust"
     return {}, "unknown"
 
+def _bulk_export_sizes_once(scan_root: str, export_roots: List[str]) -> Tuple[Dict[str, Optional[int]], str]:
+    """
+    Compute sizes for multiple export roots using a single dust invocation over scan_root.
+    Returns: (abs_path -> bytes|None, tool_used).
+    """
+    scan_root = os.path.abspath(scan_root)
+    abs_roots = [os.path.abspath(p) for p in export_roots]
+
+    dust = shutil.which("dust")
+    if not dust:
+        return {p: None for p in abs_roots}, "unknown"
+
+    # Compute the minimum depth needed to include all export roots.
+    max_depth = 0
+    for p in abs_roots:
+        if not _is_ancestor_dir(scan_root, p):
+            continue
+        rel = os.path.relpath(p, scan_root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        max_depth = max(max_depth, depth)
+
+    # Ensure we don't truncate output at the top-level. This is cheap compared to a full size walk.
+    try:
+        top_dirs = sum(1 for e in os.scandir(scan_root) if e.is_dir(follow_symlinks=False))
+    except Exception:
+        top_dirs = max(200, len(abs_roots))
+    max_lines = max(200, top_dirs + 50)
+
+    dust_map, tool = _bulk_dir_sizes_via_dust_tree(scan_root, max_depth=max_depth, max_lines=max_lines)
+    if not dust_map:
+        return {p: None for p in abs_roots}, tool
+
+    out: Dict[str, Optional[int]] = {}
+    for p in abs_roots:
+        out[p] = dust_map.get(p)
+    return out, tool
+
 def _dir_size_bytes_dust_only(path: str) -> Optional[int]:
     dust = shutil.which("dust")
     if not dust:
@@ -1532,6 +1569,14 @@ def main() -> int:
     else:
         print(f"Found {len(reports)} Telegram export(s) under: {root}\n")
         size_tool_used: Set[str] = set()
+        size_by_export_root: Dict[str, Optional[int]] = {}
+
+        if not args.no_sizes:
+            export_roots = [r.export_root for r in reports]
+            size_by_export_root, tool = _bulk_export_sizes_once(root, export_roots)
+            if tool:
+                size_tool_used.add(tool)
+
         for r in reports:
             print(f"- Export root: {r.export_root}")
             if r.fmt == "json":
@@ -1554,8 +1599,7 @@ def main() -> int:
             if r.last_message_source:
                 print(f"  last message source: {r.last_message_source}")
             if not args.no_sizes:
-                b, tool = _dir_size_bytes(r.export_root)
-                size_tool_used.add(tool)
+                b = size_by_export_root.get(os.path.abspath(r.export_root))
                 print(f"  size on disk: {'?' if b is None else _format_bytes(b)}")
             print()
 
