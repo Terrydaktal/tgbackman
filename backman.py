@@ -320,6 +320,9 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
         # vertical bar. Chat names can contain ASCII '|' so we only split on '│'.
         if "│" in s:
             s = s.split("│", 1)[0]
+        # Some builds may not use the box-drawing separator; still strip a trailing
+        # percent column if present (e.g. "...   24%").
+        s = re.sub(r"\s+\d+%\s*$", "", s)
         return s.strip().rstrip("/")
 
     # dust output format varies a bit between versions/configs. It may print:
@@ -423,6 +426,27 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
                         stack = [] if rel2 == "." else rel2.split(os.sep)
                         continue
 
+            # Another flat form is just: "<size> <name>" (no slashes, no tree glyphs),
+            # which is common when depth=1 and the tool prints basenames.
+            if size_i >= 0 and size_i < len(toks):
+                size_tok = toks[size_i]
+                j = line.find(size_tok)
+                if j != -1:
+                    cand = _strip_dust_columns(line[j + len(size_tok) :])
+                    # Drop any leading punctuation that might remain after stripping.
+                    cand = cand.lstrip(" -\t")
+                    if cand:
+                        if cand == os.path.basename(root) and not out:
+                            out[root] = b
+                            stack = []
+                            continue
+                        p = os.path.abspath(os.path.join(root, cand))
+                        if _is_ancestor_dir(root, p):
+                            out[p] = b
+                            rel2 = os.path.relpath(p, root)
+                            stack = [] if rel2 == "." else rel2.split(os.sep)
+                            continue
+
             # Root line: dust commonly uses "." or prints the input path.
             # If unsure, treat the first parsed line as the root total.
             if not out:
@@ -514,19 +538,30 @@ def _bulk_dir_sizes_via_dust_tree(root: str, max_depth: int, max_lines: Optional
         except Exception:
             n_lines = None
 
-    # Note: dust defaults to showing only a limited number of lines at each level.
+    # Note: dust defaults to showing only a limited number of lines.
     # For export roots with hundreds of chat folders, we must raise the limit or
     # we'll miss many sizes and print '?'.
     arg_sets: List[List[str]] = []
-    base0 = [dust, "-b", "-d", str(max_depth), "--no-colors", root]
-    base1 = [dust, "-b", "-d", str(max_depth), root]
+
+    # Prefer the user's typical fast output (human units + tree glyphs), then fall
+    # back to bytes output if available.
+    base0 = [dust, "-d", str(max_depth), "--no-colors", root]
+    base1 = [dust, "-d", str(max_depth), root]
+    baseb0 = [dust, "-b", "-d", str(max_depth), "--no-colors", root]
+    baseb1 = [dust, "-b", "-d", str(max_depth), root]
     if n_lines is not None:
+        arg_sets.append([dust, "-d", str(max_depth), "-n", str(n_lines), "--no-colors", root])
+        arg_sets.append([dust, "-d", str(max_depth), "-n", str(n_lines), root])
         arg_sets.append([dust, "-b", "-d", str(max_depth), "-n", str(n_lines), "--no-colors", root])
         arg_sets.append([dust, "-b", "-d", str(max_depth), "-n", str(n_lines), root])
+
     arg_sets.append(base0)
-    # Compat: some builds use --no-color (singular). Try it too.
-    arg_sets.append([dust, "-b", "-d", str(max_depth), "--no-color", root])
     arg_sets.append(base1)
+    arg_sets.append(baseb0)
+    # Compat: some builds use --no-color (singular). Try it too.
+    arg_sets.append([dust, "-d", str(max_depth), "--no-color", root])
+    arg_sets.append([dust, "-b", "-d", str(max_depth), "--no-color", root])
+    arg_sets.append(baseb1)
 
     for args in arg_sets:
         stdout = _dust_call(args)
