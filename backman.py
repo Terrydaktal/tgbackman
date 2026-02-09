@@ -316,28 +316,51 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
     out: Dict[str, int] = {}
 
     # dust output format varies a bit between versions/configs. It may print:
+    # - absolute paths (common)
     # - basenames with tree indentation (like `tree`)
     # - relative paths like `chats/chat_001` even at deeper depths
-    # - absolute paths in some modes
     #
-    # We keep a stack for basename-only mode but also support paths with separators.
+    # We support all three:
+    # - If the line contains `root`, we grab the substring starting at `root` and
+    #   treat it as the path label. This handles spaces in directory names.
+    # - Else, if it looks like tree output, we reconstruct from indentation.
+    # - Else, we skip the line (we can't reliably recover a path with spaces).
     stack: List[str] = []
     for raw in stdout.splitlines():
         line = raw.rstrip("\n")
         if not line.strip():
             continue
 
-        try:
-            # With `-b`, dust typically prints bytes as the first token.
-            # Still tolerate human tokens (e.g. "4.00KiB") just in case.
-            parts0 = line.lstrip().split()
-            if not parts0:
-                continue
-            b0 = _parse_human_bytes(parts0[0])
-            if b0 is None:
-                continue
-            b = b0
-        except Exception:
+        # Parse size: find the first token that parses as a size (bytes or human).
+        cleaned = (
+            line.replace("│", " ")
+            .replace("█", " ")
+            .replace("▉", " ")
+            .replace("▊", " ")
+            .replace("▌", " ")
+            .replace("▓", " ")
+            .replace("▒", " ")
+            .replace("░", " ")
+        )
+        b: Optional[int] = None
+        for tok in (x for x in cleaned.split() if x):
+            b_try = _parse_human_bytes(tok)
+            if b_try is not None:
+                b = b_try
+                break
+        if b is None:
+            continue
+
+        # Fast path: dust prints full paths (including root) on each line.
+        if root in line:
+            idx = line.find(root)
+            path_label = line[idx:].strip().rstrip("/")
+            p = os.path.abspath(path_label)
+            if _is_ancestor_dir(root, p):
+                out[p] = b
+            else:
+                # If `root` occurs in other columns (rare), fall back to tree parsing.
+                pass
             continue
 
         # Find tree branch marker if present.
@@ -423,7 +446,7 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
 
     return out
 
-def _bulk_dir_sizes_via_dust_tree(root: str, max_depth: int) -> Tuple[Dict[str, int], str]:
+def _bulk_dir_sizes_via_dust_tree(root: str, max_depth: int, max_lines: Optional[int] = None) -> Tuple[Dict[str, int], str]:
     """
     One dust invocation over `root`, returning directory totals for paths under it.
     This matches the speed profile of running `dust <root>` manually.
@@ -434,11 +457,26 @@ def _bulk_dir_sizes_via_dust_tree(root: str, max_depth: int) -> Tuple[Dict[str, 
 
     root = os.path.abspath(root)
     max_depth = max(0, int(max_depth))
+    n_lines = None
+    if max_lines is not None:
+        try:
+            n_lines = max(1, int(max_lines))
+        except Exception:
+            n_lines = None
 
-    for args in (
-        [dust, "-b", "-d", str(max_depth), "--no-color", root],
-        [dust, "-b", "-d", str(max_depth), root],
-    ):
+    # Note: dust defaults to showing only a limited number of lines at each level.
+    # For export roots with hundreds of chat folders, we must raise the limit or
+    # we'll miss many sizes and print '?'.
+    arg_sets: List[List[str]] = []
+    base0 = [dust, "-b", "-d", str(max_depth), "--no-color", root]
+    base1 = [dust, "-b", "-d", str(max_depth), root]
+    if n_lines is not None:
+        arg_sets.append([dust, "-b", "-d", str(max_depth), "-n", str(n_lines), "--no-color", root])
+        arg_sets.append([dust, "-b", "-d", str(max_depth), "-n", str(n_lines), root])
+    arg_sets.append(base0)
+    arg_sets.append(base1)
+
+    for args in arg_sets:
         stdout = _dust_call(args)
         if stdout is None:
             continue
@@ -523,7 +561,21 @@ def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
         if depth > max_depth:
             max_depth = depth
 
-    dust_map, dust_tool = _bulk_dir_sizes_via_dust_tree(root, max_depth=max_depth)
+    # Tell dust to print enough entries at the first level to cover all unique
+    # top-level directories that contain exports (common case: hundreds of chats).
+    first_level: Set[str] = set()
+    for n in nodes:
+        if n == root:
+            continue
+        rel = os.path.relpath(n, root)
+        if rel == ".":
+            continue
+        first = rel.split(os.sep, 1)[0]
+        if first:
+            first_level.add(first)
+    dust_lines = max(50, len(first_level) + 25)
+
+    dust_map, dust_tool = _bulk_dir_sizes_via_dust_tree(root, max_depth=max_depth, max_lines=dust_lines)
     if dust_map:
         tools.add(dust_tool)
 
