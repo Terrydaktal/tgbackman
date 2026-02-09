@@ -304,6 +304,29 @@ def _is_media_url(url: str) -> bool:
         return True
     return False
 
+def _classify_media_ref(url: str) -> Optional[str]:
+    """
+    For media-like refs, classify whether it points at:
+    - shared media localized under media/ (split output)
+    - chat-local media dirs like files/, photos/, etc.
+    Returns "shared", "chat_local", or None.
+    """
+    if _should_skip_url(url):
+        return None
+    u = _normalize_url_to_fs_path(url)
+    if not u:
+        return None
+    u2 = _strip_leading_dot_segments(u)
+    parts = [p for p in u2.replace("\\", "/").lstrip("/").split("/") if p]
+    if not parts:
+        return None
+    head = parts[0]
+    if head == "media":
+        return "shared"
+    if head in CHAT_LOCAL_MEDIA_DIRS:
+        return "chat_local"
+    return None
+
 
 def _iter_srcset_urls(val: str) -> Iterator[str]:
     # srcset format: "url1 1x, url2 2x" or "url 640w, url 1280w"
@@ -346,14 +369,29 @@ def scan_html_file_for_bad_refs(
     max_keep: int,
     scheme_prefixes: Optional[Tuple[str, ...]] = None,
     max_keep_schemes: int = 200,
-) -> Tuple[int, int, int, int, List[MissingRef], int, List[MissingRef], int, List[MissingRef], int, List[SchemeRef]]:
+) -> Tuple[
+    int,
+    int,
+    int,
+    int,
+    List[MissingRef],
+    int,
+    List[MissingRef],
+    int,
+    List[MissingRef],
+    int,
+    List[SchemeRef],
+    int,
+    int,
+]:
     """
     Returns:
       total_refs, skipped_refs, ok_refs,
       missing_total, missing_kept,
       outside_total, outside_kept,
       split_leftover_total, split_leftover_kept,
-      scheme_total, scheme_kept
+      scheme_total, scheme_kept,
+      media_shared_refs, media_chat_local_refs
     """
     total = 0
     skipped = 0
@@ -366,6 +404,8 @@ def scan_html_file_for_bad_refs(
     split_leftover_kept: List[MissingRef] = []
     scheme_total = 0
     scheme_kept: List[SchemeRef] = []
+    media_shared_refs = 0
+    media_chat_local_refs = 0
     in_style_block = False
 
     scheme_prefixes_l = tuple((scheme_prefixes or ()))
@@ -440,6 +480,12 @@ def scan_html_file_for_bad_refs(
                     url = m.group("url")
                     total += 1
                     _maybe_keep_scheme(ln, m.group(0).split("=", 1)[0].strip(), url)
+                    if _is_media_url(url):
+                        cls = _classify_media_ref(url)
+                        if cls == "shared":
+                            media_shared_refs += 1
+                        elif cls == "chat_local":
+                            media_chat_local_refs += 1
                     if scope == "media" and not _is_media_url(url):
                         skipped += 1
                         continue
@@ -484,6 +530,12 @@ def scan_html_file_for_bad_refs(
                     for url in _iter_srcset_urls(val):
                         total += 1
                         _maybe_keep_scheme(ln, "srcset", url)
+                        if _is_media_url(url):
+                            cls = _classify_media_ref(url)
+                            if cls == "shared":
+                                media_shared_refs += 1
+                            elif cls == "chat_local":
+                                media_chat_local_refs += 1
                         if scope == "media" and not _is_media_url(url):
                             skipped += 1
                             continue
@@ -512,6 +564,12 @@ def scan_html_file_for_bad_refs(
                     if not in_style_block and 'style="' not in line_l and "style='" not in line_l:
                         skipped += 1
                         continue
+                    if _is_media_url(url):
+                        cls = _classify_media_ref(url)
+                        if cls == "shared":
+                            media_shared_refs += 1
+                        elif cls == "chat_local":
+                            media_chat_local_refs += 1
                     if scope == "media" and not _is_media_url(url):
                         skipped += 1
                         continue
@@ -537,7 +595,7 @@ def scan_html_file_for_bad_refs(
                     in_style_block = False
     except Exception:
         # Treat unreadable files as having no refs; the caller can decide whether to care.
-        return 0, 0, 0, 0, [], 0, [], 0, [], 0, []
+        return 0, 0, 0, 0, [], 0, [], 0, [], 0, [], 0, 0
 
     return (
         total,
@@ -551,6 +609,8 @@ def scan_html_file_for_bad_refs(
         split_leftover_kept,
         scheme_total,
         scheme_kept,
+        media_shared_refs,
+        media_chat_local_refs,
     )
 
 
@@ -618,6 +678,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     outside_total = 0
     split_leftover_total = 0
     scheme_total = 0
+    media_shared_refs_total = 0
+    media_chat_local_refs_total = 0
     missing_kept: List[MissingRef] = []
     outside_kept: List[MissingRef] = []
     split_leftover_kept: List[MissingRef] = []
@@ -631,7 +693,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         scheme_prefixes = None
 
     for p in html_files:
-        t, s, ok, m_total, m_kept, o_total, o_kept, sl_total, sl_kept, sc_total, sc_kept = scan_html_file_for_bad_refs(
+        (
+            t,
+            s,
+            ok,
+            m_total,
+            m_kept,
+            o_total,
+            o_kept,
+            sl_total,
+            sl_kept,
+            sc_total,
+            sc_kept,
+            ms_total,
+            ml_total,
+        ) = scan_html_file_for_bad_refs(
             p,
             root,
             scope=args.scope,
@@ -649,6 +725,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         outside_total += o_total
         split_leftover_total += sl_total
         scheme_total += sc_total
+        media_shared_refs_total += ms_total
+        media_chat_local_refs_total += ml_total
         # Keep a bounded sample list across all files.
         for m in m_kept:
             if len(missing_kept) >= args.max_missing:
@@ -697,6 +775,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "total_refs": total_refs,
             "skipped_refs": skipped_refs,
             "ok_refs": ok_refs,
+            "media_shared_refs_total": media_shared_refs_total,
+            "media_chat_local_refs_total": media_chat_local_refs_total,
             "scheme_refs_total": scheme_total if scheme_prefixes else None,
             "scheme_refs": [
                 {
@@ -756,6 +836,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(
         f"Refs: total={total_refs} ok={ok_refs} skipped={skipped_refs} "
         f"split_leftover={split_leftover_total} outside_root={outside_total} missing={missing_total} ({scope_note})"
+    )
+    print(
+        "Media refs (links): "
+        f"shared_media_dir={media_shared_refs_total} "
+        f"chat_local_dirs={media_chat_local_refs_total}"
     )
     if args.count_media_files:
         print(
