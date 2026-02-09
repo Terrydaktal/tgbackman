@@ -318,13 +318,15 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
     # dust output format varies a bit between versions/configs. It may print:
     # - absolute paths (common)
     # - basenames with tree indentation (like `tree`)
-    # - relative paths like `chats/chat_001` even at deeper depths
+    # - relative paths (common) like `chats/chat_001` or `./chats/chat_001`, either
+    #   as a tree or as a flat list (no glyphs).
     #
-    # We support all three:
+    # We support all of the above:
     # - If the line contains `root`, we grab the substring starting at `root` and
     #   treat it as the path label. This handles spaces in directory names.
     # - Else, if it looks like tree output, we reconstruct from indentation.
-    # - Else, we skip the line (we can't reliably recover a path with spaces).
+    # - Else, try to recover a relative path by finding the first token that looks
+    #   like a path and taking the rest of the line from there (preserves spaces).
     stack: List[str] = []
     for raw in stdout.splitlines():
         line = raw.rstrip("\n")
@@ -343,10 +345,13 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
             .replace("░", " ")
         )
         b: Optional[int] = None
-        for tok in (x for x in cleaned.split() if x):
+        toks = [x for x in cleaned.split() if x]
+        size_i = -1
+        for i, tok in enumerate(toks):
             b_try = _parse_human_bytes(tok)
             if b_try is not None:
                 b = b_try
+                size_i = i
                 break
         if b is None:
             continue
@@ -378,6 +383,37 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
                 break
 
         if not marker_match:
+            # Flat-list output: try to find a path-like token after the size.
+            # Example forms:
+            #   12345  chats/alex
+            #   4.00KiB  ./chats/Alternative group
+            rel_tok: Optional[str] = None
+            if size_i >= 0:
+                for tok in toks[size_i + 1 :]:
+                    if tok in (".", "./."):
+                        rel_tok = "."
+                        break
+                    if tok.startswith("./") or tok.startswith("../") or ("/" in tok) or (os.sep in tok):
+                        rel_tok = tok
+                        break
+            if rel_tok is not None:
+                idx = line.find(rel_tok)
+                if idx != -1:
+                    path_label = line[idx:].strip().rstrip("/")
+                    if path_label in (".", "./."):
+                        p = root
+                    else:
+                        if path_label.startswith("./"):
+                            path_label = path_label[2:]
+                        path_label = path_label.lstrip(os.sep)
+                        p = os.path.abspath(os.path.join(root, path_label))
+                    if _is_ancestor_dir(root, p):
+                        out[p] = b
+                        # Keep stack in sync for any subsequent tree-like lines.
+                        rel2 = os.path.relpath(p, root)
+                        stack = [] if rel2 == "." else rel2.split(os.sep)
+                        continue
+
             # Root line: dust commonly uses "." or prints the input path.
             # If unsure, treat the first parsed line as the root total.
             if not out:
