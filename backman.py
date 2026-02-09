@@ -315,67 +315,110 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
     root = os.path.abspath(root)
     out: Dict[str, int] = {}
 
-    # Reconstruct full relative paths using tree indentation, because dust prints
-    # basenames at deeper depths (like `tree`), not full relative paths.
+    # dust output format varies a bit between versions/configs. It may print:
+    # - basenames with tree indentation (like `tree`)
+    # - relative paths like `chats/chat_001` even at deeper depths
+    # - absolute paths in some modes
+    #
+    # We keep a stack for basename-only mode but also support paths with separators.
     stack: List[str] = []
     for raw in stdout.splitlines():
         line = raw.rstrip("\n")
         if not line.strip():
             continue
 
-        m = re.search(r"(\d+)", line)
-        if not m:
-            continue
         try:
-            b = int(m.group(1))
+            # With `-b`, dust typically prints bytes as the first token.
+            # Still tolerate human tokens (e.g. "4.00KiB") just in case.
+            parts0 = line.lstrip().split()
+            if not parts0:
+                continue
+            b0 = _parse_human_bytes(parts0[0])
+            if b0 is None:
+                continue
+            b = b0
         except Exception:
             continue
 
         # Find tree branch marker if present.
-        idx = -1
-        marker = ""
-        for mk in ("├── ", "└── "):
-            j = line.find(mk)
-            if j != -1:
-                idx = j
-                marker = mk
+        marker_match = None
+        for pat in (
+            r"├──\s+",
+            r"└──\s+",
+            r"\|--\s+",
+            r"\+--\s+",
+            r"`--\s+",
+        ):
+            m = re.search(pat, line)
+            if m:
+                marker_match = m
                 break
 
-        if idx == -1:
-            # Root line: dust commonly uses "." for the input root.
-            out[root] = b
+        if not marker_match:
+            # Root line: dust commonly uses "." or prints the input path.
+            # If unsure, treat the first parsed line as the root total.
+            if not out:
+                out[root] = b
+            else:
+                if root in line:
+                    out[root] = b
             continue
 
-        # Determine depth by counting 4-char indent blocks right before the marker.
-        depth_prefix = 0
-        j = idx
-        while j >= 4:
-            chunk = line[j - 4 : j]
-            if chunk in ("│   ", "    "):
-                depth_prefix += 1
-                j -= 4
-                continue
-            break
-        depth = depth_prefix + 1
-
-        name = line[idx + len(marker) :].strip()
+        idx = marker_match.start()
+        name = line[marker_match.end() :].strip()
         name = name.rstrip("/")
         if not name:
             continue
 
-        # Maintain a stack of path components at each depth.
-        if depth <= 0:
-            continue
-        if len(stack) >= depth:
-            stack = stack[: depth - 1]
-        while len(stack) < depth - 1:
-            # If the output is malformed, pad to avoid IndexError.
-            stack.append("_")
-        stack.append(name)
+        # Determine depth by counting indent blocks right before the marker.
+        # Most builds use 4-char blocks ("│   " / "    "), but tolerate 3-char ASCII.
+        depth_prefix = 0
+        j = idx
+        while j > 0:
+            if j >= 4 and line[j - 4 : j] in ("│   ", "    "):
+                depth_prefix += 1
+                j -= 4
+                continue
+            if j >= 3 and line[j - 3 : j] in ("|  ", "│  "):
+                depth_prefix += 1
+                j -= 3
+                continue
+            break
+        depth = depth_prefix + 1
 
-        rel = os.path.join(*stack) if stack else "."
-        p = os.path.abspath(os.path.join(root, rel))
-        if _is_ancestor_dir(root, p):
+        # Map label -> absolute path under root.
+        p: Optional[str] = None
+        if name == ".":
+            p = root
+            stack = []
+        elif os.path.isabs(name):
+            p = os.path.abspath(name)
+            if _is_ancestor_dir(root, p):
+                rel = os.path.relpath(p, root)
+                stack = [] if rel == "." else rel.split(os.sep)
+        elif (os.sep in name) or ("/" in name):
+            # Some dust versions print relative paths even at deeper levels.
+            rel = name
+            if rel.startswith("./"):
+                rel = rel[2:]
+            rel = rel.lstrip(os.sep)
+            p = os.path.abspath(os.path.join(root, rel))
+            if _is_ancestor_dir(root, p):
+                rel2 = os.path.relpath(p, root)
+                stack = [] if rel2 == "." else rel2.split(os.sep)
+        else:
+            # Basename-only output: maintain a stack of path components.
+            if depth <= 0:
+                continue
+            if len(stack) >= depth:
+                stack = stack[: depth - 1]
+            while len(stack) < depth - 1:
+                stack.append("_")
+            stack.append(name)
+            rel = os.path.join(*stack) if stack else "."
+            p = os.path.abspath(os.path.join(root, rel))
+
+        if p and _is_ancestor_dir(root, p):
             out[p] = b
 
     return out
@@ -484,10 +527,11 @@ def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
     if dust_map:
         tools.add(dust_tool)
 
+    # Important for performance: do NOT fall back to per-node dust calls here.
+    # If parsing misses paths, we'd end up spawning dust hundreds of times, which
+    # dominates runtime. Instead, show "?" for missing sizes.
     for n in nodes:
         b = dust_map.get(n)
-        if b is None:
-            b = _dir_size_bytes_dust_only(n)
         size_cache[n] = (b, "dust" if b is not None else "unknown")
         tools.add(size_cache[n][1])
 
