@@ -1035,25 +1035,56 @@ def _resolve_local_url_to_export_file(
     if _should_skip_url(url):
         return None
 
-    u = html.unescape(url).strip()
-    # Strip query/fragment, which browsers ignore for local file lookups anyway.
-    u = u.split("#", 1)[0].split("?", 1)[0].strip()
-    if not u:
+    u0 = html.unescape(url).strip()
+    # Strip query; local file paths ignore it.
+    u0 = u0.split("?", 1)[0].strip()
+    if not u0:
         return None
 
-    # Telegram exports sometimes use percent-encoding in paths.
-    u_fs = urllib.parse.unquote(u)
-    abs_p = os.path.abspath(os.path.normpath(os.path.join(src_html_dir, u_fs)))
-    if not _is_ancestor_dir(export_root, abs_p):
-        return None
-    if not os.path.isfile(abs_p):
-        return None
+    # Telegram exports are inconsistent:
+    # - Sometimes the on-disk filename is percent-encoded literally (e.g. "U2%20...mp3"),
+    #   and the HTML uses the same (so we must NOT unquote).
+    # - Sometimes the HTML is percent-encoded but the on-disk filename is decoded
+    #   (so we MUST unquote).
+    #
+    # Also, Telegram sometimes emits links with an unescaped '#' in the filename
+    # (broken in browsers). For splitting/copying, we still want to resolve the
+    # underlying file so we can rewrite to a safe %23 URL later.
+    candidates = [u0]
+    u_no_frag = u0.split("#", 1)[0].strip()
+    if u_no_frag and u_no_frag != u0:
+        candidates.append(u_no_frag)
 
-    rel = os.path.relpath(abs_p, export_root)
-    top = rel.split(os.sep, 1)[0]
-    if top in _SKIP_SHARED_MEDIA_TOPLEVEL:
-        return None
-    return abs_p, rel
+    seen: Set[str] = set()
+    for c in candidates:
+        # Try raw first (handles literal %xx filenames), then decoded variants.
+        variants = [c]
+        try:
+            v1 = urllib.parse.unquote(c)
+            variants.append(v1)
+            v2 = urllib.parse.unquote(v1)
+            variants.append(v2)
+        except Exception:
+            pass
+
+        for v in variants:
+            if not v or v in seen:
+                continue
+            seen.add(v)
+
+            abs_p = os.path.abspath(os.path.normpath(os.path.join(src_html_dir, v)))
+            if not _is_ancestor_dir(export_root, abs_p):
+                continue
+            if not os.path.isfile(abs_p):
+                continue
+
+            rel = os.path.relpath(abs_p, export_root)
+            top = rel.split(os.sep, 1)[0]
+            if top in _SKIP_SHARED_MEDIA_TOPLEVEL:
+                return None
+            return abs_p, rel
+
+    return None
 
 def _copy_and_localize_shared_media_for_chat(
     export_root: str,
@@ -1080,7 +1111,9 @@ def _copy_and_localize_shared_media_for_chat(
     if not src_msg_files:
         return
 
-    abs_to_media_url: Dict[str, str] = {}
+    # For files that live outside this chat folder (shared across the export), we copy them
+    # into dst_chat/media/<rel-from-export-root>/ and rewrite links to media/<url-encoded rel>.
+    abs_to_media_relposix: Dict[str, str] = {}
 
     # First pass: scan source HTML for referenced files under export_root (excluding chat-local content).
     for src_html in src_msg_files:
@@ -1097,10 +1130,9 @@ def _copy_and_localize_shared_media_for_chat(
                         if not resolved:
                             continue
                         abs_p, rel = resolved
-                        if _is_ancestor_dir(src_chat, abs_p):
-                            continue  # chat-local; already copied with the chat folder
                         rel_posix = rel.replace(os.sep, "/")
-                        abs_to_media_url[abs_p] = f"media/{rel_posix}"
+                        if not _is_ancestor_dir(src_chat, abs_p):
+                            abs_to_media_relposix[abs_p] = rel_posix
 
                     for m in HTML_CSS_URL_RE.finditer(line):
                         url = m.group("url")
@@ -1108,21 +1140,21 @@ def _copy_and_localize_shared_media_for_chat(
                         if not resolved:
                             continue
                         abs_p, rel = resolved
-                        if _is_ancestor_dir(src_chat, abs_p):
-                            continue
                         rel_posix = rel.replace(os.sep, "/")
-                        abs_to_media_url[abs_p] = f"media/{rel_posix}"
+                        if not _is_ancestor_dir(src_chat, abs_p):
+                            abs_to_media_relposix[abs_p] = rel_posix
         except Exception:
             continue
 
-    if not abs_to_media_url:
-        return
+    def _quote_url_path(rel_posix: str) -> str:
+        # Encode reserved characters so the URL resolves to the exact on-disk path.
+        # Important for literal '%' in filenames (e.g. "U2%20..." should become "U2%2520...").
+        return urllib.parse.quote(rel_posix, safe="/")
 
     # Copy referenced media into dst_chat/media/<relpath>.
     media_root = os.path.join(dst_chat, "media")
-    for abs_p, media_url in abs_to_media_url.items():
-        rel = media_url[len("media/") :].replace("/", os.sep)
-        dp = os.path.join(media_root, rel)
+    for abs_p, rel_posix in abs_to_media_relposix.items():
+        dp = os.path.join(media_root, rel_posix.replace("/", os.sep))
         os.makedirs(os.path.dirname(dp), exist_ok=True)
         try:
             shutil.copy2(abs_p, dp)
@@ -1145,8 +1177,14 @@ def _copy_and_localize_shared_media_for_chat(
                 return None
             abs_p, _rel = resolved
             if _is_ancestor_dir(src_chat, abs_p):
+                # Chat-local file: rewrite to a safe, URL-encoded relative path within the chat.
+                rel_local = os.path.relpath(abs_p, src_chat).replace(os.sep, "/")
+                return _quote_url_path(rel_local)
+
+            rel_posix = abs_to_media_relposix.get(abs_p)
+            if not rel_posix:
                 return None
-            return abs_to_media_url.get(abs_p)
+            return f"media/{_quote_url_path(rel_posix)}"
 
         def _sub_attr(m: re.Match) -> str:
             prefix = m.group("prefix")
