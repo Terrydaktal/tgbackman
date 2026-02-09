@@ -630,6 +630,24 @@ def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
         if p not in nodes:
             nodes.append(p)
 
+    # Also include intermediate directories between root and each export root so the
+    # printed tree matches the actual nesting on disk (e.g. ChatName/START__END).
+    # This keeps node counts small (only ancestors of discovered export roots).
+    extra: Set[str] = set()
+    for n in list(nodes):
+        if n == root:
+            continue
+        cur = os.path.abspath(os.path.dirname(n))
+        while _is_ancestor_dir(root, cur) and cur != root:
+            extra.add(cur)
+            cur2 = os.path.abspath(os.path.dirname(cur))
+            if cur2 == cur:
+                break
+            cur = cur2
+    for p in sorted(extra):
+        if p not in nodes:
+            nodes.append(p)
+
     # Map export_root -> report for labels (root may or may not be in reports).
     report_by_root: Dict[str, ExportReport] = {os.path.abspath(r.export_root): r for r in reports}
 
@@ -680,7 +698,7 @@ def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
         first = rel.split(os.sep, 1)[0]
         if first:
             first_level.add(first)
-    dust_lines = max(50, len(first_level) + 25)
+    dust_lines = max(200, len(first_level) + 50)
 
     dust_map, dust_tool = _bulk_dir_sizes_via_dust_tree(root, max_depth=max_depth, max_lines=dust_lines)
     if dust_map:
@@ -693,6 +711,49 @@ def _render_export_tree(root: str, reports: List[ExportReport]) -> str:
         b = dust_map.get(n)
         size_cache[n] = (b, "dust" if b is not None else "unknown")
         tools.add(size_cache[n][1])
+
+    # Heuristic to eliminate '?' for the common case where a container directory
+    # contains exactly one child directory (e.g. ChatName contains only START__END).
+    # If dust reported the parent size but not the child size, treat the child size
+    # as the parent's total. This avoids slow per-node sizing and matches reality
+    # for the 1-child layout produced by --split-multi-html.
+    def _infer_single_child_size(child: str) -> Optional[int]:
+        p = parents.get(child)
+        if not p or p == child:
+            return None
+        pb, _pt = size_cache.get(p, (None, "unknown"))
+        if pb is None:
+            return None
+        try:
+            # Only consider direct filesystem parent/child.
+            if os.path.abspath(os.path.dirname(child)) != os.path.abspath(p):
+                return None
+            if not os.path.isdir(p) or not os.path.isdir(child):
+                return None
+            child_base = os.path.basename(child)
+            subdirs: List[str] = []
+            for ent in os.scandir(p):
+                if not ent.is_dir(follow_symlinks=False):
+                    continue
+                name = ent.name
+                if name.startswith("."):
+                    continue
+                subdirs.append(name)
+                if len(subdirs) > 1:
+                    break
+            if len(subdirs) == 1 and subdirs[0] == child_base:
+                return pb
+        except Exception:
+            return None
+        return None
+
+    for n in nodes:
+        b, tool = size_cache.get(n, (None, "unknown"))
+        if b is None:
+            inferred = _infer_single_child_size(n)
+            if inferred is not None:
+                size_cache[n] = (inferred, "dust(parent)")
+                tools.add("dust(parent)")
 
     def label(n: str) -> str:
         rel = os.path.relpath(n, root)
