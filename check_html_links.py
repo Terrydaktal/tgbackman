@@ -108,6 +108,22 @@ MEDIA_DIRS = {
     "media",
 }
 
+# Media dirs that represent "chat content" when present directly under a chat export root.
+# (We intentionally exclude css/js/images because those are rendering assets in Telegram HTML exports.)
+CHAT_LOCAL_MEDIA_DIRS = {
+    "photos",
+    "files",
+    "video_files",
+    "voice_messages",
+    "audio_files",
+    "documents",
+    "sticker_files",
+    "stickers",
+    "animations",
+    "round_video_messages",
+    "profile_pictures",
+}
+
 MEDIA_EXTS = {
     # Images
     ".jpg",
@@ -150,6 +166,34 @@ def _iter_html_files(root: str) -> Iterator[str]:
         for fn in filenames:
             if fn.lower().endswith(".html"):
                 yield os.path.join(dirpath, fn)
+
+def _iter_chat_roots(root: str) -> Iterator[str]:
+    """
+    Yield chat export roots: directories that contain at least one messages*.html.
+    (Works for both a single chat export root and a collection of per-chat exports.)
+    """
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if any(fn.startswith("messages") and fn.endswith(".html") for fn in filenames):
+            yield dirpath
+
+def _count_files_recursive(p: str) -> int:
+    n = 0
+    stack = [p]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            n += 1
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return n
 
 
 def _should_skip_url(url: str) -> bool:
@@ -504,6 +548,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Stop after the first missing ref (useful for quick checks).",
     )
+    ap.add_argument(
+        "--count-media-files",
+        action="store_true",
+        help="Also count on-disk media files: shared under each chat's media/ vs chat-local media dirs.",
+    )
     args = ap.parse_args(argv)
 
     root = os.path.abspath(args.path)
@@ -562,6 +611,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if (m_total or o_total or sl_total) and args.fail_fast:
             break
 
+    shared_media_files = 0
+    chat_local_media_files = 0
+    if args.count_media_files:
+        # Best-effort counts; this is independent of link resolution.
+        seen_chat_roots: Set[str] = set()
+        for cr in _iter_chat_roots(root):
+            if cr in seen_chat_roots:
+                continue
+            seen_chat_roots.add(cr)
+
+            shared_p = os.path.join(cr, "media")
+            if os.path.isdir(shared_p):
+                shared_media_files += _count_files_recursive(shared_p)
+
+            for d in CHAT_LOCAL_MEDIA_DIRS:
+                lp = os.path.join(cr, d)
+                if os.path.isdir(lp):
+                    chat_local_media_files += _count_files_recursive(lp)
+
     if args.json:
         out = {
             "root": root,
@@ -570,6 +638,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "total_refs": total_refs,
             "skipped_refs": skipped_refs,
             "ok_refs": ok_refs,
+            "shared_media_files": shared_media_files if args.count_media_files else None,
+            "chat_local_media_files": chat_local_media_files if args.count_media_files else None,
             "split_leftover_refs": [
                 {
                     "html_file": m.html_file,
@@ -616,6 +686,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"Refs: total={total_refs} ok={ok_refs} skipped={skipped_refs} "
         f"split_leftover={split_leftover_total} outside_root={outside_total} missing={missing_total} ({scope_note})"
     )
+    if args.count_media_files:
+        print(
+            "Media files: "
+            f"shared_in_media_dir={shared_media_files} "
+            f"chat_local_in_dirs={chat_local_media_files}"
+        )
 
     if not missing_total and not outside_total and not split_leftover_total:
         print()
