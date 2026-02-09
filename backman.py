@@ -28,6 +28,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
 RESULT_NAMES = ("result.json", "results.json")
 
 EXPORT_DATE_RE = re.compile(
@@ -181,7 +183,7 @@ def _parse_dust_total(stdout: str, path: str) -> Optional[int]:
     Prefer lines that contain the (absolute) path.
     """
     p = os.path.abspath(path)
-    lines = [ln.strip("\n") for ln in stdout.splitlines() if ln.strip()]
+    lines = [ANSI_ESCAPE_RE.sub("", ln.strip("\n")) for ln in stdout.splitlines() if ln.strip()]
     if not lines:
         return None
 
@@ -352,7 +354,7 @@ def _parse_dust_tree(stdout: str, root: str) -> Dict[str, int]:
     #   like a path and taking the rest of the line from there (preserves spaces).
     stack: List[str] = []
     for raw in stdout.splitlines():
-        line = raw.rstrip("\n")
+        line = ANSI_ESCAPE_RE.sub("", raw.rstrip("\n"))
         if not line.strip():
             continue
 
@@ -613,9 +615,16 @@ def _bulk_export_sizes_once(scan_root: str, export_roots: List[str]) -> Tuple[Di
     scan_root = os.path.abspath(scan_root)
     abs_roots = [os.path.abspath(p) for p in export_roots]
 
+    # We'll try dust first (fast), then fall back to a single-pass du for robustness.
+    out: Dict[str, Optional[int]] = {p: None for p in abs_roots}
     dust = shutil.which("dust")
     if not dust:
-        return {p: None for p in abs_roots}, "unknown"
+        du_map, _tool = _bulk_dir_sizes_via_du(scan_root)
+        if du_map:
+            for p in abs_roots:
+                out[p] = du_map.get(p)
+            return out, "du"
+        return out, "unknown"
 
     # Compute the minimum depth needed to include all export roots.
     max_depth = 0
@@ -634,9 +643,10 @@ def _bulk_export_sizes_once(scan_root: str, export_roots: List[str]) -> Tuple[Di
         top_dirs = max(200, len(abs_roots))
     max_lines = max(200, 1 + top_dirs + len(abs_roots) + 100)
 
-    dust_map, tool = _bulk_dir_sizes_via_dust_tree(scan_root, max_depth=max_depth, max_lines=max_lines)
-    if not dust_map:
-        return {p: None for p in abs_roots}, tool
+    dust_map, tool1 = _bulk_dir_sizes_via_dust_tree(scan_root, max_depth=max_depth, max_lines=max_lines)
+    if dust_map:
+        for p in abs_roots:
+            out[p] = dust_map.get(p)
 
     def _chain_is_only_child(parent: str, child: str) -> bool:
         """
@@ -702,13 +712,21 @@ def _bulk_export_sizes_once(scan_root: str, export_roots: List[str]) -> Tuple[Di
             cur_parent = cur_path
         return size
 
-    out: Dict[str, Optional[int]] = {}
-    for p in abs_roots:
-        b = dust_map.get(p)
-        if b is None:
-            b = _infer_from_ancestor(p)
-        out[p] = b
-    return out, tool
+    if dust_map:
+        for p in abs_roots:
+            if out[p] is None:
+                out[p] = _infer_from_ancestor(p)
+
+    missing = [p for p in abs_roots if out[p] is None]
+    if missing:
+        du_map, tool2 = _bulk_dir_sizes_via_du(scan_root)
+        if du_map:
+            for p in missing:
+                out[p] = du_map.get(p)
+            return out, ("dust+du" if dust_map else "du")
+        return out, (tool1 if dust_map else tool2)
+
+    return out, ("dust" if dust_map else tool1)
 
 def _dir_size_bytes_dust_only(path: str) -> Optional[int]:
     dust = shutil.which("dust")
