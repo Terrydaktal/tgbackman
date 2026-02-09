@@ -74,6 +74,10 @@ CSS_URL_RE = re.compile(
     r'url\(\s*(?P<q>["\']?)(?P<url>[^"\')]+)(?P=q)\s*\)',
     re.IGNORECASE,
 )
+MULTI_EXPORT_REF_RE = re.compile(
+    r'\b(?:href|src)\s*=\s*(?P<q>["\'])(?P<url>(?:\.\./)+chats/chat_\d+/[^"\']+)(?P=q)',
+    re.IGNORECASE,
+)
 
 
 _SKIP_SCHEMES = (
@@ -285,21 +289,26 @@ def scan_html_file_for_bad_refs(
     *,
     scope: str,
     allow_outside_root: bool,
+    check_split_leftovers: bool,
+    is_multi_export_root: bool,
     max_keep: int,
-) -> Tuple[int, int, int, int, List[MissingRef], int, List[MissingRef]]:
+) -> Tuple[int, int, int, int, List[MissingRef], int, List[MissingRef], int, List[MissingRef]]:
     """
     Returns:
       total_refs, skipped_refs, ok_refs,
       missing_total, missing_kept,
-      outside_total, outside_kept
+      outside_total, outside_kept,
+      split_leftover_total, split_leftover_kept
     """
     total = 0
     skipped = 0
     ok = 0
     missing_total = 0
     outside_total = 0
+    split_leftover_total = 0
     missing_kept: List[MissingRef] = []
     outside_kept: List[MissingRef] = []
+    split_leftover_kept: List[MissingRef] = []
     in_style_block = False
 
     try:
@@ -327,6 +336,33 @@ def scan_html_file_for_bad_refs(
                     if end_style_after:
                         in_style_block = False
                     continue
+
+                # If we're checking a split output (not a multi-export root), flag any remaining
+                # multi-export style references in message pages.
+                if (
+                    check_split_leftovers
+                    and not is_multi_export_root
+                    and os.path.basename(html_path).startswith("messages")
+                    and os.path.basename(html_path).lower().endswith(".html")
+                    and "chats/chat_" in line_l
+                ):
+                    for m in MULTI_EXPORT_REF_RE.finditer(line):
+                        url = m.group("url")
+                        # Optional media-only filtering: these are always media-like, but keep consistent.
+                        if scope == "media" and not _is_media_url(url):
+                            continue
+                        split_leftover_total += 1
+                        if len(split_leftover_kept) < max_keep:
+                            split_leftover_kept.append(
+                                MissingRef(
+                                    html_path,
+                                    ln,
+                                    "multi_export_ref",
+                                    url,
+                                    "(should be localized into this chat folder)",
+                                    "multi-export-leftover",
+                                )
+                            )
 
                 for m in ATTR_URL_RE.finditer(line):
                     url = m.group("url")
@@ -427,9 +463,19 @@ def scan_html_file_for_bad_refs(
                     in_style_block = False
     except Exception:
         # Treat unreadable files as having no refs; the caller can decide whether to care.
-        return 0, 0, 0, 0, [], 0, []
+        return 0, 0, 0, 0, [], 0, [], 0, []
 
-    return total, skipped, ok, missing_total, missing_kept, outside_total, outside_kept
+    return (
+        total,
+        skipped,
+        ok,
+        missing_total,
+        missing_kept,
+        outside_total,
+        outside_kept,
+        split_leftover_total,
+        split_leftover_kept,
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -449,6 +495,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Treat refs that resolve outside the provided root as OK if they exist on disk (default: fail them).",
     )
     ap.add_argument(
+        "--no-split-leftovers-check",
+        action="store_true",
+        help="Disable detection of leftover multi-export links (../../chats/chat_XXX/...) in messages*.html.",
+    )
+    ap.add_argument(
         "--fail-fast",
         action="store_true",
         help="Stop after the first missing ref (useful for quick checks).",
@@ -463,20 +514,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     html_files = list(_iter_html_files(root))
     html_files.sort()
 
+    # Heuristic to detect scanning an original Telegram multi-chat export root.
+    is_multi_export_root = os.path.isfile(os.path.join(root, "export_results.html")) or os.path.isdir(
+        os.path.join(root, "chats")
+    )
+
     total_refs = 0
     skipped_refs = 0
     ok_refs = 0
     missing_total = 0
     outside_total = 0
+    split_leftover_total = 0
     missing_kept: List[MissingRef] = []
     outside_kept: List[MissingRef] = []
+    split_leftover_kept: List[MissingRef] = []
 
     for p in html_files:
-        t, s, ok, m_total, m_kept, o_total, o_kept = scan_html_file_for_bad_refs(
+        t, s, ok, m_total, m_kept, o_total, o_kept, sl_total, sl_kept = scan_html_file_for_bad_refs(
             p,
             root,
             scope=args.scope,
             allow_outside_root=args.allow_outside_root,
+            check_split_leftovers=(not args.no_split_leftovers_check),
+            is_multi_export_root=is_multi_export_root,
             max_keep=args.max_missing,
         )
         total_refs += t
@@ -484,6 +544,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ok_refs += ok
         missing_total += m_total
         outside_total += o_total
+        split_leftover_total += sl_total
         # Keep a bounded sample list across all files.
         for m in m_kept:
             if len(missing_kept) >= args.max_missing:
@@ -493,17 +554,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if len(outside_kept) >= args.max_missing:
                 break
             outside_kept.append(m)
+        for m in sl_kept:
+            if len(split_leftover_kept) >= args.max_missing:
+                break
+            split_leftover_kept.append(m)
 
-        if (m_total or o_total) and args.fail_fast:
+        if (m_total or o_total or sl_total) and args.fail_fast:
             break
 
     if args.json:
         out = {
             "root": root,
+            "is_multi_export_root": is_multi_export_root,
             "html_files_scanned": len(html_files),
             "total_refs": total_refs,
             "skipped_refs": skipped_refs,
             "ok_refs": ok_refs,
+            "split_leftover_refs": [
+                {
+                    "html_file": m.html_file,
+                    "line_no": m.line_no,
+                    "attr": m.attr,
+                    "url": m.url,
+                    "note": m.note,
+                }
+                for m in split_leftover_kept
+            ],
+            "split_leftover_refs_total": split_leftover_total,
             "outside_root_refs": [
                 {
                     "html_file": m.html_file,
@@ -530,22 +607,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "missing_refs_total": missing_total,
         }
         print(json.dumps(out, indent=2, ensure_ascii=False))
-        return 1 if (missing_total or outside_total) else 0
+        return 1 if (missing_total or outside_total or split_leftover_total) else 0
 
     print(_c(f"Root: {root}", _Ansi.BOLD))
     print(f"HTML files scanned: {len(html_files)}")
     scope_note = f"scope={args.scope}"
     print(
         f"Refs: total={total_refs} ok={ok_refs} skipped={skipped_refs} "
-        f"outside_root={outside_total} missing={missing_total} ({scope_note})"
+        f"split_leftover={split_leftover_total} outside_root={outside_total} missing={missing_total} ({scope_note})"
     )
 
-    if not missing_total and not outside_total:
+    if not missing_total and not outside_total and not split_leftover_total:
         print()
         print(_c("All local references resolved.", _Ansi.GREEN))
         return 0
 
     print()
+    if split_leftover_total and not is_multi_export_root:
+        print(_c("Leftover multi-export links found in messages*.html (should be localized):", _Ansi.YELLOW))
+        lim = args.max_missing
+        for i, m in enumerate(split_leftover_kept[:lim], start=1):
+            rel_html = os.path.relpath(m.html_file, root)
+            print(f"{i:>4}. {rel_html}:{m.line_no} {m.url}")
+        if split_leftover_total > len(split_leftover_kept):
+            print(_c(f"... and {split_leftover_total - len(split_leftover_kept)} more", _Ansi.DIM))
+        print()
+
     if outside_total:
         print(_c("References that resolve outside the provided root:", _Ansi.YELLOW))
         lim = args.max_missing
