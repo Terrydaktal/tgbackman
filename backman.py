@@ -544,12 +544,25 @@ def _bulk_dir_sizes_via_dust_tree(root: str, max_depth: int, max_lines: Optional
     arg_sets: List[List[str]] = []
 
     # Prefer the user's typical fast output (human units + tree glyphs), then fall
-    # back to bytes output if available.
-    base0 = [dust, "-d", str(max_depth), "--no-colors", root]
-    base1 = [dust, "-d", str(max_depth), root]
-    baseb0 = [dust, "-b", "-d", str(max_depth), "--no-colors", root]
-    baseb1 = [dust, "-b", "-d", str(max_depth), root]
+    # back to bytes output if available. Some dust builds don't support short flags
+    # for depth/lines, so we try both long and short forms.
+    base0 = [dust, "--depth", str(max_depth), "--no-colors", root]
+    base1 = [dust, "--depth", str(max_depth), root]
+    base0s = [dust, "-d", str(max_depth), "--no-colors", root]
+    base1s = [dust, "-d", str(max_depth), root]
+
+    baseb0 = [dust, "-b", "--depth", str(max_depth), "--no-colors", root]
+    baseb1 = [dust, "-b", "--depth", str(max_depth), root]
+    baseb0s = [dust, "-b", "-d", str(max_depth), "--no-colors", root]
+    baseb1s = [dust, "-b", "-d", str(max_depth), root]
     if n_lines is not None:
+        # Long-form flags first.
+        arg_sets.append([dust, "--depth", str(max_depth), "--number-of-lines", str(n_lines), "--no-colors", root])
+        arg_sets.append([dust, "--depth", str(max_depth), "--number-of-lines", str(n_lines), root])
+        arg_sets.append([dust, "-b", "--depth", str(max_depth), "--number-of-lines", str(n_lines), "--no-colors", root])
+        arg_sets.append([dust, "-b", "--depth", str(max_depth), "--number-of-lines", str(n_lines), root])
+
+        # Short-form flags.
         arg_sets.append([dust, "-d", str(max_depth), "-n", str(n_lines), "--no-colors", root])
         arg_sets.append([dust, "-d", str(max_depth), "-n", str(n_lines), root])
         arg_sets.append([dust, "-b", "-d", str(max_depth), "-n", str(n_lines), "--no-colors", root])
@@ -559,9 +572,16 @@ def _bulk_dir_sizes_via_dust_tree(root: str, max_depth: int, max_lines: Optional
     arg_sets.append(base1)
     arg_sets.append(baseb0)
     # Compat: some builds use --no-color (singular). Try it too.
+    arg_sets.append([dust, "--depth", str(max_depth), "--no-color", root])
     arg_sets.append([dust, "-d", str(max_depth), "--no-color", root])
+    arg_sets.append([dust, "-b", "--depth", str(max_depth), "--no-color", root])
     arg_sets.append([dust, "-b", "-d", str(max_depth), "--no-color", root])
+
+    arg_sets.append(base0s)
+    arg_sets.append(base1s)
+    arg_sets.append(baseb0s)
     arg_sets.append(baseb1)
+    arg_sets.append(baseb1s)
 
     for args in arg_sets:
         stdout = _dust_call(args)
