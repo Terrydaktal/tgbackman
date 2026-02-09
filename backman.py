@@ -637,9 +637,76 @@ def _bulk_export_sizes_once(scan_root: str, export_roots: List[str]) -> Tuple[Di
     if not dust_map:
         return {p: None for p in abs_roots}, tool
 
+    def _chain_is_only_child(parent: str, child: str) -> bool:
+        """
+        True if `child` is the only non-hidden entry inside `parent` and it's a dir.
+        We ignore hidden entries (dotfiles) since exporters sometimes drop them.
+        """
+        try:
+            child_base = os.path.basename(child)
+            # Only consider direct filesystem parent/child.
+            if os.path.abspath(os.path.dirname(child)) != os.path.abspath(parent):
+                return False
+            subdirs: List[str] = []
+            # Any non-hidden files mean parent size != child size.
+            for ent in os.scandir(parent):
+                name = ent.name
+                if name.startswith("."):
+                    continue
+                if ent.is_dir(follow_symlinks=False):
+                    subdirs.append(name)
+                    if len(subdirs) > 1:
+                        return False
+                else:
+                    return False
+            return len(subdirs) == 1 and subdirs[0] == child_base
+        except Exception:
+            return False
+
+    def _infer_from_ancestor(p: str) -> Optional[int]:
+        """
+        If dust didn't print `p` but did print an ancestor, we can safely re-use the
+        ancestor size only when the path from ancestor -> p is a single-child chain.
+        This is common for the split layout: ChatName/START__END.
+        """
+        cur = os.path.abspath(p)
+        # Walk up until we hit something dust reported.
+        while True:
+            if cur in dust_map:
+                break
+            if cur == scan_root:
+                return None
+            nxt = os.path.abspath(os.path.dirname(cur))
+            if nxt == cur:
+                return None
+            cur = nxt
+
+        ancestor = cur
+        size = dust_map.get(ancestor)
+        if size is None:
+            return None
+
+        if ancestor == p:
+            return size
+
+        # Ensure ancestor contains only the subdir chain down to p.
+        rel = os.path.relpath(p, ancestor)
+        parts = [] if rel == "." else rel.split(os.sep)
+        cur_parent = ancestor
+        cur_path = ancestor
+        for part in parts:
+            cur_path = os.path.join(cur_parent, part)
+            if not _chain_is_only_child(cur_parent, cur_path):
+                return None
+            cur_parent = cur_path
+        return size
+
     out: Dict[str, Optional[int]] = {}
     for p in abs_roots:
-        out[p] = dust_map.get(p)
+        b = dust_map.get(p)
+        if b is None:
+            b = _infer_from_ancestor(p)
+        out[p] = b
     return out, tool
 
 def _dir_size_bytes_dust_only(path: str) -> Optional[int]:
