@@ -37,10 +37,16 @@ UNOFFICIAL_SQLITE_NAMES = ("database.sqlite",)
 
 BACKMAN_EXPORT_META = ".backman_export_meta.json"
 
+# Split output subfolder format: START__END (used under each chat folder).
+SPLIT_RANGE_DIR_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$"
+)
+
 class _Ansi:
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
+    RED = "\033[31m"
     CYAN = "\033[36m"
     MAGENTA = "\033[35m"
     BLUE = "\033[34m"
@@ -68,6 +74,14 @@ def _write_json(path: str, obj: Any) -> None:
             f.write("\n")
     except Exception:
         return
+
+def _write_json_atomic(path: str, obj: Any) -> None:
+    # Atomic write for metadata so we don't leave partial JSON on interruption.
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
 
 def _maybe_mark_converted_single_html(export_root: str, kind: str) -> str:
     """
@@ -123,6 +137,51 @@ HTML_CSS_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# For link-checking (broader than split rewrite): includes poster= and srcset=
+LINK_ATTR_URL_RE = re.compile(
+    r'(?P<prefix>\b(?:src|href|poster)\s*=\s*)(?P<q>["\'])(?P<url>[^"\']+)(?P=q)',
+    re.IGNORECASE,
+)
+LINK_ATTR_SRCSET_RE = re.compile(
+    r'(?P<prefix>\bsrcset\s*=\s*)(?P<q>["\'])(?P<val>[^"\']+)(?P=q)',
+    re.IGNORECASE,
+)
+LINK_MULTI_EXPORT_REF_RE = re.compile(
+    r'\b(?:href|src)\s*=\s*(?P<q>["\'])(?P<url>(?:\.\./)+chats/chat_\d+/[^"\']+)(?P=q)',
+    re.IGNORECASE,
+)
+
+# Used by link-checking to identify media-ish paths (keeps signal high when scanning huge exports)
+LINK_MEDIA_DIRS = {
+    "photos",
+    "files",
+    "video_files",
+    "voice_messages",
+    "audio_files",
+    "documents",
+    "sticker_files",
+    "stickers",
+    "animations",
+    "round_video_messages",
+    "profile_pictures",
+    "images",
+    # Used by backman split to localize shared media
+    "media",
+}
+LINK_CHAT_LOCAL_MEDIA_DIRS = {
+    "photos",
+    "files",
+    "video_files",
+    "voice_messages",
+    "audio_files",
+    "documents",
+    "sticker_files",
+    "stickers",
+    "animations",
+    "round_video_messages",
+    "profile_pictures",
+}
+
 _SKIP_SHARED_MEDIA_TOPLEVEL = {
     # These are copied separately as shared assets for standalone rendering.
     "css",
@@ -158,12 +217,644 @@ def _parse_unixtime(v: Any) -> Optional[datetime]:
     except Exception:
         return None
 
+def _iter_all_html_files(root: str) -> Iterable[str]:
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.lower().endswith(".html"):
+                yield os.path.join(dirpath, fn)
+
+def _iter_chat_export_roots(root: str) -> Iterable[str]:
+    """
+    Yield chat export roots: directories that contain at least one messages*.html.
+    (Works for both a single chat export root and a collection of per-chat exports.)
+    """
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if any(fn.startswith("messages") and fn.endswith(".html") for fn in filenames):
+            yield dirpath
+
+def _count_files_recursive(p: str) -> int:
+    n = 0
+    stack = [p]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            n += 1
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return n
+
+def _normalize_url_to_fs_path(url: str) -> str:
+    u = html.unescape(url).strip()
+    u = u.split("#", 1)[0].split("?", 1)[0].strip()
+    return u
+
+def _strip_leading_dot_segments(p: str) -> str:
+    # Collapse leading "./" and "../" for classification; does not resolve on disk.
+    s = p.replace("\\", "/")
+    out: List[str] = []
+    for seg in s.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            continue
+        out.append(seg)
+    return "/".join(out)
+
+def _resolve_local_ref_for_check(
+    url: str,
+    src_html_path: str,
+    root: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (resolved_abs_path, note).
+    note is non-None for special cases (outside root, absolute, etc.).
+    """
+    if _should_skip_url(url):
+        return None, None
+
+    u0 = _normalize_url_to_fs_path(url)
+    if not u0:
+        return None, None
+
+    # Telegram exports sometimes keep percent-encoding in on-disk filenames; try both.
+    u_candidates = [u0]
+    try:
+        uq = urllib.parse.unquote(u0)
+        if uq and uq != u0:
+            u_candidates.append(uq)
+    except Exception:
+        pass
+
+    src_dir = os.path.dirname(src_html_path)
+    root_abs = os.path.abspath(root)
+    chosen_abs: Optional[str] = None
+    chosen_note: Optional[str] = None
+
+    for u in u_candidates:
+        if not u:
+            continue
+        if os.path.isabs(u):
+            abs_p = os.path.abspath(os.path.normpath(u))
+            note = "absolute"
+        else:
+            abs_p = os.path.abspath(os.path.normpath(os.path.join(src_dir, u)))
+            note = None
+
+        try:
+            within = os.path.commonpath([root_abs, abs_p]) == root_abs
+        except Exception:
+            within = False
+        if not within:
+            note = (note + ",outside-root") if note else "outside-root"
+
+        if os.path.exists(abs_p):
+            return abs_p, note
+
+        if chosen_abs is None:
+            chosen_abs = abs_p
+            chosen_note = note
+
+    return chosen_abs, chosen_note
+
+def _is_media_url_for_check(url: str) -> bool:
+    """
+    Media in Telegram exports is almost always stored under specific directories. For a
+    "media-only" scan, we restrict to those directories to avoid false positives from
+    pasted code snippets and linkified domains.
+    """
+    if _should_skip_url(url):
+        return False
+    u = _normalize_url_to_fs_path(url)
+    if not u:
+        return False
+    u2 = _strip_leading_dot_segments(u)
+    parts = [p for p in u2.replace("\\", "/").lstrip("/").split("/") if p]
+    return any(p in LINK_MEDIA_DIRS for p in parts)
+
+def _classify_media_ref_for_check(url: str) -> Optional[str]:
+    """
+    For media-like refs, classify whether it points at:
+    - shared media localized under media/ (split output)
+    - chat-local media dirs like files/, photos/, etc.
+    Returns "shared", "chat_local", or None.
+    """
+    if _should_skip_url(url):
+        return None
+    u = _normalize_url_to_fs_path(url)
+    if not u:
+        return None
+    u2 = _strip_leading_dot_segments(u)
+    parts = [p for p in u2.replace("\\", "/").lstrip("/").split("/") if p]
+    if not parts:
+        return None
+    head = parts[0]
+    if head == "media":
+        return "shared"
+    if head in LINK_CHAT_LOCAL_MEDIA_DIRS:
+        return "chat_local"
+    return None
+
+def _iter_srcset_urls(val: str) -> Iterable[str]:
+    for part in val.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        url = part.split()[0].strip()
+        if url:
+            yield url
+
+@dataclass(frozen=True)
+class LinkMissingRef:
+    html_file: str
+    line_no: int
+    attr: str  # src/href/poster/srcset/url(...)
+    url: str
+    resolved_path: str
+    note: Optional[str] = None
+
+@dataclass(frozen=True)
+class LinkSchemeRef:
+    html_file: str
+    line_no: int
+    attr: str  # src/href/poster/srcset
+    url: str
+
+def _scan_html_file_for_bad_refs(
+    html_path: str,
+    root: str,
+    *,
+    scope: str,
+    allow_outside_root: bool,
+    check_split_leftovers: bool,
+    is_multi_export_root: bool,
+    max_keep: int,
+    scheme_prefixes: Optional[Tuple[str, ...]] = None,
+    max_keep_schemes: int = 200,
+) -> Tuple[
+    int,
+    int,
+    int,
+    int,
+    List[LinkMissingRef],
+    int,
+    List[LinkMissingRef],
+    int,
+    List[LinkMissingRef],
+    int,
+    List[LinkSchemeRef],
+    int,
+    int,
+]:
+    """
+    Returns:
+      total_refs, skipped_refs, ok_refs,
+      missing_total, missing_kept,
+      outside_total, outside_kept,
+      split_leftover_total, split_leftover_kept,
+      scheme_total, scheme_kept,
+      media_shared_refs, media_chat_local_refs
+    """
+    total = 0
+    skipped = 0
+    ok = 0
+    missing_total = 0
+    outside_total = 0
+    split_leftover_total = 0
+    missing_kept: List[LinkMissingRef] = []
+    outside_kept: List[LinkMissingRef] = []
+    split_leftover_kept: List[LinkMissingRef] = []
+    scheme_total = 0
+    scheme_kept: List[LinkSchemeRef] = []
+    media_shared_refs = 0
+    media_chat_local_refs = 0
+    in_style_block = False
+
+    scheme_prefixes_l = tuple((scheme_prefixes or ()))
+
+    def _maybe_keep_scheme(ln: int, attr: str, url: str) -> None:
+        nonlocal scheme_total
+        if not scheme_prefixes_l:
+            return
+        u = url.strip()
+        if not u:
+            return
+        lu = u.lower()
+        if any(lu.startswith(p) for p in scheme_prefixes_l):
+            scheme_total += 1
+            if len(scheme_kept) < max_keep_schemes:
+                scheme_kept.append(LinkSchemeRef(html_path, ln, attr, u))
+
+    try:
+        with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
+            for ln, line in enumerate(f, start=1):
+                line_l = line.lower()
+                # Track <style> blocks so we only treat url(...) in real CSS contexts.
+                if "<style" in line_l:
+                    in_style_block = True
+                if "</style" in line_l:
+                    end_style_after = True
+                else:
+                    end_style_after = False
+
+                if (
+                    "href" not in line_l
+                    and "src" not in line_l
+                    and "poster" not in line_l
+                    and "srcset" not in line_l
+                    and "url(" not in line_l
+                ):
+                    if end_style_after:
+                        in_style_block = False
+                    continue
+
+                if (
+                    check_split_leftovers
+                    and not is_multi_export_root
+                    and os.path.basename(html_path).startswith("messages")
+                    and "chats/chat_" in line_l
+                ):
+                    for m in LINK_MULTI_EXPORT_REF_RE.finditer(line):
+                        url = m.group("url")
+                        if scope == "media" and not _is_media_url_for_check(url):
+                            continue
+                        split_leftover_total += 1
+                        if len(split_leftover_kept) < max_keep:
+                            split_leftover_kept.append(
+                                LinkMissingRef(
+                                    html_path,
+                                    ln,
+                                    "multi_export_ref",
+                                    url,
+                                    "(should be localized into this chat folder)",
+                                    "multi-export-leftover",
+                                )
+                            )
+
+                for m in LINK_ATTR_URL_RE.finditer(line):
+                    url = m.group("url")
+                    total += 1
+                    attr = m.group("prefix").split("=", 1)[0].strip()
+                    _maybe_keep_scheme(ln, attr, url)
+                    if _is_media_url_for_check(url):
+                        cls = _classify_media_ref_for_check(url)
+                        if cls == "shared":
+                            media_shared_refs += 1
+                        elif cls == "chat_local":
+                            media_chat_local_refs += 1
+                    if scope == "media" and not _is_media_url_for_check(url):
+                        skipped += 1
+                        continue
+                    resolved, note = _resolve_local_ref_for_check(url, html_path, root)
+                    if resolved is None:
+                        skipped += 1
+                        continue
+                    is_outside = bool(note and "outside-root" in note)
+                    exists = os.path.exists(resolved)
+                    if is_outside and not allow_outside_root:
+                        outside_total += 1
+                        if len(outside_kept) < max_keep:
+                            outside_kept.append(LinkMissingRef(html_path, ln, attr, url, resolved, note))
+                        continue
+                    if exists:
+                        ok += 1
+                        continue
+                    missing_total += 1
+                    if len(missing_kept) < max_keep:
+                        missing_kept.append(LinkMissingRef(html_path, ln, attr, url, resolved, note))
+
+                for m in LINK_ATTR_SRCSET_RE.finditer(line):
+                    val = m.group("val")
+                    for url in _iter_srcset_urls(val):
+                        total += 1
+                        _maybe_keep_scheme(ln, "srcset", url)
+                        if _is_media_url_for_check(url):
+                            cls = _classify_media_ref_for_check(url)
+                            if cls == "shared":
+                                media_shared_refs += 1
+                            elif cls == "chat_local":
+                                media_chat_local_refs += 1
+                        if scope == "media" and not _is_media_url_for_check(url):
+                            skipped += 1
+                            continue
+                        resolved, note = _resolve_local_ref_for_check(url, html_path, root)
+                        if resolved is None:
+                            skipped += 1
+                            continue
+                        is_outside = bool(note and "outside-root" in note)
+                        exists = os.path.exists(resolved)
+                        if is_outside and not allow_outside_root:
+                            outside_total += 1
+                            if len(outside_kept) < max_keep:
+                                outside_kept.append(LinkMissingRef(html_path, ln, "srcset", url, resolved, note))
+                            continue
+                        if exists:
+                            ok += 1
+                            continue
+                        missing_total += 1
+                        if len(missing_kept) < max_keep:
+                            missing_kept.append(LinkMissingRef(html_path, ln, "srcset", url, resolved, note))
+
+                for m in HTML_CSS_URL_RE.finditer(line):
+                    url = m.group("url")
+                    total += 1
+                    # Only consider url(...) inside actual CSS contexts (style="..." or <style> blocks).
+                    if not in_style_block and 'style="' not in line_l and "style='" not in line_l:
+                        skipped += 1
+                        continue
+                    if _is_media_url_for_check(url):
+                        cls = _classify_media_ref_for_check(url)
+                        if cls == "shared":
+                            media_shared_refs += 1
+                        elif cls == "chat_local":
+                            media_chat_local_refs += 1
+                    if scope == "media" and not _is_media_url_for_check(url):
+                        skipped += 1
+                        continue
+                    resolved, note = _resolve_local_ref_for_check(url, html_path, root)
+                    if resolved is None:
+                        skipped += 1
+                        continue
+                    is_outside = bool(note and "outside-root" in note)
+                    exists = os.path.exists(resolved)
+                    if is_outside and not allow_outside_root:
+                        outside_total += 1
+                        if len(outside_kept) < max_keep:
+                            outside_kept.append(LinkMissingRef(html_path, ln, "url(...)", url, resolved, note))
+                        continue
+                    if exists:
+                        ok += 1
+                        continue
+                    missing_total += 1
+                    if len(missing_kept) < max_keep:
+                        missing_kept.append(LinkMissingRef(html_path, ln, "url(...)", url, resolved, note))
+
+                if end_style_after:
+                    in_style_block = False
+    except Exception:
+        return 0, 0, 0, 0, [], 0, [], 0, [], 0, [], 0, 0
+
+    return (
+        total,
+        skipped,
+        ok,
+        missing_total,
+        missing_kept,
+        outside_total,
+        outside_kept,
+        split_leftover_total,
+        split_leftover_kept,
+        scheme_total,
+        scheme_kept,
+        media_shared_refs,
+        media_chat_local_refs,
+    )
+
+def _cmd_check_links(
+    root: str,
+    *,
+    json_out: bool,
+    max_missing: int,
+    scope: str,
+    allow_outside_root: bool,
+    check_split_leftovers: bool,
+    fail_fast: bool,
+    list_schemes: str,
+    max_schemes: int,
+    count_media_files: bool,
+) -> int:
+    root = os.path.abspath(root)
+    html_files = sorted(_iter_all_html_files(root))
+    is_multi_export_root = os.path.isfile(os.path.join(root, "export_results.html")) or os.path.isdir(os.path.join(root, "chats"))
+
+    total_refs = 0
+    skipped_refs = 0
+    ok_refs = 0
+    missing_total = 0
+    outside_total = 0
+    split_leftover_total = 0
+    scheme_total = 0
+    media_shared_refs_total = 0
+    media_chat_local_refs_total = 0
+    missing_kept: List[LinkMissingRef] = []
+    outside_kept: List[LinkMissingRef] = []
+    split_leftover_kept: List[LinkMissingRef] = []
+    scheme_kept: List[LinkSchemeRef] = []
+
+    scheme_names = [s.strip().lower() for s in list_schemes.split(",") if s.strip()]
+    scheme_prefixes: Optional[Tuple[str, ...]] = tuple(f"{s}:" for s in scheme_names) if scheme_names else None
+
+    for p in html_files:
+        (
+            t,
+            s,
+            ok,
+            m_total,
+            m_kept,
+            o_total,
+            o_kept,
+            sl_total,
+            sl_kept,
+            sc_total,
+            sc_kept,
+            ms_total,
+            ml_total,
+        ) = _scan_html_file_for_bad_refs(
+            p,
+            root,
+            scope=scope,
+            allow_outside_root=allow_outside_root,
+            check_split_leftovers=check_split_leftovers,
+            is_multi_export_root=is_multi_export_root,
+            max_keep=max_missing,
+            scheme_prefixes=scheme_prefixes,
+            max_keep_schemes=max_schemes,
+        )
+        total_refs += t
+        skipped_refs += s
+        ok_refs += ok
+        missing_total += m_total
+        outside_total += o_total
+        split_leftover_total += sl_total
+        scheme_total += sc_total
+        media_shared_refs_total += ms_total
+        media_chat_local_refs_total += ml_total
+
+        for m in m_kept:
+            if len(missing_kept) >= max_missing:
+                break
+            missing_kept.append(m)
+        for m in o_kept:
+            if len(outside_kept) >= max_missing:
+                break
+            outside_kept.append(m)
+        for m in sl_kept:
+            if len(split_leftover_kept) >= max_missing:
+                break
+            split_leftover_kept.append(m)
+        for m in sc_kept:
+            if len(scheme_kept) >= max_schemes:
+                break
+            scheme_kept.append(m)
+
+        if (m_total or o_total or sl_total) and fail_fast:
+            break
+
+    shared_media_files = 0
+    chat_local_media_files = 0
+    if count_media_files:
+        seen_chat_roots: Set[str] = set()
+        for cr in _iter_chat_export_roots(root):
+            if cr in seen_chat_roots:
+                continue
+            seen_chat_roots.add(cr)
+            shared_p = os.path.join(cr, "media")
+            if os.path.isdir(shared_p):
+                shared_media_files += _count_files_recursive(shared_p)
+            for d in LINK_CHAT_LOCAL_MEDIA_DIRS:
+                lp = os.path.join(cr, d)
+                if os.path.isdir(lp):
+                    chat_local_media_files += _count_files_recursive(lp)
+
+    if json_out:
+        out = {
+            "root": root,
+            "is_multi_export_root": is_multi_export_root,
+            "html_files_scanned": len(html_files),
+            "total_refs": total_refs,
+            "skipped_refs": skipped_refs,
+            "ok_refs": ok_refs,
+            "media_shared_refs_total": media_shared_refs_total,
+            "media_chat_local_refs_total": media_chat_local_refs_total,
+            "scheme_refs_total": scheme_total if scheme_prefixes else None,
+            "scheme_refs": [
+                {"html_file": m.html_file, "line_no": m.line_no, "attr": m.attr, "url": m.url}
+                for m in scheme_kept
+            ]
+            if scheme_prefixes
+            else [],
+            "shared_media_files": shared_media_files if count_media_files else None,
+            "chat_local_media_files": chat_local_media_files if count_media_files else None,
+            "split_leftover_refs": [
+                {"html_file": m.html_file, "line_no": m.line_no, "attr": m.attr, "url": m.url, "note": m.note}
+                for m in split_leftover_kept
+            ],
+            "split_leftover_refs_total": split_leftover_total,
+            "outside_root_refs": [
+                {
+                    "html_file": m.html_file,
+                    "line_no": m.line_no,
+                    "attr": m.attr,
+                    "url": m.url,
+                    "resolved_path": m.resolved_path,
+                    "note": m.note,
+                }
+                for m in outside_kept
+            ],
+            "outside_root_refs_total": outside_total,
+            "missing_refs": [
+                {
+                    "html_file": m.html_file,
+                    "line_no": m.line_no,
+                    "attr": m.attr,
+                    "url": m.url,
+                    "resolved_path": m.resolved_path,
+                    "note": m.note,
+                }
+                for m in missing_kept
+            ],
+            "missing_refs_total": missing_total,
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 1 if (missing_total or outside_total or split_leftover_total) else 0
+
+    print(_c(f"Root: {root}", _Ansi.BOLD))
+    print(f"HTML files scanned: {len(html_files)}")
+    scope_note = f"scope={scope}"
+    print(
+        f"Refs: total={total_refs} ok={ok_refs} skipped={skipped_refs} "
+        f"split_leftover={split_leftover_total} outside_root={outside_total} missing={missing_total} ({scope_note})"
+    )
+    print(
+        "Media refs (links): "
+        f"shared_media_dir={media_shared_refs_total} "
+        f"chat_local_dirs={media_chat_local_refs_total}"
+    )
+    if count_media_files:
+        print(
+            "Media files: "
+            f"shared_in_media_dir={shared_media_files} "
+            f"chat_local_in_dirs={chat_local_media_files}"
+        )
+    if scheme_prefixes:
+        print(f"Scheme refs (in HTML attrs): total={scheme_total} ({', '.join(scheme_names)})")
+
+    if not missing_total and not outside_total and not split_leftover_total:
+        print()
+        print(_c("All local references resolved.", _Ansi.GREEN))
+        return 0
+
+    print()
+    if split_leftover_total and not is_multi_export_root:
+        print(_c("Leftover multi-export links found in messages*.html (should be localized):", _Ansi.YELLOW))
+        for i, m in enumerate(split_leftover_kept[:max_missing], start=1):
+            rel_html = os.path.relpath(m.html_file, root)
+            print(f"{i:>4}. {rel_html}:{m.line_no} {m.url}")
+        if split_leftover_total > len(split_leftover_kept):
+            print(_c(f"... and {split_leftover_total - len(split_leftover_kept)} more", _Ansi.DIM))
+        print()
+
+    if outside_total:
+        print(_c("References that resolve outside the provided root:", _Ansi.YELLOW))
+        for i, m in enumerate(outside_kept[:max_missing], start=1):
+            rel_html = os.path.relpath(m.html_file, root)
+            note = f" [{m.note}]" if m.note else ""
+            print(f"{i:>4}. {rel_html}:{m.line_no} {m.attr}=\"{m.url}\" -> {m.resolved_path}{note}")
+        if outside_total > len(outside_kept):
+            print(_c(f"... and {outside_total - len(outside_kept)} more", _Ansi.DIM))
+        print()
+
+    if missing_total:
+        print(_c("Missing local references:", _Ansi.RED))
+        for i, m in enumerate(missing_kept[:max_missing], start=1):
+            rel_html = os.path.relpath(m.html_file, root)
+            note = f" [{m.note}]" if m.note else ""
+            print(f"{i:>4}. {rel_html}:{m.line_no} {m.attr}=\"{m.url}\" -> {m.resolved_path}{note}")
+        if missing_total > len(missing_kept):
+            print(_c(f"... and {missing_total - len(missing_kept)} more", _Ansi.DIM))
+
+    if scheme_prefixes and scheme_total:
+        print()
+        print(_c("Scheme refs found in HTML attributes:", _Ansi.CYAN))
+        for i, m in enumerate(scheme_kept[:max_schemes], start=1):
+            rel_html = os.path.relpath(m.html_file, root)
+            print(f"{i:>4}. {rel_html}:{m.line_no} {m.attr}=\"{m.url}\"")
+        if scheme_total > len(scheme_kept):
+            print(_c(f"... and {scheme_total - len(scheme_kept)} more", _Ansi.DIM))
+
+    return 1
+
 @dataclass
 class ChatSummary:
     name: str
     messages_backed_up: Optional[int]
     first_message_utc: Optional[str]
     last_message_utc: Optional[str]
+
+@dataclass
+class FixSplitStats:
+    html_files_scanned: int = 0
+    html_files_modified: int = 0
+    urls_rewritten: int = 0
+    media_files_copied: int = 0
+    media_files_skipped_existing: int = 0
 
 
 @dataclass
@@ -1470,6 +2161,474 @@ def _is_unofficial_telegram_sqlite_db(db_path: str) -> bool:
         except Exception:
             pass
 
+def _resolve_existing_under_root(
+    url: str,
+    base_dir: str,
+    root: str,
+) -> Optional[str]:
+    """
+    Resolve a (local) URL relative to base_dir and return an existing absolute path
+    under root. Tries raw and unquoted variants to handle Telegram exports that
+    store literal %xx sequences in filenames.
+    """
+    if _should_skip_url(url):
+        return None
+
+    u0 = html.unescape(url).strip()
+    u0 = u0.split("?", 1)[0].strip()
+    if not u0:
+        return None
+
+    candidates = [u0]
+    u_no_frag = u0.split("#", 1)[0].strip()
+    if u_no_frag and u_no_frag != u0:
+        candidates.append(u_no_frag)
+
+    seen: Set[str] = set()
+    for c in candidates:
+        variants = [c]
+        try:
+            v1 = urllib.parse.unquote(c)
+            variants.append(v1)
+            v2 = urllib.parse.unquote(v1)
+            variants.append(v2)
+        except Exception:
+            pass
+
+        for v in variants:
+            if not v or v in seen:
+                continue
+            seen.add(v)
+            abs_p = os.path.abspath(os.path.normpath(os.path.join(base_dir, v)))
+            if not _is_ancestor_dir(root, abs_p):
+                continue
+            if os.path.isfile(abs_p):
+                return abs_p
+    return None
+
+def _quote_url_path_posix(rel_posix: str) -> str:
+    # Quote reserved characters so file:// resolution hits the exact on-disk name.
+    # Most important: literal '%' and '#'.
+    return urllib.parse.quote(rel_posix, safe="/")
+
+def _resolve_multi_chat_ref_to_abs(url: str, multi_root: str) -> Optional[Tuple[str, str]]:
+    """
+    If url contains chats/chat_XXX/... return (abs_path, rel_posix_from_multi_root).
+    """
+    if _should_skip_url(url):
+        return None
+
+    u0 = html.unescape(url).strip()
+    u0 = u0.split("?", 1)[0].strip()
+    if not u0:
+        return None
+
+    marker = "chats/chat_"
+    idx = u0.find(marker)
+    if idx < 0:
+        return None
+
+    rel0 = u0[idx:]
+    rels = [rel0]
+    rel_no_frag = rel0.split("#", 1)[0].strip()
+    if rel_no_frag and rel_no_frag != rel0:
+        rels.append(rel_no_frag)
+
+    seen: Set[str] = set()
+    for rel in rels:
+        variants = [rel]
+        try:
+            v1 = urllib.parse.unquote(rel)
+            variants.append(v1)
+            v2 = urllib.parse.unquote(v1)
+            variants.append(v2)
+        except Exception:
+            pass
+
+        for v in variants:
+            if not v or v in seen:
+                continue
+            seen.add(v)
+
+            abs_p = os.path.abspath(os.path.normpath(os.path.join(multi_root, v)))
+            if not _is_ancestor_dir(multi_root, abs_p):
+                continue
+            if os.path.isfile(abs_p):
+                rel_posix = os.path.relpath(abs_p, multi_root).replace(os.sep, "/")
+                return abs_p, rel_posix
+    return None
+
+def fix_single_chat_export_in_place(
+    chat_root: str,
+    multi_root: str,
+    *,
+    dry_run: bool,
+    overwrite: bool,
+    verbose: bool,
+    stats: FixSplitStats,
+) -> None:
+    msg_files = sorted(
+        os.path.join(chat_root, fn)
+        for fn in os.listdir(chat_root)
+        if fn.startswith("messages") and fn.endswith(".html")
+    )
+    if not msg_files:
+        return
+
+    media_root = os.path.join(chat_root, "media")
+
+    # Cache: abs source -> (dest_abs_path, new_url)
+    multi_copy_map: Dict[str, Tuple[str, str]] = {}
+
+    def _ensure_multi_copied(abs_src: str, rel_posix: str) -> str:
+        dst_abs = os.path.join(media_root, rel_posix.replace("/", os.sep))
+        dst_url = f"media/{_quote_url_path_posix(rel_posix)}"
+        if abs_src in multi_copy_map:
+            return multi_copy_map[abs_src][1]
+        multi_copy_map[abs_src] = (dst_abs, dst_url)
+        return dst_url
+
+    # First pass: discover multi-export refs and copy them.
+    for p in msg_files:
+        stats.html_files_scanned += 1
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if "chats/chat_" not in line:
+                        continue
+                    for m in HTML_ATTR_URL_RE.finditer(line):
+                        url = m.group("url")
+                        resolved = _resolve_multi_chat_ref_to_abs(url, multi_root)
+                        if not resolved:
+                            continue
+                        abs_src, rel_posix = resolved
+                        _ensure_multi_copied(abs_src, rel_posix)
+                    for m in HTML_CSS_URL_RE.finditer(line):
+                        url = m.group("url")
+                        resolved = _resolve_multi_chat_ref_to_abs(url, multi_root)
+                        if not resolved:
+                            continue
+                        abs_src, rel_posix = resolved
+                        _ensure_multi_copied(abs_src, rel_posix)
+        except Exception:
+            continue
+
+    if multi_copy_map:
+        for abs_src, (dst_abs, _dst_url) in multi_copy_map.items():
+            if os.path.isfile(dst_abs) and not overwrite:
+                stats.media_files_skipped_existing += 1
+                continue
+            if dry_run:
+                continue
+            os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
+            try:
+                shutil.copy2(abs_src, dst_abs)
+                stats.media_files_copied += 1
+            except Exception:
+                continue
+
+    # Second pass: rewrite HTML in-place.
+    for p in msg_files:
+        base_dir = os.path.dirname(p)
+        tmp = p + ".tmp"
+        changed = False
+
+        def _rewrite_url(url: str) -> Optional[str]:
+            r = _resolve_multi_chat_ref_to_abs(url, multi_root)
+            if r:
+                abs_src, rel_posix = r
+                return _ensure_multi_copied(abs_src, rel_posix)
+
+            if ("%" in url) or ("#" in url):
+                abs_local = _resolve_existing_under_root(url, base_dir, chat_root)
+                if abs_local:
+                    rel_local = os.path.relpath(abs_local, chat_root).replace(os.sep, "/")
+                    return _quote_url_path_posix(rel_local)
+            return None
+
+        def _sub_attr(m: re.Match) -> str:
+            nonlocal changed
+            prefix = m.group("prefix")
+            q = m.group("q")
+            url = m.group("url")
+            nu = _rewrite_url(url)
+            if not nu:
+                return m.group(0)
+            changed = True
+            stats.urls_rewritten += 1
+            return f"{prefix}{q}{nu}{q}"
+
+        def _sub_css(m: re.Match) -> str:
+            nonlocal changed
+            q = m.group("q")
+            url = m.group("url")
+            nu = _rewrite_url(url)
+            if not nu:
+                return m.group(0)
+            changed = True
+            stats.urls_rewritten += 1
+            return f"url({q}{nu}{q})"
+
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as rf, open(tmp, "w", encoding="utf-8") as wf:
+                for line in rf:
+                    if ("href=" not in line) and ("src=" not in line) and ("url(" not in line) and ("chats/chat_" not in line):
+                        wf.write(line)
+                        continue
+                    line2 = HTML_ATTR_URL_RE.sub(_sub_attr, line)
+                    line2 = HTML_CSS_URL_RE.sub(_sub_css, line2)
+                    wf.write(line2)
+            if changed:
+                stats.html_files_modified += 1
+                if dry_run:
+                    os.remove(tmp)
+                else:
+                    os.replace(tmp, p)
+                    if verbose:
+                        print(f"[fix] modified: {p}", file=sys.stderr)
+            else:
+                os.remove(tmp)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+def _cmd_fix_split_in_place(
+    single_root: str,
+    multi_root: str,
+    *,
+    dry_run: bool,
+    overwrite: bool,
+    verbose: bool,
+) -> int:
+    single_root = os.path.abspath(single_root)
+    multi_root = os.path.abspath(multi_root)
+    if not os.path.isdir(single_root):
+        print(f"single_root is not a directory: {single_root}", file=sys.stderr)
+        return 2
+    if not os.path.isdir(multi_root):
+        print(f"multi_root is not a directory: {multi_root}", file=sys.stderr)
+        return 2
+    if not os.path.isdir(os.path.join(multi_root, "chats")):
+        print(f"multi_root does not look like a multi-export (missing chats/): {multi_root}", file=sys.stderr)
+        return 2
+
+    stats = FixSplitStats()
+    chat_roots = list(_iter_chat_export_roots(single_root))
+    if not chat_roots:
+        print("No per-chat exports found (no messages*.html).", file=sys.stderr)
+        return 1
+    for i, chat_root in enumerate(sorted(chat_roots), start=1):
+        if verbose and (i == 1 or i % 50 == 0 or i == len(chat_roots)):
+            print(f"[fix] chat {i}/{len(chat_roots)}: {chat_root}", file=sys.stderr)
+        fix_single_chat_export_in_place(
+            chat_root,
+            multi_root,
+            dry_run=dry_run,
+            overwrite=overwrite,
+            verbose=verbose,
+            stats=stats,
+        )
+
+    print(f"Single root: {single_root}")
+    print(f"Multi root:  {multi_root}")
+    print(
+        "Stats: "
+        f"chat_roots={len(chat_roots)} "
+        f"html_scanned={stats.html_files_scanned} "
+        f"html_modified={stats.html_files_modified} "
+        f"urls_rewritten={stats.urls_rewritten} "
+        f"media_copied={stats.media_files_copied} "
+        f"media_skipped_existing={stats.media_files_skipped_existing}"
+    )
+    if dry_run:
+        print("(dry-run: no changes were written)")
+    return 0
+
+def _iter_message_htmls_in_dir(dirpath: str) -> List[str]:
+    try:
+        names = os.listdir(dirpath)
+    except Exception:
+        return []
+    out: List[str] = []
+    for n in names:
+        if n.startswith("messages") and n.endswith(".html"):
+            out.append(os.path.join(dirpath, n))
+    return sorted(out)
+
+def _looks_like_single_chat_export_root(dirpath: str) -> bool:
+    if not _iter_message_htmls_in_dir(dirpath):
+        return False
+    try:
+        dset = set(os.listdir(dirpath))
+    except Exception:
+        return False
+    # Telegram HTML exports always include these rendering assets.
+    return ("css" in dset) and ("js" in dset)
+
+def _cmd_fix_split_ranges(split_root: str, *, apply: bool, all_dirs: bool) -> int:
+    """
+    Rename per-chat subfolders like unknown__unknown to detected START__END.
+    Expects layout:
+      <split_root>/<chat_name>/<subfolder>/
+    where <subfolder> contains messages*.html.
+    """
+    split_root = os.path.abspath(split_root)
+    if not os.path.isdir(split_root):
+        print(f"Not a directory: {split_root}", file=sys.stderr)
+        return 2
+
+    renamed = 0
+    planned = 0
+    skipped = 0
+    errors = 0
+
+    try:
+        chats = sorted(os.listdir(split_root))
+    except Exception as e:
+        print(f"Failed to list root: {e}", file=sys.stderr)
+        return 2
+
+    def _should_consider(name: str) -> bool:
+        if all_dirs:
+            return True
+        if "unknown" in name:
+            return True
+        if not SPLIT_RANGE_DIR_RE.match(name):
+            return True
+        return False
+
+    for chat in chats:
+        chat_dir = os.path.join(split_root, chat)
+        if not os.path.isdir(chat_dir):
+            continue
+        try:
+            subs = sorted(os.listdir(chat_dir))
+        except Exception:
+            continue
+        for sub in subs:
+            subdir = os.path.join(chat_dir, sub)
+            if not os.path.isdir(subdir):
+                continue
+            if not _should_consider(sub):
+                continue
+            msg_files = _iter_message_htmls_in_dir(subdir)
+            if not msg_files:
+                continue
+            try:
+                # _scan_html_message_files returns: (msg_count, first_dt, last_dt, first_src, last_src, basis)
+                _, first_dt, last_dt, _, _, _ = _scan_html_message_files(msg_files)
+                new_name = f"{_fmt_dt_for_dir(first_dt)}__{_fmt_dt_for_dir(last_dt)}"
+            except Exception as e:
+                errors += 1
+                print(f"error: {subdir}: {e}", file=sys.stderr)
+                continue
+
+            if (not new_name) or (new_name == "unknown__unknown"):
+                skipped += 1
+                continue
+            if new_name == sub:
+                skipped += 1
+                continue
+            dst = os.path.join(chat_dir, new_name)
+            if os.path.exists(dst):
+                skipped += 1
+                print(f"skip (dest exists): {subdir} -> {dst}", file=sys.stderr)
+                continue
+
+            try:
+                if not apply:
+                    planned += 1
+                    print(f"DRY-RUN rename: {subdir} -> {dst}")
+                    continue
+                os.rename(subdir, dst)
+                renamed += 1
+                print(f"renamed: {subdir} -> {dst}")
+            except Exception as e:
+                errors += 1
+                print(f"error: rename failed: {subdir} -> {dst}: {e}", file=sys.stderr)
+
+    if apply:
+        print(f"done: renamed={renamed} skipped={skipped} errors={errors}")
+    else:
+        print(f"done: planned={planned} skipped={skipped} errors={errors}")
+    return 0 if errors == 0 else 1
+
+def _cmd_backfill_split_meta(split_root: str, *, apply: bool) -> int:
+    """
+    Create .backman_export_meta.json inside each ChatName/START__END folder, without
+    touching the split root itself.
+    """
+    split_root = os.path.abspath(split_root)
+    if not os.path.isdir(split_root):
+        print(f"Not a directory: {split_root}", file=sys.stderr)
+        return 2
+
+    created = 0
+    planned = 0
+    skipped = 0
+    errors = 0
+
+    try:
+        chat_dirs = sorted(os.listdir(split_root))
+    except Exception as e:
+        print(f"Failed to list root: {e}", file=sys.stderr)
+        return 2
+
+    for chat in chat_dirs:
+        chat_dir = os.path.join(split_root, chat)
+        if not os.path.isdir(chat_dir):
+            continue
+        try:
+            subs = sorted(os.listdir(chat_dir))
+        except Exception:
+            continue
+        for sub in subs:
+            if not SPLIT_RANGE_DIR_RE.match(sub):
+                continue
+            export_root = os.path.join(chat_dir, sub)
+            if not os.path.isdir(export_root):
+                continue
+            if not _looks_like_single_chat_export_root(export_root):
+                continue
+            meta_path = os.path.join(export_root, BACKMAN_EXPORT_META)
+            if os.path.exists(meta_path):
+                skipped += 1
+                continue
+
+            meta = {
+                "tool": "backman",
+                "kind": "html_single_chat_export_converted",
+                "chat_name": chat,
+                "converted_from": {
+                    "kind": "html_multi_chat_export",
+                    "export_root": None,
+                    "chat_id": None,
+                },
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "note": "Backfilled marker; original multi-export root unknown.",
+            }
+
+            try:
+                if not apply:
+                    planned += 1
+                    print(f"DRY-RUN create: {meta_path}")
+                    continue
+                _write_json_atomic(meta_path, meta)
+                created += 1
+                print(f"created: {meta_path}")
+            except Exception as e:
+                errors += 1
+                print(f"error: {meta_path}: {e}", file=sys.stderr)
+
+    if apply:
+        print(f"done: created={created} skipped={skipped} errors={errors}")
+    else:
+        print(f"done: planned={planned} skipped={skipped} errors={errors}")
+    return 0 if errors == 0 else 1
+
 def find_unofficial_telegram_sqlite_dbs(root: str) -> List[str]:
     hits: List[str] = []
     for dirpath, _, filenames in os.walk(root):
@@ -2157,6 +3316,11 @@ def main() -> int:
     ap.add_argument("path", help="Telegram export folder (will be scanned recursively)")
     ap.add_argument("--json", action="store_true", help="Output JSON (machine-readable)")
     ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="For commands that default to dry-run (e.g. --fix-split-ranges, --backfill-split-meta): apply changes.",
+    )
+    ap.add_argument(
         "--no-inspect",
         action="store_true",
         help="Skip scanning message bodies for counts/date ranges (much faster).",
@@ -2195,11 +3359,62 @@ def main() -> int:
         action="store_true",
         help="With --split-multi-html: only print planned output directory and exit.",
     )
+    ap.add_argument(
+        "--check-links",
+        action="store_true",
+        help="Scan all .html files under the given path and verify that local refs resolve on disk.",
+    )
+    ap.add_argument("--check-scope", choices=("all", "media"), default="all")
+    ap.add_argument("--check-max-missing", type=int, default=200)
+    ap.add_argument("--check-allow-outside-root", action="store_true")
+    ap.add_argument("--check-no-split-leftovers-check", action="store_true")
+    ap.add_argument("--check-fail-fast", action="store_true")
+    ap.add_argument("--check-list-schemes", default="")
+    ap.add_argument("--check-max-schemes", type=int, default=200)
+    ap.add_argument("--check-count-media-files", action="store_true")
+
+    ap.add_argument(
+        "--fix-split-in-place",
+        action="store_true",
+        help="Fix a split output in place by localizing leftover ../../chats/chat_XXX/... refs into each chat's media/ folder.",
+    )
+    ap.add_argument("--fix-split-multi-root", default=None, help="Original multi-chat HTML export root for --fix-split-in-place.")
+    ap.add_argument("--fix-split-dry-run", action="store_true")
+    ap.add_argument("--fix-split-overwrite", action="store_true")
+    ap.add_argument("--fix-split-verbose", action="store_true")
+
+    ap.add_argument(
+        "--fix-split-ranges",
+        action="store_true",
+        help="Rename per-chat subfolders like unknown__unknown to detected START__END (dry-run unless --apply).",
+    )
+    ap.add_argument(
+        "--fix-split-ranges-all",
+        action="store_true",
+        help="With --fix-split-ranges: consider all subfolders (not just unknown/non-standard).",
+    )
+    ap.add_argument(
+        "--backfill-split-meta",
+        action="store_true",
+        help="Create .backman_export_meta.json inside each ChatName/START__END folder (dry-run unless --apply).",
+    )
     args = ap.parse_args()
 
     root = os.path.abspath(args.path)
     if not os.path.exists(root):
         print(f"Path does not exist: {root}", file=sys.stderr)
+        return 2
+
+    action_flags = [
+        ("--split-multi-html", args.split_multi_html),
+        ("--check-links", args.check_links),
+        ("--fix-split-in-place", args.fix_split_in_place),
+        ("--fix-split-ranges", args.fix_split_ranges),
+        ("--backfill-split-meta", args.backfill_split_meta),
+    ]
+    enabled = [name for name, on in action_flags if on]
+    if len(enabled) > 1:
+        print(f"Only one action flag may be used at a time; got: {', '.join(enabled)}", file=sys.stderr)
         return 2
 
     if args.split_multi_html:
@@ -2219,6 +3434,39 @@ def main() -> int:
             return 0
         print(f"Wrote per-chat exports to: {out}")
         return 0
+
+    if args.check_links:
+        return _cmd_check_links(
+            root,
+            json_out=args.json,
+            max_missing=args.check_max_missing,
+            scope=args.check_scope,
+            allow_outside_root=args.check_allow_outside_root,
+            check_split_leftovers=not args.check_no_split_leftovers_check,
+            fail_fast=args.check_fail_fast,
+            list_schemes=args.check_list_schemes,
+            max_schemes=args.check_max_schemes,
+            count_media_files=args.check_count_media_files,
+        )
+
+    if args.fix_split_in_place:
+        if not args.fix_split_multi_root:
+            print("--fix-split-in-place requires --fix-split-multi-root", file=sys.stderr)
+            return 2
+        dry_run = args.fix_split_dry_run or (not args.apply)
+        return _cmd_fix_split_in_place(
+            root,
+            args.fix_split_multi_root,
+            dry_run=dry_run,
+            overwrite=args.fix_split_overwrite,
+            verbose=args.fix_split_verbose,
+        )
+
+    if args.fix_split_ranges:
+        return _cmd_fix_split_ranges(root, apply=args.apply, all_dirs=args.fix_split_ranges_all)
+
+    if args.backfill_split_meta:
+        return _cmd_backfill_split_meta(root, apply=args.apply)
 
     reports: List[ExportReport] = []
     json_hits = find_result_jsons(root)
