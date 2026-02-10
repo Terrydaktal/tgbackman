@@ -1374,7 +1374,9 @@ def split_multi_html_export_to_single_chat_exports(
             for fn in os.listdir(src_chat)
             if fn.startswith("messages") and fn.endswith(".html")
         )
-        first_dt, last_dt = _scan_first_last_message_ts(src_msg_files)
+        # Important: use the same logic as inspection (timestamps + day-separator fallback),
+        # otherwise chats with only service/day-separator entries become unknown__unknown.
+        _, first_dt, last_dt, _, _, _ = _scan_html_message_files(src_msg_files)
         range_dir = f"{_fmt_dt_for_dir(first_dt)}__{_fmt_dt_for_dir(last_dt)}"
         dst_chat = os.path.join(dst_chat_parent, range_dir)
 
