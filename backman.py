@@ -2368,15 +2368,71 @@ def main() -> int:
         if collection_mode:
             print(_c(f"Export root: {root}", _Ansi.BOLD))
             print()
-            def _sort_key(x: ExportReport) -> tuple:
-                # Primary: messages descending (unknowns last). Secondary: stable path ordering.
-                msgs = x.messages_backed_up
-                rel = os.path.relpath(x.export_root, root)
-                return (-(msgs if msgs is not None else -1), rel)
+            # Group by the top-level folder under root (usually the chat name in split output).
+            groups: Dict[str, List[ExportReport]] = {}
+            for r in reports:
+                rel = os.path.relpath(r.export_root, root)
+                parts = [] if rel == "." else rel.split(os.sep)
+                key = parts[0] if parts else os.path.basename(r.export_root)
+                groups.setdefault(key, []).append(r)
 
-            for r in sorted(reports, key=_sort_key):
-                print(_line_for_report(r))
-                _print_chat_summaries(r)
+            def _msg_sort_val(v: Optional[int]) -> int:
+                # Unknowns last.
+                return v if v is not None else -1
+
+            def _group_sort_key(item: Tuple[str, List[ExportReport]]) -> tuple:
+                # Order chat groups by the max message count of any subfolder (avoids double counting
+                # when multiple exports exist for the same chat), then by name.
+                name, rs = item
+                m = max((_msg_sort_val(r.messages_backed_up) for r in rs), default=-1)
+                return (-m, name)
+
+            def _sub_label(r: ExportReport) -> str:
+                rel = os.path.relpath(r.export_root, root)
+                parts = [] if rel == "." else rel.split(os.sep)
+                if len(parts) <= 1:
+                    return os.path.basename(r.export_root)
+                return " ".join(parts[1:])
+
+            for _chat_name, rs in sorted(groups.items(), key=_group_sort_key):
+                # Within a chat, print the largest export first, then any additional subfolders indented
+                # (so repeated chat names don't spam the output).
+                def _within_key(r: ExportReport) -> tuple:
+                    m = _msg_sort_val(r.messages_backed_up)
+                    return (-m, _sub_label(r))
+
+                rs_sorted = sorted(rs, key=_within_key)
+                if not rs_sorted:
+                    continue
+
+                # Primary line (keeps the existing "ChatName SUB" format).
+                print(_line_for_report(rs_sorted[0]))
+                _print_chat_summaries(rs_sorted[0])
+
+                # Additional exports for the same chat (indented; only show the subfolder label).
+                for r2 in rs_sorted[1:]:
+                    fmt = _c(r2.fmt, _Ansi.MAGENTA)
+                    chats_s = _c(_fmt_int(r2.chats_backed_up), _Ansi.YELLOW)
+                    msgs_s = _c(_fmt_int(r2.messages_backed_up), _Ansi.YELLOW)
+                    size_s = _c(_fmt_size(r2.export_root), _Ansi.GREEN)
+                    kind = _c(r2.kind, _Ansi.BLUE)
+
+                    range_s = ""
+                    if r2.kind in ("html_single_chat_export", "single_chat_export"):
+                        range_s = (
+                            " "
+                            + _c("range:", _Ansi.DIM)
+                            + _c(_fmt_iso_utc(r2.first_message_utc), _Ansi.DIM)
+                            + _c(" → ", _Ansi.DIM)
+                            + _c(_fmt_iso_utc(r2.last_message_utc), _Ansi.DIM)
+                        )
+
+                    left = "      " + _c(_sub_label(r2), _Ansi.DIM)
+                    print(
+                        f"{left} {fmt} chats:{chats_s} messages:{msgs_s} "
+                        f"size on disk: {size_s} {kind}{range_s}"
+                    )
+                    _print_chat_summaries(r2)
         else:
             # One section per report.export_root (keeps output useful when scanning a parent folder).
             def _sort_key(x: ExportReport) -> tuple:
