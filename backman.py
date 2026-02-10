@@ -2475,11 +2475,11 @@ def main() -> int:
                 msgs = x.messages_backed_up
                 return (-(msgs if msgs is not None else -1), x.export_root)
 
-            for i, r in enumerate(sorted(reports, key=_sort_key)):
-                if i:
-                    print()
-                print(_c(f"Export root: {r.export_root}", _Ansi.BOLD))
-                print()
+            # If we're effectively listing per-export-roots under a container, avoid repeating
+            # "Export root:" for every entry; show the parent once.
+            print(_c(f"Export root: {root}", _Ansi.BOLD))
+            print()
+            for r in sorted(reports, key=_sort_key):
                 print(_line_for_report(r))
                 _print_chat_summaries(r)
 
