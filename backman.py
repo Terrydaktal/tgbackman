@@ -37,11 +37,6 @@ UNOFFICIAL_SQLITE_NAMES = ("database.sqlite",)
 
 BACKMAN_EXPORT_META = ".backman_export_meta.json"
 
-# Split output subfolder format: START__END (used under each chat folder).
-SPLIT_RANGE_DIR_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$"
-)
-
 class _Ansi:
     RESET = "\033[0m"
     BOLD = "\033[1m"
@@ -74,14 +69,6 @@ def _write_json(path: str, obj: Any) -> None:
             f.write("\n")
     except Exception:
         return
-
-def _write_json_atomic(path: str, obj: Any) -> None:
-    # Atomic write for metadata so we don't leave partial JSON on interruption.
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
 
 def _maybe_mark_converted_single_html(export_root: str, kind: str) -> str:
     """
@@ -847,14 +834,6 @@ class ChatSummary:
     messages_backed_up: Optional[int]
     first_message_utc: Optional[str]
     last_message_utc: Optional[str]
-
-@dataclass
-class FixSplitStats:
-    html_files_scanned: int = 0
-    html_files_modified: int = 0
-    urls_rewritten: int = 0
-    media_files_copied: int = 0
-    media_files_skipped_existing: int = 0
 
 
 @dataclass
@@ -2258,377 +2237,6 @@ def _resolve_multi_chat_ref_to_abs(url: str, multi_root: str) -> Optional[Tuple[
                 return abs_p, rel_posix
     return None
 
-def fix_single_chat_export_in_place(
-    chat_root: str,
-    multi_root: str,
-    *,
-    dry_run: bool,
-    overwrite: bool,
-    verbose: bool,
-    stats: FixSplitStats,
-) -> None:
-    msg_files = sorted(
-        os.path.join(chat_root, fn)
-        for fn in os.listdir(chat_root)
-        if fn.startswith("messages") and fn.endswith(".html")
-    )
-    if not msg_files:
-        return
-
-    media_root = os.path.join(chat_root, "media")
-
-    # Cache: abs source -> (dest_abs_path, new_url)
-    multi_copy_map: Dict[str, Tuple[str, str]] = {}
-
-    def _ensure_multi_copied(abs_src: str, rel_posix: str) -> str:
-        dst_abs = os.path.join(media_root, rel_posix.replace("/", os.sep))
-        dst_url = f"media/{_quote_url_path_posix(rel_posix)}"
-        if abs_src in multi_copy_map:
-            return multi_copy_map[abs_src][1]
-        multi_copy_map[abs_src] = (dst_abs, dst_url)
-        return dst_url
-
-    # First pass: discover multi-export refs and copy them.
-    for p in msg_files:
-        stats.html_files_scanned += 1
-        try:
-            with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if "chats/chat_" not in line:
-                        continue
-                    for m in HTML_ATTR_URL_RE.finditer(line):
-                        url = m.group("url")
-                        resolved = _resolve_multi_chat_ref_to_abs(url, multi_root)
-                        if not resolved:
-                            continue
-                        abs_src, rel_posix = resolved
-                        _ensure_multi_copied(abs_src, rel_posix)
-                    for m in HTML_CSS_URL_RE.finditer(line):
-                        url = m.group("url")
-                        resolved = _resolve_multi_chat_ref_to_abs(url, multi_root)
-                        if not resolved:
-                            continue
-                        abs_src, rel_posix = resolved
-                        _ensure_multi_copied(abs_src, rel_posix)
-        except Exception:
-            continue
-
-    if multi_copy_map:
-        for abs_src, (dst_abs, _dst_url) in multi_copy_map.items():
-            if os.path.isfile(dst_abs) and not overwrite:
-                stats.media_files_skipped_existing += 1
-                continue
-            if dry_run:
-                continue
-            os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
-            try:
-                shutil.copy2(abs_src, dst_abs)
-                stats.media_files_copied += 1
-            except Exception:
-                continue
-
-    # Second pass: rewrite HTML in-place.
-    for p in msg_files:
-        base_dir = os.path.dirname(p)
-        tmp = p + ".tmp"
-        changed = False
-
-        def _rewrite_url(url: str) -> Optional[str]:
-            r = _resolve_multi_chat_ref_to_abs(url, multi_root)
-            if r:
-                abs_src, rel_posix = r
-                return _ensure_multi_copied(abs_src, rel_posix)
-
-            if ("%" in url) or ("#" in url):
-                abs_local = _resolve_existing_under_root(url, base_dir, chat_root)
-                if abs_local:
-                    rel_local = os.path.relpath(abs_local, chat_root).replace(os.sep, "/")
-                    return _quote_url_path_posix(rel_local)
-            return None
-
-        def _sub_attr(m: re.Match) -> str:
-            nonlocal changed
-            prefix = m.group("prefix")
-            q = m.group("q")
-            url = m.group("url")
-            nu = _rewrite_url(url)
-            if not nu:
-                return m.group(0)
-            changed = True
-            stats.urls_rewritten += 1
-            return f"{prefix}{q}{nu}{q}"
-
-        def _sub_css(m: re.Match) -> str:
-            nonlocal changed
-            q = m.group("q")
-            url = m.group("url")
-            nu = _rewrite_url(url)
-            if not nu:
-                return m.group(0)
-            changed = True
-            stats.urls_rewritten += 1
-            return f"url({q}{nu}{q})"
-
-        try:
-            with open(p, "r", encoding="utf-8", errors="ignore") as rf, open(tmp, "w", encoding="utf-8") as wf:
-                for line in rf:
-                    if ("href=" not in line) and ("src=" not in line) and ("url(" not in line) and ("chats/chat_" not in line):
-                        wf.write(line)
-                        continue
-                    line2 = HTML_ATTR_URL_RE.sub(_sub_attr, line)
-                    line2 = HTML_CSS_URL_RE.sub(_sub_css, line2)
-                    wf.write(line2)
-            if changed:
-                stats.html_files_modified += 1
-                if dry_run:
-                    os.remove(tmp)
-                else:
-                    os.replace(tmp, p)
-                    if verbose:
-                        print(f"[fix] modified: {p}", file=sys.stderr)
-            else:
-                os.remove(tmp)
-        except Exception:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-
-def _cmd_fix_split_in_place(
-    single_root: str,
-    multi_root: str,
-    *,
-    dry_run: bool,
-    overwrite: bool,
-    verbose: bool,
-) -> int:
-    single_root = os.path.abspath(single_root)
-    multi_root = os.path.abspath(multi_root)
-    if not os.path.isdir(single_root):
-        print(f"single_root is not a directory: {single_root}", file=sys.stderr)
-        return 2
-    if not os.path.isdir(multi_root):
-        print(f"multi_root is not a directory: {multi_root}", file=sys.stderr)
-        return 2
-    if not os.path.isdir(os.path.join(multi_root, "chats")):
-        print(f"multi_root does not look like a multi-export (missing chats/): {multi_root}", file=sys.stderr)
-        return 2
-
-    stats = FixSplitStats()
-    chat_roots = list(_iter_chat_export_roots(single_root))
-    if not chat_roots:
-        print("No per-chat exports found (no messages*.html).", file=sys.stderr)
-        return 1
-    for i, chat_root in enumerate(sorted(chat_roots), start=1):
-        if verbose and (i == 1 or i % 50 == 0 or i == len(chat_roots)):
-            print(f"[fix] chat {i}/{len(chat_roots)}: {chat_root}", file=sys.stderr)
-        fix_single_chat_export_in_place(
-            chat_root,
-            multi_root,
-            dry_run=dry_run,
-            overwrite=overwrite,
-            verbose=verbose,
-            stats=stats,
-        )
-
-    print(f"Single root: {single_root}")
-    print(f"Multi root:  {multi_root}")
-    print(
-        "Stats: "
-        f"chat_roots={len(chat_roots)} "
-        f"html_scanned={stats.html_files_scanned} "
-        f"html_modified={stats.html_files_modified} "
-        f"urls_rewritten={stats.urls_rewritten} "
-        f"media_copied={stats.media_files_copied} "
-        f"media_skipped_existing={stats.media_files_skipped_existing}"
-    )
-    if dry_run:
-        print("(dry-run: no changes were written)")
-    return 0
-
-def _iter_message_htmls_in_dir(dirpath: str) -> List[str]:
-    try:
-        names = os.listdir(dirpath)
-    except Exception:
-        return []
-    out: List[str] = []
-    for n in names:
-        if n.startswith("messages") and n.endswith(".html"):
-            out.append(os.path.join(dirpath, n))
-    return sorted(out)
-
-def _looks_like_single_chat_export_root(dirpath: str) -> bool:
-    if not _iter_message_htmls_in_dir(dirpath):
-        return False
-    try:
-        dset = set(os.listdir(dirpath))
-    except Exception:
-        return False
-    # Telegram HTML exports always include these rendering assets.
-    return ("css" in dset) and ("js" in dset)
-
-def _cmd_fix_split_ranges(split_root: str, *, apply: bool, all_dirs: bool) -> int:
-    """
-    Rename per-chat subfolders like unknown__unknown to detected START__END.
-    Expects layout:
-      <split_root>/<chat_name>/<subfolder>/
-    where <subfolder> contains messages*.html.
-    """
-    split_root = os.path.abspath(split_root)
-    if not os.path.isdir(split_root):
-        print(f"Not a directory: {split_root}", file=sys.stderr)
-        return 2
-
-    renamed = 0
-    planned = 0
-    skipped = 0
-    errors = 0
-
-    try:
-        chats = sorted(os.listdir(split_root))
-    except Exception as e:
-        print(f"Failed to list root: {e}", file=sys.stderr)
-        return 2
-
-    def _should_consider(name: str) -> bool:
-        if all_dirs:
-            return True
-        if "unknown" in name:
-            return True
-        if not SPLIT_RANGE_DIR_RE.match(name):
-            return True
-        return False
-
-    for chat in chats:
-        chat_dir = os.path.join(split_root, chat)
-        if not os.path.isdir(chat_dir):
-            continue
-        try:
-            subs = sorted(os.listdir(chat_dir))
-        except Exception:
-            continue
-        for sub in subs:
-            subdir = os.path.join(chat_dir, sub)
-            if not os.path.isdir(subdir):
-                continue
-            if not _should_consider(sub):
-                continue
-            msg_files = _iter_message_htmls_in_dir(subdir)
-            if not msg_files:
-                continue
-            try:
-                # _scan_html_message_files returns: (msg_count, first_dt, last_dt, first_src, last_src, basis)
-                _, first_dt, last_dt, _, _, _ = _scan_html_message_files(msg_files)
-                new_name = f"{_fmt_dt_for_dir(first_dt)}__{_fmt_dt_for_dir(last_dt)}"
-            except Exception as e:
-                errors += 1
-                print(f"error: {subdir}: {e}", file=sys.stderr)
-                continue
-
-            if (not new_name) or (new_name == "unknown__unknown"):
-                skipped += 1
-                continue
-            if new_name == sub:
-                skipped += 1
-                continue
-            dst = os.path.join(chat_dir, new_name)
-            if os.path.exists(dst):
-                skipped += 1
-                print(f"skip (dest exists): {subdir} -> {dst}", file=sys.stderr)
-                continue
-
-            try:
-                if not apply:
-                    planned += 1
-                    print(f"DRY-RUN rename: {subdir} -> {dst}")
-                    continue
-                os.rename(subdir, dst)
-                renamed += 1
-                print(f"renamed: {subdir} -> {dst}")
-            except Exception as e:
-                errors += 1
-                print(f"error: rename failed: {subdir} -> {dst}: {e}", file=sys.stderr)
-
-    if apply:
-        print(f"done: renamed={renamed} skipped={skipped} errors={errors}")
-    else:
-        print(f"done: planned={planned} skipped={skipped} errors={errors}")
-    return 0 if errors == 0 else 1
-
-def _cmd_backfill_split_meta(split_root: str, *, apply: bool) -> int:
-    """
-    Create .backman_export_meta.json inside each ChatName/START__END folder, without
-    touching the split root itself.
-    """
-    split_root = os.path.abspath(split_root)
-    if not os.path.isdir(split_root):
-        print(f"Not a directory: {split_root}", file=sys.stderr)
-        return 2
-
-    created = 0
-    planned = 0
-    skipped = 0
-    errors = 0
-
-    try:
-        chat_dirs = sorted(os.listdir(split_root))
-    except Exception as e:
-        print(f"Failed to list root: {e}", file=sys.stderr)
-        return 2
-
-    for chat in chat_dirs:
-        chat_dir = os.path.join(split_root, chat)
-        if not os.path.isdir(chat_dir):
-            continue
-        try:
-            subs = sorted(os.listdir(chat_dir))
-        except Exception:
-            continue
-        for sub in subs:
-            if not SPLIT_RANGE_DIR_RE.match(sub):
-                continue
-            export_root = os.path.join(chat_dir, sub)
-            if not os.path.isdir(export_root):
-                continue
-            if not _looks_like_single_chat_export_root(export_root):
-                continue
-            meta_path = os.path.join(export_root, BACKMAN_EXPORT_META)
-            if os.path.exists(meta_path):
-                skipped += 1
-                continue
-
-            meta = {
-                "tool": "backman",
-                "kind": "html_single_chat_export_converted",
-                "chat_name": chat,
-                "converted_from": {
-                    "kind": "html_multi_chat_export",
-                    "export_root": None,
-                    "chat_id": None,
-                },
-                "created_utc": datetime.now(timezone.utc).isoformat(),
-                "note": "Backfilled marker; original multi-export root unknown.",
-            }
-
-            try:
-                if not apply:
-                    planned += 1
-                    print(f"DRY-RUN create: {meta_path}")
-                    continue
-                _write_json_atomic(meta_path, meta)
-                created += 1
-                print(f"created: {meta_path}")
-            except Exception as e:
-                errors += 1
-                print(f"error: {meta_path}: {e}", file=sys.stderr)
-
-    if apply:
-        print(f"done: created={created} skipped={skipped} errors={errors}")
-    else:
-        print(f"done: planned={planned} skipped={skipped} errors={errors}")
-    return 0 if errors == 0 else 1
-
 def find_unofficial_telegram_sqlite_dbs(root: str) -> List[str]:
     hits: List[str] = []
     for dirpath, _, filenames in os.walk(root):
@@ -3316,11 +2924,6 @@ def main() -> int:
     ap.add_argument("path", help="Telegram export folder (will be scanned recursively)")
     ap.add_argument("--json", action="store_true", help="Output JSON (machine-readable)")
     ap.add_argument(
-        "--apply",
-        action="store_true",
-        help="For commands that default to dry-run (e.g. --fix-split-ranges, --backfill-split-meta): apply changes.",
-    )
-    ap.add_argument(
         "--no-inspect",
         action="store_true",
         help="Skip scanning message bodies for counts/date ranges (much faster).",
@@ -3372,32 +2975,6 @@ def main() -> int:
     ap.add_argument("--check-list-schemes", default="")
     ap.add_argument("--check-max-schemes", type=int, default=200)
     ap.add_argument("--check-count-media-files", action="store_true")
-
-    ap.add_argument(
-        "--fix-split-in-place",
-        action="store_true",
-        help="Fix a split output in place by localizing leftover ../../chats/chat_XXX/... refs into each chat's media/ folder.",
-    )
-    ap.add_argument("--fix-split-multi-root", default=None, help="Original multi-chat HTML export root for --fix-split-in-place.")
-    ap.add_argument("--fix-split-dry-run", action="store_true")
-    ap.add_argument("--fix-split-overwrite", action="store_true")
-    ap.add_argument("--fix-split-verbose", action="store_true")
-
-    ap.add_argument(
-        "--fix-split-ranges",
-        action="store_true",
-        help="Rename per-chat subfolders like unknown__unknown to detected START__END (dry-run unless --apply).",
-    )
-    ap.add_argument(
-        "--fix-split-ranges-all",
-        action="store_true",
-        help="With --fix-split-ranges: consider all subfolders (not just unknown/non-standard).",
-    )
-    ap.add_argument(
-        "--backfill-split-meta",
-        action="store_true",
-        help="Create .backman_export_meta.json inside each ChatName/START__END folder (dry-run unless --apply).",
-    )
     args = ap.parse_args()
 
     root = os.path.abspath(args.path)
@@ -3408,9 +2985,6 @@ def main() -> int:
     action_flags = [
         ("--split-multi-html", args.split_multi_html),
         ("--check-links", args.check_links),
-        ("--fix-split-in-place", args.fix_split_in_place),
-        ("--fix-split-ranges", args.fix_split_ranges),
-        ("--backfill-split-meta", args.backfill_split_meta),
     ]
     enabled = [name for name, on in action_flags if on]
     if len(enabled) > 1:
@@ -3448,25 +3022,6 @@ def main() -> int:
             max_schemes=args.check_max_schemes,
             count_media_files=args.check_count_media_files,
         )
-
-    if args.fix_split_in_place:
-        if not args.fix_split_multi_root:
-            print("--fix-split-in-place requires --fix-split-multi-root", file=sys.stderr)
-            return 2
-        dry_run = args.fix_split_dry_run or (not args.apply)
-        return _cmd_fix_split_in_place(
-            root,
-            args.fix_split_multi_root,
-            dry_run=dry_run,
-            overwrite=args.fix_split_overwrite,
-            verbose=args.fix_split_verbose,
-        )
-
-    if args.fix_split_ranges:
-        return _cmd_fix_split_ranges(root, apply=args.apply, all_dirs=args.fix_split_ranges_all)
-
-    if args.backfill_split_meta:
-        return _cmd_backfill_split_meta(root, apply=args.apply)
 
     reports: List[ExportReport] = []
     json_hits = find_result_jsons(root)
