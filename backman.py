@@ -35,7 +35,6 @@ ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 RESULT_NAMES = ("result.json", "results.json")
 UNOFFICIAL_SQLITE_NAMES = ("database.sqlite",)
 
-BACKMAN_SPLIT_ROOT_MARKER = ".backman_split_root.json"
 BACKMAN_EXPORT_META = ".backman_export_meta.json"
 
 class _Ansi:
@@ -70,17 +69,6 @@ def _write_json(path: str, obj: Any) -> None:
     except Exception:
         return
 
-def _has_marker_in_ancestors(start_dir: str, marker_name: str, *, max_levels: int = 4) -> bool:
-    p = os.path.abspath(start_dir)
-    for _ in range(max_levels):
-        if os.path.isfile(os.path.join(p, marker_name)):
-            return True
-        parent = os.path.dirname(p)
-        if parent == p:
-            break
-        p = parent
-    return False
-
 def _maybe_mark_converted_single_html(export_root: str, kind: str) -> str:
     """
     If this looks like a per-chat export produced by backman split, label it as converted.
@@ -88,9 +76,6 @@ def _maybe_mark_converted_single_html(export_root: str, kind: str) -> str:
     if kind != "html_single_chat_export":
         return kind
     if os.path.isfile(os.path.join(export_root, BACKMAN_EXPORT_META)):
-        return "html_single_chat_export_converted"
-    # Also support a single marker at the split output root (grandparent of per-chat roots).
-    if _has_marker_in_ancestors(export_root, BACKMAN_SPLIT_ROOT_MARKER, max_levels=4):
         return "html_single_chat_export_converted"
     return kind
 
@@ -1398,15 +1383,6 @@ def split_multi_html_export_to_single_chat_exports(
         return out_root
 
     os.makedirs(out_root, exist_ok=False)
-    _write_json(
-        os.path.join(out_root, BACKMAN_SPLIT_ROOT_MARKER),
-        {
-            "tool": "backman",
-            "action": "split_multi_html_export_to_single_chat_exports",
-            "source_export_root": export_root,
-            "created_utc": datetime.now(timezone.utc).isoformat(),
-        },
-    )
 
     # Copy each chat folder into its own export root and add shared assets.
     for i, chat_id in enumerate(chat_names, start=1):
