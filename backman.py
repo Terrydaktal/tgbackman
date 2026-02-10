@@ -2342,7 +2342,15 @@ def main() -> int:
             return du.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         def _line_for_report(r: ExportReport) -> str:
-            rel = os.path.relpath(r.export_root, root)
+            return _line_for_report_base(r, root=root, base=root, indent="")
+
+        def _line_for_report_base(r: ExportReport, *, root: str, base: str, indent: str) -> str:
+            """
+            Format a report line, but compute the "label" relative to `base` (not necessarily the
+            scanned `root`). This is used for nested printing so children show up as "g" under
+            their parent export root, instead of repeating the parent's name.
+            """
+            rel = os.path.relpath(r.export_root, base)
             parts = [] if rel == "." else rel.split(os.sep)
             if collection_mode and len(parts) >= 2:
                 chat = parts[0]
@@ -2351,7 +2359,7 @@ def main() -> int:
                 chat = parts[0] if parts else os.path.basename(r.export_root)
                 sub = " ".join(parts[1:]) if len(parts) > 1 else ""
 
-            left = _c(chat, _Ansi.CYAN)
+            left = indent + _c(chat, _Ansi.CYAN)
             if sub:
                 left += " " + _c(sub, _Ansi.DIM)
 
@@ -2376,7 +2384,7 @@ def main() -> int:
                 f"size on disk: {size_s} {kind}{range_s}"
             )
 
-        def _print_chat_summaries(r: ExportReport) -> None:
+        def _print_chat_summaries(r: ExportReport, *, indent: str = "") -> None:
             if not r.chat_summaries:
                 return
             # Sorted by message count desc; unknowns last.
@@ -2390,7 +2398,8 @@ def main() -> int:
                 rng = f"{_fmt_dt_for_dir(fd)}__{_fmt_dt_for_dir(ld)}"
                 msgs = "?" if cs.messages_backed_up is None else str(cs.messages_backed_up)
                 line = (
-                    "  "
+                    indent
+                    + "  "
                     + _c(cs.name, _Ansi.CYAN)
                     + " "
                     + _c(rng, _Ansi.DIM)
@@ -2470,18 +2479,60 @@ def main() -> int:
                     )
                     _print_chat_summaries(r2)
         else:
-            # One section per report.export_root (keeps output useful when scanning a parent folder).
-            def _sort_key(x: ExportReport) -> tuple:
-                msgs = x.messages_backed_up
-                return (-(msgs if msgs is not None else -1), x.export_root)
+            # Nest results by filesystem hierarchy (export roots within other export roots).
+            def _is_ancestor(a: str, b: str) -> bool:
+                try:
+                    ap = os.path.abspath(a)
+                    bp = os.path.abspath(b)
+                    if ap == bp:
+                        return False
+                    return os.path.commonpath([ap, bp]) == ap
+                except Exception:
+                    return False
 
-            # If we're effectively listing per-export-roots under a container, avoid repeating
-            # "Export root:" for every entry; show the parent once.
+            # Map export_root -> report and build a parent/children forest using the nearest ancestor export root.
+            report_by_root: Dict[str, ExportReport] = {os.path.abspath(r.export_root): r for r in reports}
+            roots = sorted(report_by_root.keys(), key=lambda p: (p.count(os.sep), p))
+
+            parent_of: Dict[str, Optional[str]] = {p: None for p in roots}
+            for p in roots:
+                best: Optional[str] = None
+                for cand in roots:
+                    if _is_ancestor(cand, p):
+                        if best is None or len(cand) > len(best):
+                            best = cand
+                parent_of[p] = best
+
+            children: Dict[str, List[str]] = {p: [] for p in roots}
+            for p, par in parent_of.items():
+                if par:
+                    children[par].append(p)
+
+            def _msg_sort_val(v: Optional[int]) -> int:
+                return v if v is not None else -1
+
+            def _node_sort_key(p: str, *, base: str) -> tuple:
+                r = report_by_root[p]
+                # Primary: messages desc (unknowns last). Secondary: relative path label for stability.
+                rel = os.path.relpath(p, base)
+                return (-_msg_sort_val(r.messages_backed_up), rel)
+
+            def _print_node(p: str, *, depth: int, base: str) -> None:
+                r = report_by_root[p]
+                indent = "  " * depth
+                print(_line_for_report_base(r, root=root, base=base, indent=indent))
+                _print_chat_summaries(r, indent=indent)
+
+                # Print nested exports (children) after the parent's own summaries.
+                kids = children.get(p) or []
+                for ch in sorted(kids, key=lambda x: _node_sort_key(x, base=p)):
+                    _print_node(ch, depth=depth + 1, base=p)
+
             print(_c(f"Export root: {root}", _Ansi.BOLD))
             print()
-            for r in sorted(reports, key=_sort_key):
-                print(_line_for_report(r))
-                _print_chat_summaries(r)
+            top = [p for p in roots if parent_of[p] is None]
+            for p in sorted(top, key=lambda x: _node_sort_key(x, base=root)):
+                _print_node(p, depth=0, base=root)
 
         if not args.no_sizes and size_tool_used:
             tool_note = ", ".join(sorted(t for t in size_tool_used if t != "unknown"))
