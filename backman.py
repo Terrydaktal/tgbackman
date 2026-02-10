@@ -35,6 +35,9 @@ ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 RESULT_NAMES = ("result.json", "results.json")
 UNOFFICIAL_SQLITE_NAMES = ("database.sqlite",)
 
+BACKMAN_SPLIT_ROOT_MARKER = ".backman_split_root.json"
+BACKMAN_EXPORT_META = ".backman_export_meta.json"
+
 class _Ansi:
     RESET = "\033[0m"
     BOLD = "\033[1m"
@@ -57,6 +60,39 @@ def _c(s: str, code: str) -> str:
     if not _use_color():
         return s
     return f"{code}{s}{_Ansi.RESET}"
+
+def _write_json(path: str, obj: Any) -> None:
+    # Best-effort: metadata should never break the split.
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+    except Exception:
+        return
+
+def _has_marker_in_ancestors(start_dir: str, marker_name: str, *, max_levels: int = 4) -> bool:
+    p = os.path.abspath(start_dir)
+    for _ in range(max_levels):
+        if os.path.isfile(os.path.join(p, marker_name)):
+            return True
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return False
+
+def _maybe_mark_converted_single_html(export_root: str, kind: str) -> str:
+    """
+    If this looks like a per-chat export produced by backman split, label it as converted.
+    """
+    if kind != "html_single_chat_export":
+        return kind
+    if os.path.isfile(os.path.join(export_root, BACKMAN_EXPORT_META)):
+        return "html_single_chat_export_converted"
+    # Also support a single marker at the split output root (grandparent of per-chat roots).
+    if _has_marker_in_ancestors(export_root, BACKMAN_SPLIT_ROOT_MARKER, max_levels=4):
+        return "html_single_chat_export_converted"
+    return kind
 
 EXPORT_DATE_RE = re.compile(
     r"(?:DataExport|ChatExport)[_-](\d{2})[._-](\d{2})[._-](\d{4})"
@@ -1362,6 +1398,15 @@ def split_multi_html_export_to_single_chat_exports(
         return out_root
 
     os.makedirs(out_root, exist_ok=False)
+    _write_json(
+        os.path.join(out_root, BACKMAN_SPLIT_ROOT_MARKER),
+        {
+            "tool": "backman",
+            "action": "split_multi_html_export_to_single_chat_exports",
+            "source_export_root": export_root,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
     # Copy each chat folder into its own export root and add shared assets.
     for i, chat_id in enumerate(chat_names, start=1):
@@ -1399,6 +1444,19 @@ def split_multi_html_export_to_single_chat_exports(
 
         _rewrite_chat_html_for_standalone(dst_chat, chat_id=chat_id)
         _copy_and_localize_shared_media_for_chat(export_root, src_chat, dst_chat, chat_id=chat_id)
+        _write_json(
+            os.path.join(dst_chat, BACKMAN_EXPORT_META),
+            {
+                "tool": "backman",
+                "kind": "html_single_chat_export_converted",
+                "converted_from": {
+                    "kind": "html_multi_chat_export",
+                    "export_root": export_root,
+                    "chat_id": chat_id,
+                },
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
         # Progress every so often for large exports.
         if i == 1 or i % 25 == 0 or i == len(chat_names):
@@ -1984,6 +2042,7 @@ def inspect_html_export(export_root: str) -> ExportReport:
     kind = "html_multi_chat_export" if entrypoint else "html_single_chat_export"
     if entrypoint is None:
         entrypoint = os.path.join(export_root, HTML_SINGLE_ROOT_NAME)
+    kind = _maybe_mark_converted_single_html(export_root, kind)
 
     chat_count: Optional[int]
     if kind == "html_multi_chat_export":
@@ -2085,6 +2144,7 @@ def summarize_html_export(export_root: str) -> ExportReport:
     kind = "html_multi_chat_export" if entrypoint else "html_single_chat_export"
     if entrypoint is None:
         entrypoint = os.path.join(export_root, HTML_SINGLE_ROOT_NAME)
+    kind = _maybe_mark_converted_single_html(export_root, kind)
 
     chat_count: Optional[int]
     if kind == "html_multi_chat_export":
@@ -2271,7 +2331,7 @@ def main() -> int:
         def _is_collection_mode() -> bool:
             if len(reports) < 5:
                 return False
-            if not all(r.kind == "html_single_chat_export" for r in reports):
+            if not all(r.kind in ("html_single_chat_export", "html_single_chat_export_converted") for r in reports):
                 return False
             try:
                 for r in reports:
@@ -2326,7 +2386,7 @@ def main() -> int:
             kind = _c(r.kind, _Ansi.BLUE)
 
             range_s = ""
-            if r.kind in ("html_single_chat_export", "single_chat_export"):
+            if r.kind in ("html_single_chat_export", "html_single_chat_export_converted", "single_chat_export"):
                 range_s = (
                     " "
                     + _c("range:", _Ansi.DIM)
@@ -2418,7 +2478,7 @@ def main() -> int:
                     kind = _c(r2.kind, _Ansi.BLUE)
 
                     range_s = ""
-                    if r2.kind in ("html_single_chat_export", "single_chat_export"):
+                    if r2.kind in ("html_single_chat_export", "html_single_chat_export_converted", "single_chat_export"):
                         range_s = (
                             " "
                             + _c("range:", _Ansi.DIM)
