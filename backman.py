@@ -2060,6 +2060,28 @@ def _resolve_local_url_to_export_file(
         candidates.append(u_no_frag)
 
     seen: Set[str] = set()
+    seen_abs: Set[str] = set()
+
+    def _consider_candidate(rel_or_abs: str) -> Optional[Tuple[str, str]]:
+        # rel_or_abs may be absolute or relative to src_html_dir.
+        abs_p = (
+            os.path.abspath(os.path.normpath(rel_or_abs))
+            if os.path.isabs(rel_or_abs)
+            else os.path.abspath(os.path.normpath(os.path.join(src_html_dir, rel_or_abs)))
+        )
+        if abs_p in seen_abs:
+            return None
+        seen_abs.add(abs_p)
+        if not _is_ancestor_dir(export_root, abs_p):
+            return None
+        if not os.path.isfile(abs_p):
+            return None
+        rel = os.path.relpath(abs_p, export_root)
+        top = rel.split(os.sep, 1)[0]
+        if top in _SKIP_SHARED_MEDIA_TOPLEVEL:
+            return None
+        return abs_p, rel
+
     for c in candidates:
         # Try raw first (handles literal %xx filenames), then decoded variants.
         variants = [c]
@@ -2075,18 +2097,17 @@ def _resolve_local_url_to_export_file(
             if not v or v in seen:
                 continue
             seen.add(v)
+            hit = _consider_candidate(v)
+            if hit:
+                return hit
 
-            abs_p = os.path.abspath(os.path.normpath(os.path.join(src_html_dir, v)))
-            if not _is_ancestor_dir(export_root, abs_p):
-                continue
-            if not os.path.isfile(abs_p):
-                continue
-
-            rel = os.path.relpath(abs_p, export_root)
-            top = rel.split(os.sep, 1)[0]
-            if top in _SKIP_SHARED_MEDIA_TOPLEVEL:
-                return None
-            return abs_p, rel
+            # Fallback for ambiguous bare filenames often found in Telegram HTML:
+            # try common chat-local media dirs (e.g. files/, photos/, ...).
+            if "/" not in v and "\\" not in v and not v.startswith("."):
+                for d in sorted(LINK_CHAT_LOCAL_MEDIA_DIRS):
+                    hit = _consider_candidate(os.path.join(d, v))
+                    if hit:
+                        return hit
 
     return None
 
