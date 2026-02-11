@@ -510,6 +510,11 @@ def _scan_html_file_for_bad_refs(
     int,
     int,
     int,
+    int,
+    int,
+    int,
+    int,
+    int,
 ]:
     """
     Returns:
@@ -520,7 +525,9 @@ def _scan_html_file_for_bad_refs(
       scheme_total, scheme_kept,
       media_shared_refs, media_chat_local_refs,
       media_shared_ok, media_chat_local_ok,
-      cross_chat_total, cross_chat_ok
+      cross_chat_total, cross_chat_ok,
+      bucket_non_local, bucket_cross_chat, bucket_media_shared,
+      bucket_media_chat_local, bucket_other_local
     """
     total = 0
     skipped = 0
@@ -539,6 +546,11 @@ def _scan_html_file_for_bad_refs(
     media_chat_local_ok = 0
     cross_chat_total = 0
     cross_chat_ok = 0
+    bucket_non_local = 0
+    bucket_cross_chat = 0
+    bucket_media_shared = 0
+    bucket_media_chat_local = 0
+    bucket_other_local = 0
     in_style_block = False
     src_chat_id = _source_chat_id_from_html_path_for_check(html_path, root)
 
@@ -556,6 +568,32 @@ def _scan_html_file_for_bad_refs(
             scheme_total += 1
             if len(scheme_kept) < max_keep_schemes:
                 scheme_kept.append(LinkSchemeRef(html_path, ln, attr, u))
+
+    def _bucket_for(url: str, cls: Optional[str], is_cross_chat: bool) -> str:
+        if _should_skip_url(url):
+            return "non_local"
+        if _looks_like_external_host_ref(url) or _looks_like_bare_file_token_ref(url):
+            return "non_local"
+        if is_cross_chat:
+            return "cross_chat"
+        if cls == "shared":
+            return "media_shared"
+        if cls == "chat_local":
+            return "media_chat_local"
+        return "other_local"
+
+    def _inc_bucket(name: str) -> None:
+        nonlocal bucket_non_local, bucket_cross_chat, bucket_media_shared, bucket_media_chat_local, bucket_other_local
+        if name == "non_local":
+            bucket_non_local += 1
+        elif name == "cross_chat":
+            bucket_cross_chat += 1
+        elif name == "media_shared":
+            bucket_media_shared += 1
+        elif name == "media_chat_local":
+            bucket_media_chat_local += 1
+        else:
+            bucket_other_local += 1
 
     try:
         with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -619,6 +657,7 @@ def _scan_html_file_for_bad_refs(
                     is_cross_chat = bool(tgt_chat_id and src_chat_id and tgt_chat_id != src_chat_id)
                     if is_cross_chat:
                         cross_chat_total += 1
+                    _inc_bucket(_bucket_for(url, cls, is_cross_chat))
                     if scope == "media" and not _is_media_url_for_check(url):
                         skipped += 1
                         continue
@@ -662,6 +701,7 @@ def _scan_html_file_for_bad_refs(
                         is_cross_chat = bool(tgt_chat_id and src_chat_id and tgt_chat_id != src_chat_id)
                         if is_cross_chat:
                             cross_chat_total += 1
+                        _inc_bucket(_bucket_for(url, cls, is_cross_chat))
                         if scope == "media" and not _is_media_url_for_check(url):
                             skipped += 1
                             continue
@@ -692,10 +732,6 @@ def _scan_html_file_for_bad_refs(
                 for m in HTML_CSS_URL_RE.finditer(line):
                     url = m.group("url")
                     total += 1
-                    # Only consider url(...) inside actual CSS contexts (style="..." or <style> blocks).
-                    if not in_style_block and 'style="' not in line_l and "style='" not in line_l:
-                        skipped += 1
-                        continue
                     cls = None
                     if _is_media_url_for_check(url):
                         cls = _classify_media_ref_for_check(url)
@@ -707,6 +743,11 @@ def _scan_html_file_for_bad_refs(
                     is_cross_chat = bool(tgt_chat_id and src_chat_id and tgt_chat_id != src_chat_id)
                     if is_cross_chat:
                         cross_chat_total += 1
+                    _inc_bucket(_bucket_for(url, cls, is_cross_chat))
+                    # Only consider url(...) inside actual CSS contexts (style="..." or <style> blocks).
+                    if not in_style_block and 'style="' not in line_l and "style='" not in line_l:
+                        skipped += 1
+                        continue
                     if scope == "media" and not _is_media_url_for_check(url):
                         skipped += 1
                         continue
@@ -737,7 +778,7 @@ def _scan_html_file_for_bad_refs(
                 if end_style_after:
                     in_style_block = False
     except Exception:
-        return 0, 0, 0, 0, [], 0, [], 0, [], 0, [], 0, 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, [], 0, [], 0, [], 0, [], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
     return (
         total,
@@ -757,6 +798,11 @@ def _scan_html_file_for_bad_refs(
         media_chat_local_ok,
         cross_chat_total,
         cross_chat_ok,
+        bucket_non_local,
+        bucket_cross_chat,
+        bucket_media_shared,
+        bucket_media_chat_local,
+        bucket_other_local,
     )
 
 def _cmd_check_links(
@@ -845,6 +891,11 @@ def _cmd_check_links(
     media_chat_local_ok_total = 0
     cross_chat_refs_total = 0
     cross_chat_refs_ok_total = 0
+    bucket_non_local_total = 0
+    bucket_cross_chat_total = 0
+    bucket_media_shared_total = 0
+    bucket_media_chat_local_total = 0
+    bucket_other_local_total = 0
     missing_kept: List[LinkMissingRef] = []
     outside_kept: List[LinkMissingRef] = []
     split_leftover_kept: List[LinkMissingRef] = []
@@ -872,6 +923,11 @@ def _cmd_check_links(
             ml_ok,
             xc_total,
             xc_ok,
+            b_non_local,
+            b_cross_chat,
+            b_media_shared,
+            b_media_chat_local,
+            b_other_local,
         ) = _scan_html_file_for_bad_refs(
             p,
             root,
@@ -896,6 +952,11 @@ def _cmd_check_links(
         media_chat_local_ok_total += ml_ok
         cross_chat_refs_total += xc_total
         cross_chat_refs_ok_total += xc_ok
+        bucket_non_local_total += b_non_local
+        bucket_cross_chat_total += b_cross_chat
+        bucket_media_shared_total += b_media_shared
+        bucket_media_chat_local_total += b_media_chat_local
+        bucket_other_local_total += b_other_local
 
         for m in m_kept:
             if len(missing_kept) >= max_missing:
@@ -947,6 +1008,11 @@ def _cmd_check_links(
             "media_chat_local_refs_ok": media_chat_local_ok_total,
             "cross_chat_refs_total": cross_chat_refs_total,
             "cross_chat_refs_ok": cross_chat_refs_ok_total,
+            "bucket_non_local_total": bucket_non_local_total,
+            "bucket_cross_chat_total": bucket_cross_chat_total,
+            "bucket_media_shared_total": bucket_media_shared_total,
+            "bucket_media_chat_local_total": bucket_media_chat_local_total,
+            "bucket_other_local_total": bucket_other_local_total,
             "scheme_refs_total": scheme_total if scheme_prefixes else None,
             "scheme_refs": [
                 {"html_file": m.html_file, "line_no": m.line_no, "attr": m.attr, "url": m.url}
@@ -1004,6 +1070,22 @@ def _cmd_check_links(
     print(
         "Cross-chat refs (links): "
         f"total={cross_chat_refs_total} ok={cross_chat_refs_ok_total}"
+    )
+    bucket_sum = (
+        bucket_non_local_total
+        + bucket_cross_chat_total
+        + bucket_media_shared_total
+        + bucket_media_chat_local_total
+        + bucket_other_local_total
+    )
+    print(
+        "Ref classes (exclusive): "
+        f"non_local={bucket_non_local_total} "
+        f"cross_chat={bucket_cross_chat_total} "
+        f"media_shared={bucket_media_shared_total} "
+        f"media_chat_local={bucket_media_chat_local_total} "
+        f"other_local={bucket_other_local_total} "
+        f"(sum={bucket_sum})"
     )
     if count_media_files:
         print(
