@@ -341,13 +341,33 @@ def _looks_like_external_host_ref(url: str) -> bool:
     host = u.split("/", 1)[0].strip()
     if not host or host.count(".") < 1:
         return False
-    if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+    # IPv4 literals (with optional CIDR suffix in original url) are external refs.
+    if _looks_like_ipv4_literal(host):
+        return True
+    # Be permissive for host-like tokens seen in message text (including underscores).
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", host):
         return False
     tld = host.rsplit(".", 1)[-1].lower()
     if tld in _LIKELY_FILE_EXTS:
         return False
     if not re.fullmatch(r"[a-z]{2,24}", tld):
         return False
+    return True
+
+
+def _looks_like_ipv4_literal(host: str) -> bool:
+    parts = host.split(".")
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not re.fullmatch(r"\d{1,3}", p):
+            return False
+        try:
+            v = int(p)
+        except Exception:
+            return False
+        if v < 0 or v > 255:
+            return False
     return True
 
 def _is_media_url_for_check(url: str) -> bool:
