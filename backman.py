@@ -1898,6 +1898,101 @@ def _rewrite_chat_html_for_standalone(chat_root: str, chat_id: Optional[str] = N
             with open(p, "w", encoding="utf-8") as f:
                 f.write(s2)
 
+def _repair_local_html_links_in_place(root: str, *, apply_changes: bool) -> Tuple[int, int, int]:
+    """
+    Rewrite local HTML links to safe URL-encoded relative paths (in-place).
+    This fixes Telegram-export links that contain unescaped reserved chars
+    (notably '#') that browsers treat as URL fragments.
+
+    Returns: (html_files_scanned, html_files_changed, links_rewritten)
+    """
+    root = os.path.abspath(root)
+    html_files = sorted(_iter_all_html_files(root))
+    changed_files = 0
+    rewritten = 0
+
+    def _quote_url_path(rel_posix: str) -> str:
+        return urllib.parse.quote(rel_posix, safe="/")
+
+    for p in html_files:
+        src_dir = os.path.dirname(p)
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                s = f.read()
+        except Exception:
+            continue
+
+        changed = False
+
+        def _rewrite_url(url: str) -> Optional[str]:
+            nonlocal rewritten, changed
+            resolved = _resolve_local_url_to_export_file(url, src_dir, root)
+            if not resolved:
+                return None
+            abs_p, _ = resolved
+            rel_local = os.path.relpath(abs_p, src_dir).replace(os.sep, "/")
+            nu = _quote_url_path(rel_local)
+            if nu == url:
+                return None
+            rewritten += 1
+            changed = True
+            return nu
+
+        def _sub_attr(m: re.Match) -> str:
+            prefix = m.group("prefix")
+            q = m.group("q")
+            url = m.group("url")
+            nu = _rewrite_url(url)
+            if not nu:
+                return m.group(0)
+            return f"{prefix}{q}{nu}{q}"
+
+        def _sub_srcset(m: re.Match) -> str:
+            prefix = m.group("prefix")
+            q = m.group("q")
+            val = m.group("val")
+            parts = []
+            local_changed = False
+            for part in val.split(","):
+                raw = part.strip()
+                if not raw:
+                    continue
+                bits = raw.split()
+                if not bits:
+                    continue
+                url0 = bits[0]
+                nu = _rewrite_url(url0)
+                if nu:
+                    bits[0] = nu
+                    local_changed = True
+                parts.append(" ".join(bits))
+            if not local_changed:
+                return m.group(0)
+            return f"{prefix}{q}{', '.join(parts)}{q}"
+
+        def _sub_css_url(m: re.Match) -> str:
+            q = m.group("q")
+            url = m.group("url")
+            nu = _rewrite_url(url)
+            if not nu:
+                return m.group(0)
+            return f"url({q}{nu}{q})"
+
+        s2 = LINK_ATTR_URL_RE.sub(_sub_attr, s)
+        s2 = LINK_ATTR_SRCSET_RE.sub(_sub_srcset, s2)
+        s2 = HTML_CSS_URL_RE.sub(_sub_css_url, s2)
+
+        if s2 != s:
+            changed_files += 1
+            if apply_changes:
+                try:
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.write(s2)
+                except Exception:
+                    continue
+
+    return len(html_files), changed_files, rewritten
+
 def _should_skip_url(url: str) -> bool:
     u = url.strip()
     if not u:
@@ -3154,6 +3249,19 @@ def main() -> int:
         action="store_true",
         help="Scan all .html files under the given path and verify that local refs resolve on disk.",
     )
+    ap.add_argument(
+        "--repair-html-links",
+        action="store_true",
+        help=(
+            "Repair local href/src/poster/srcset/url(...) links in .html files by URL-encoding "
+            "resolved local file paths (fixes unescaped '#' and similar chars)."
+        ),
+    )
+    ap.add_argument(
+        "--repair-dry-run",
+        action="store_true",
+        help="With --repair-html-links: report how many files/links would change without writing files.",
+    )
     ap.add_argument("--check-scope", choices=("all", "media"), default="all")
     ap.add_argument("--check-max-missing", type=int, default=200)
     ap.add_argument("--check-allow-outside-root", action="store_true")
@@ -3172,6 +3280,7 @@ def main() -> int:
     action_flags = [
         ("--split-multi-html", args.split_multi_html),
         ("--check-links", args.check_links),
+        ("--repair-html-links", args.repair_html_links),
     ]
     enabled = [name for name, on in action_flags if on]
     if len(enabled) > 1:
@@ -3209,6 +3318,18 @@ def main() -> int:
             max_schemes=args.check_max_schemes,
             count_media_files=args.check_count_media_files,
         )
+
+    if args.repair_html_links:
+        scanned, changed, rewritten = _repair_local_html_links_in_place(
+            root,
+            apply_changes=not args.repair_dry_run,
+        )
+        mode = "dry-run" if args.repair_dry_run else "applied"
+        print(f"Repair mode: {mode}")
+        print(f"HTML files scanned: {scanned}")
+        print(f"HTML files changed: {changed}")
+        print(f"Links rewritten: {rewritten}")
+        return 0
 
     reports: List[ExportReport] = []
     json_hits = find_result_jsons(root)
