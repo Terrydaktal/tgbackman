@@ -688,6 +688,8 @@ def _cmd_check_links(
     list_schemes: str,
     max_schemes: int,
     count_media_files: bool,
+    _disable_auto_grouping: bool = False,
+    _exclude_roots: Optional[Tuple[str, ...]] = None,
 ) -> int:
     root = os.path.abspath(root)
 
@@ -695,9 +697,9 @@ def _cmd_check_links(
     # report each detected backup separately.
     detected_html_roots = find_html_export_roots(root)
     if (
-        not json_out
+        not _disable_auto_grouping
+        and not json_out
         and len(detected_html_roots) > 1
-        and root not in detected_html_roots
     ):
         print(_c(f"Root: {root}", _Ansi.BOLD))
         print(f"Detected backups: {len(detected_html_roots)}")
@@ -705,6 +707,10 @@ def _cmd_check_links(
         for i, dr in enumerate(detected_html_roots, start=1):
             print()
             print(_c(f"Backup {i}/{len(detected_html_roots)}: {dr}", _Ansi.BOLD))
+            subroots = tuple(
+                p for p in detected_html_roots
+                if _is_ancestor_dir(dr, p)
+            )
             rc = _cmd_check_links(
                 dr,
                 json_out=False,
@@ -716,12 +722,21 @@ def _cmd_check_links(
                 list_schemes=list_schemes,
                 max_schemes=max_schemes,
                 count_media_files=count_media_files,
+                _disable_auto_grouping=True,
+                _exclude_roots=subroots,
             )
             if rc != 0:
                 overall_rc = 1
         return overall_rc
 
     html_files = sorted(_iter_all_html_files(root))
+    if _exclude_roots:
+        ex = [os.path.abspath(p) for p in _exclude_roots if os.path.abspath(p) != root]
+        if ex:
+            html_files = [
+                p for p in html_files
+                if not any(_is_ancestor_dir(e, p) for e in ex)
+            ]
     is_multi_export_root = os.path.isfile(os.path.join(root, "export_results.html")) or os.path.isdir(os.path.join(root, "chats"))
 
     total_refs = 0
