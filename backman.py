@@ -430,6 +430,22 @@ def _classify_media_ref_for_check(url: str) -> Optional[str]:
         return "shared"
     if head in LINK_CHAT_LOCAL_MEDIA_DIRS:
         return "chat_local"
+    # Official multi export often references media as:
+    # chats/chat_XXX/<media_dir>/file.ext
+    if (
+        len(parts) >= 3
+        and parts[0] == "chats"
+        and re.fullmatch(r"chat_\d+", parts[1]) is not None
+    ):
+        media_seg = parts[2]
+        if media_seg == "media":
+            return "shared"
+        if media_seg in LINK_CHAT_LOCAL_MEDIA_DIRS:
+            return "chat_local"
+    # Fallback: if any segment looks like a known media dir, treat as chat-local.
+    # Shared media remains specifically identified only as "media".
+    if any(seg in LINK_CHAT_LOCAL_MEDIA_DIRS for seg in parts):
+        return "chat_local"
     return None
 
 def _target_chat_id_from_url_for_check(url: str) -> Optional[str]:
