@@ -169,6 +169,17 @@ LINK_CHAT_LOCAL_MEDIA_DIRS = {
     "profile_pictures",
 }
 
+# File-like suffixes that should not be treated as web host TLDs for bare refs
+# such as "src.zip" or "document.pdf".
+_LIKELY_FILE_EXTS = {
+    "7z", "aac", "ai", "apk", "avi", "bat", "bin", "bmp", "csv", "db", "doc",
+    "docx", "dmg", "epub", "exe", "flac", "gif", "gz", "heic", "html", "htm",
+    "iso", "jpeg", "jpg", "js", "json", "m4a", "mkv", "mov", "mp3", "mp4",
+    "ogg", "pdf", "png", "ppt", "pptx", "rar", "rtf", "sqlite", "svg", "tar",
+    "tgz", "tiff", "txt", "wav", "webm", "webp", "xls", "xlsx", "xml", "yaml",
+    "yml", "zip",
+}
+
 _SKIP_SHARED_MEDIA_TOPLEVEL = {
     # These are copied separately as shared assets for standalone rendering.
     "css",
@@ -309,7 +320,35 @@ def _resolve_local_ref_for_check(
             chosen_abs = abs_p
             chosen_note = note
 
+    # Bare host-like refs (e.g. weather.com, abcmovies.ru/path) are external links
+    # in Telegram HTML and should not be reported as missing local files. But keep
+    # true local files if they actually exist (handled by the exists-return above).
+    if _looks_like_external_host_ref(u0):
+        return None, None
+
     return chosen_abs, chosen_note
+
+
+def _looks_like_external_host_ref(url: str) -> bool:
+    u = _normalize_url_to_fs_path(url)
+    if not u:
+        return False
+    u = u.strip()
+    if not u or u.startswith((".", "/", "#")):
+        return False
+    if "\\" in u or " " in u:
+        return False
+    host = u.split("/", 1)[0].strip()
+    if not host or host.count(".") < 1:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return False
+    tld = host.rsplit(".", 1)[-1].lower()
+    if tld in _LIKELY_FILE_EXTS:
+        return False
+    if not re.fullmatch(r"[a-z]{2,24}", tld):
+        return False
+    return True
 
 def _is_media_url_for_check(url: str) -> bool:
     """
