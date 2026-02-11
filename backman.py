@@ -1057,20 +1057,6 @@ def _cmd_check_links(
 
     print(_c(f"Root: {root}", _Ansi.BOLD))
     print(f"HTML files scanned: {len(html_files)}")
-    scope_note = f"scope={scope}"
-    print(
-        f"Refs: total={total_refs} ok={ok_refs} skipped={skipped_refs} "
-        f"split_leftover={split_leftover_total} outside_root={outside_total} missing={missing_total} ({scope_note})"
-    )
-    print(
-        "Media refs (links): "
-        f"shared_media_dir={media_shared_refs_total} ok={media_shared_ok_total} "
-        f"chat_local_dirs={media_chat_local_refs_total} ok={media_chat_local_ok_total}"
-    )
-    print(
-        "Cross-chat refs (links): "
-        f"total={cross_chat_refs_total} ok={cross_chat_refs_ok_total}"
-    )
     bucket_sum = (
         bucket_non_local_total
         + bucket_cross_chat_total
@@ -1080,13 +1066,15 @@ def _cmd_check_links(
     )
     print(
         "Ref classes (exclusive): "
-        f"non_local={bucket_non_local_total} "
+        f"total={total_refs} "
+        f"non_files={bucket_non_local_total} "
         f"cross_chat={bucket_cross_chat_total} "
         f"media_shared={bucket_media_shared_total} "
-        f"media_chat_local={bucket_media_chat_local_total} "
-        f"other_local={bucket_other_local_total} "
-        f"(sum={bucket_sum})"
+        f"chat_local={bucket_media_chat_local_total} "
+        f"html_stuff={bucket_other_local_total}"
     )
+    if bucket_sum != total_refs:
+        print(_c(f"Note: class sum={bucket_sum} differs from total={total_refs}", _Ansi.YELLOW))
     if count_media_files:
         print(
             "Media files: "
