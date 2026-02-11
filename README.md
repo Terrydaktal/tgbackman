@@ -1,70 +1,79 @@
 # tgbackman
 
-Tools for inspecting, splitting, and validating Telegram exports.
+`backman.py` is a single-file tool for Telegram backup workflows:
 
-`backman.py` recursively scans a folder for Telegram exports and prints (or emits JSON for) the discovered backups, including chat/message counts and message date ranges. It also includes action modes to convert multi-chat HTML exports into per-chat exports and to validate that exports are self-contained.
-
-## Requirements
-
-- Python 3 (no pip dependencies; uses the standard library)
-- Optional (nice-to-have): `jq` (for viewing JSON output)
+- discover and summarize backups under a root folder
+- split official HTML multi-chat exports into per-chat self-contained exports
+- validate local HTML links (`href/src/poster/srcset/url(...)`)
+- repair broken local links that contain unescaped `#` in filenames
 
 ## Supported Backup Types
 
-- Official Telegram exports (Telegram Desktop):
-  - HTML multi-chat export: has `export_results.html` and `chats/chat_XXX/...`
-  - HTML single-chat export: has `messages.html` (and sometimes `messages2.html`, etc.)
-  - JSON export: has `result.json` / `results.json`
-- Unofficial legacy backup (SQLite) layouts:
-  - Detects `database.sqlite` under `.telegram_backup/...` and summarizes it.
+`backman.py` scans recursively and detects:
 
-Detection is heuristic; if you have an export that “should” be detected but isn’t, open an issue and include a minimal directory listing.
+- Official Telegram HTML multi-chat exports
+  - has `export_results.html` and `chats/chat_XXX/...`
+- Official Telegram HTML single-chat exports
+  - has `messages.html` plus `css/` and `js/`
+- Official Telegram JSON exports
+  - has `result.json` or `results.json`
+- Unofficial legacy SQLite backups
+  - `database.sqlite` with `messages/chats/users` tables
 
-## Quick Start (Scan + Report)
+## Requirements
 
-Scan a folder and print a human-readable report:
+- Python 3 (stdlib only)
+- optional: `dust` (faster directory sizing)
+- optional: `jq` (pretty-print JSON output)
+
+## Basic Usage
+
+Scan and print human-readable summary:
 
 ```bash
 python3 backman.py "/path/to/Telegram Backup"
 ```
 
-Machine-readable JSON:
+Machine-readable output:
 
 ```bash
 python3 backman.py --json "/path/to/Telegram Backup" | jq .
 ```
 
-Speed knobs:
+Performance knobs:
 
-- `--no-inspect`: skips scanning message HTML/JSON bodies for ranges/counts (much faster)
-- `--no-sizes`: skips computing on-disk sizes (faster on slow disks)
+- `--no-inspect`: skip deep message scanning (counts/ranges)
+- `--no-sizes`: skip size-on-disk calculations
 
-## Action Modes (One at a Time)
+## Action Modes
 
-`backman.py` has a couple of action modes. Only one action flag may be used per invocation:
+Only one action flag may be used at a time:
 
-- `--split-multi-html` (convert multi-chat HTML to per-chat exports)
-- `--check-links` (validate local references resolve on disk)
+- `--split-multi-html`
+- `--check-links`
+- `--repair-html-links`
 
-### Convert Multi-Chat HTML Export to Per-Chat Exports
+## Split HTML Multi-Chat Export
 
-This takes a multi-chat Telegram HTML export and produces per-chat exports where each chat has its own localized “shared media” copies.
+Convert one official HTML multi export into per-chat standalone folders.
 
 ```bash
 python3 backman.py --split-multi-html "/path/to/Telegram Backup"
 ```
 
-Optional flags:
+Options:
 
-- `--split-out /path/to/output_root`
-- `--split-chat chat_001` (repeatable; only split certain chat folders)
-- `--split-dry-run` (prints planned output root and exits)
+- `--split-out /path/to/output`
+- `--split-chat chat_001` (repeatable)
+- `--split-dry-run`
 
-#### Output Layout
+Default output root (if omitted):
 
-The split output is a “collection” root containing per-chat folders. Each per-chat folder contains one or more range subfolders:
+- `<parent>/<basename>_single_chats`
 
-```
+Output structure:
+
+```text
 <out_root>/
   <Chat Name>/
     <START__END>/
@@ -72,61 +81,94 @@ The split output is a “collection” root containing per-chat folders. Each pe
       messages2.html
       ...
       photos/ files/ video_files/ ...
-      media/                       # copies of shared media (from the original multi-export)
-      css/ js/ images/             # Telegram HTML rendering assets
-      .backman_export_meta.json    # marks the export as converted (see below)
+      media/
+      css/ js/ images/
+      .backman_export_meta.json
 ```
 
-`START__END` uses UTC timestamps:
+`START__END` is UTC and filesystem-safe:
 
-`YYYY-MM-DDTHH-MM-SSZ__YYYY-MM-DDTHH-MM-SSZ`
+- `YYYY-MM-DDTHH-MM-SSZ__YYYY-MM-DDTHH-MM-SSZ`
 
-### Validate Local Links Inside HTML Files
+## Check HTML Links
 
-Checks that local `href=...`, `src=...`, `poster=...`, `srcset=...`, and CSS `url(...)` references resolve on disk.
+Validate local references in all HTML files under a root.
 
 ```bash
 python3 backman.py --check-links "/path/to/backup"
 ```
 
-Common useful flags:
+Key options:
 
-- `--check-scope media` (only check likely-media references)
+- `--check-scope {all,media}`
 - `--check-max-missing 200`
-- `--check-fail-fast` (stop on first failing file)
-- `--check-count-media-files` (counts files under `media/` vs chat-local media folders)
-- `--json` (emit JSON summary)
+- `--check-fail-fast`
+- `--check-allow-outside-root`
+- `--check-no-split-leftovers-check`
+- `--check-list-schemes "tg,file,http"`
+- `--check-max-schemes 200`
+- `--check-count-media-files`
+- `--json`
 
-This also detects “leftover multi-export links” like `../../chats/chat_XXX/...` inside `messages*.html`, which should not exist in properly localized split outputs.
+Current text summary includes:
 
-## Converted vs Original Single-Chat Exports
+- `HTML files scanned: ...`
+- `Ref classes (exclusive): total=... missing=... non_files=... cross_chat=... media_shared=... chat_local=... html_stuff=...`
 
-Telegram’s “Export chat history” single-chat exports are labeled:
+When missing links are printed, each item is prefixed with a resolved chat name when available:
 
-- `html_single_chat_export`
+- official multi-chat: from `chats/chat_XXX/messages*.html`
+- unofficial dialogs: from associated SQLite user/chat records
 
-Per-chat exports created by `--split-multi-html` are labeled:
+## Repair Broken Local HTML Links
 
-- `html_single_chat_export_converted`
+Fixes only local links with unescaped `#` in filename segments by URL-encoding them.
 
-The only signal used for “converted” is the presence of:
+```bash
+python3 backman.py --repair-html-links "/path/to/backup"
+```
 
-`<export_root>/.backman_export_meta.json`
+Dry run:
 
-## Safety / Non-Destructive Behavior
+```bash
+python3 backman.py --repair-html-links --repair-dry-run "/path/to/backup"
+```
 
-- The scan/report mode never modifies files.
-- `--split-multi-html` copies data to a new output root (does not delete sources).
+It reports:
 
-## Performance Notes
+- HTML files scanned
+- HTML files changed
+- links rewritten
 
-- `--no-inspect` can be dramatically faster on very large exports.
-- On very large split roots, link-checking can take time because it scans all `.html` files.
+## Unofficial SQLite Deduping
 
-## Troubleshooting
+If both canonical and duplicate unofficial DBs are present, you can suppress duplicate summaries:
 
-- If `--check-links` reports “Leftover multi-export links found” in a split output, re-run the split using the latest `--split-multi-html` logic (or fix the output manually).
+```bash
+python3 backman.py --dedupe-unofficial-sqlite "/path/to/Telegram Backup"
+```
 
-## License
+Behavior:
 
-No license file has been added yet. If you want an OSS license (MIT/Apache-2.0/etc.), say which and I’ll add it.
+- prefers `database.sqlite` under `.telegram_backup/...`
+- suppresses sibling/parent duplicate DB views under same tree
+
+## Converted vs Original Single-Chat HTML
+
+- Original Telegram single export: `html_single_chat_export`
+- Split output from `--split-multi-html`: `html_single_chat_export_converted`
+
+Detection is based on marker metadata written into converted chat range folders.
+
+## Exit Codes
+
+- `0`: success / no unresolved link failures
+- `1`: link-check found missing/outside/split-leftover issues
+- `2`: bad CLI usage or invalid input path
+- `3`: split action failed
+
+## Repository
+
+Remote:
+
+- `https://github.com/Terrydaktal/tgbackman.git`
