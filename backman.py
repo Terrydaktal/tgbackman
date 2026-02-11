@@ -36,6 +36,7 @@ RESULT_NAMES = ("result.json", "results.json")
 UNOFFICIAL_SQLITE_NAMES = ("database.sqlite",)
 
 BACKMAN_EXPORT_META = ".backman_export_meta.json"
+BACKMAN_VERSION = "0.7.0"
 
 class _Ansi:
     RESET = "\033[0m"
@@ -47,35 +48,6 @@ class _Ansi:
     BLUE = "\033[34m"
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
-
-def _git_commit_count(cwd: Optional[str] = None) -> Optional[int]:
-    try:
-        out = subprocess.check_output(
-            ["git", "rev-list", "--count", "HEAD"],
-            cwd=cwd,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        n = int(out)
-        return n if n >= 0 else None
-    except Exception:
-        return None
-
-def _version_from_commit_count(n: int) -> str:
-    # Decimal-style rollover:
-    # commit 10  -> 0.1.0
-    # commit 100 -> 1.0.0
-    major = n // 100
-    minor = (n % 100) // 10
-    patch = n % 10
-    return f"{major}.{minor}.{patch}"
-
-def _tool_version() -> str:
-    repo_dir = os.path.abspath(os.path.dirname(__file__))
-    n = _git_commit_count(repo_dir)
-    if n is None:
-        return "0.0.0"
-    return _version_from_commit_count(n)
 
 def _use_color() -> bool:
     if os.environ.get("NO_COLOR"):
@@ -3559,7 +3531,7 @@ def summarize_html_export(export_root: str) -> ExportReport:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", action="version", version=f"%(prog)s {_tool_version()}")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {BACKMAN_VERSION}")
     ap.add_argument("path", help="Telegram export folder (will be scanned recursively)")
     ap.add_argument("--json", action="store_true", help="Output JSON (machine-readable)")
     ap.add_argument(

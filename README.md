@@ -40,7 +40,7 @@ Machine-readable output:
 python3 backman.py --json "/path/to/Telegram Backup" | jq .
 ```
 
-Show tool version (derived from git commit count):
+Show tool version:
 
 ```bash
 python3 backman.py --version
