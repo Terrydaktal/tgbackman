@@ -325,6 +325,11 @@ def _resolve_local_ref_for_check(
     # true local files if they actually exist (handled by the exists-return above).
     if _looks_like_external_host_ref(u0):
         return None, None
+    # Telegram also linkifies plain text tokens like "src.zip" or "Language.MOV".
+    # If such a bare filename token does not resolve to a real file locally, treat
+    # it as non-local text and skip it to avoid noisy false positives.
+    if _looks_like_bare_file_token_ref(u0):
+        return None, None
 
     return chosen_abs, chosen_note
 
@@ -351,6 +356,25 @@ def _looks_like_external_host_ref(url: str) -> bool:
     if tld in _LIKELY_FILE_EXTS:
         return False
     if not re.fullmatch(r"[a-z]{2,24}", tld):
+        return False
+    return True
+
+
+def _looks_like_bare_file_token_ref(url: str) -> bool:
+    u = _normalize_url_to_fs_path(url)
+    if not u:
+        return False
+    u = u.strip()
+    if not u or u.startswith((".", "/", "#")):
+        return False
+    # Only a single path segment, e.g. "src.zip" / "Language.MOV".
+    if "/" in u or "\\" in u:
+        return False
+    # Typical "filename.ext" pattern; extension in known file-like set.
+    if "." not in u:
+        return False
+    ext = u.rsplit(".", 1)[-1].lower()
+    if ext not in _LIKELY_FILE_EXTS:
         return False
     return True
 
