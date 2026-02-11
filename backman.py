@@ -1920,9 +1920,8 @@ def _rewrite_chat_html_for_standalone(chat_root: str, chat_id: Optional[str] = N
 
 def _repair_local_html_links_in_place(root: str, *, apply_changes: bool) -> Tuple[int, int, int]:
     """
-    Rewrite local HTML links to safe URL-encoded relative paths (in-place).
-    This fixes Telegram-export links that contain unescaped reserved chars
-    (notably '#') that browsers treat as URL fragments.
+    Rewrite only broken local HTML links with unescaped '#' in filenames
+    to safe URL-encoded relative paths (in-place).
 
     Returns: (html_files_scanned, html_files_changed, links_rewritten)
     """
@@ -1946,11 +1945,22 @@ def _repair_local_html_links_in_place(root: str, *, apply_changes: bool) -> Tupl
 
         def _rewrite_url(url: str) -> Optional[str]:
             nonlocal rewritten, changed
-            resolved = _resolve_local_url_to_export_file(url, src_dir, root)
-            if not resolved:
+            if _should_skip_url(url):
                 return None
-            abs_p, _ = resolved
-            rel_local = os.path.relpath(abs_p, src_dir).replace(os.sep, "/")
+            raw = html.unescape(url).strip()
+            raw = raw.split("?", 1)[0].strip()
+            # Only target unescaped hash links (the browser-truncation case).
+            if not raw or "#" not in raw or "%23" in raw.lower():
+                return None
+            # Require that the literal path containing '#' exists as a local file.
+            # If only the pre-# part exists (e.g. page.html#anchor), skip.
+            if os.path.isabs(raw):
+                abs_raw = os.path.abspath(os.path.normpath(raw))
+            else:
+                abs_raw = os.path.abspath(os.path.normpath(os.path.join(src_dir, raw)))
+            if not _is_ancestor_dir(root, abs_raw) or not os.path.isfile(abs_raw):
+                return None
+            rel_local = os.path.relpath(abs_raw, src_dir).replace(os.sep, "/")
             nu = _quote_url_path(rel_local)
             if nu == url:
                 return None
@@ -3294,8 +3304,8 @@ def main() -> int:
         "--repair-html-links",
         action="store_true",
         help=(
-            "Repair local href/src/poster/srcset/url(...) links in .html files by URL-encoding "
-            "resolved local file paths (fixes unescaped '#' and similar chars)."
+            "Repair broken local href/src/poster/srcset/url(...) links with unescaped '#'"
+            " in .html files by URL-encoding the filename."
         ),
     )
     ap.add_argument(
