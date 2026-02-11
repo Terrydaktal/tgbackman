@@ -470,6 +470,139 @@ def _source_chat_id_from_html_path_for_check(html_path: str, root: str) -> Optio
         return None
     return m.group(1)
 
+def _chat_id_from_rel_html_for_check(rel_html: str) -> Optional[str]:
+    rel = rel_html.replace("\\", "/")
+    m = re.search(r"(?:^|/)chats/(chat_\d+)(?:/|$)", rel)
+    if not m:
+        return None
+    return m.group(1)
+
+def _unofficial_dialog_id_from_rel_html_for_check(rel_html: str) -> Optional[int]:
+    rel = rel_html.replace("\\", "/")
+    m = re.search(r"(?:^|/)files/dialogs/chat_(\d+)_p\d+\.html$", rel)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+def _lookup_official_chat_names_for_check(root: str, chat_ids: Set[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not chat_ids:
+        return out
+    chats_root = os.path.join(root, "chats")
+    for cid in sorted(chat_ids):
+        chat_dir = os.path.join(chats_root, cid)
+        if not os.path.isdir(chat_dir):
+            continue
+        msg = os.path.join(chat_dir, "messages.html")
+        if not os.path.isfile(msg):
+            try:
+                cand = sorted(
+                    fn for fn in os.listdir(chat_dir)
+                    if fn.startswith("messages") and fn.endswith(".html")
+                )
+            except Exception:
+                cand = []
+            if not cand:
+                continue
+            msg = os.path.join(chat_dir, cand[0])
+        nm = _extract_chat_name_from_messages_html(msg)
+        if nm:
+            out[cid] = nm
+    return out
+
+def _lookup_unofficial_dialog_names_for_check(root: str, dialog_ids: Set[int]) -> Dict[int, str]:
+    out: Dict[int, str] = {}
+    if not dialog_ids:
+        return out
+    dbs = find_unofficial_telegram_sqlite_dbs(root)
+    if not dbs:
+        return out
+
+    def _table_cols(con: sqlite3.Connection, table: str) -> Set[str]:
+        cur = con.cursor()
+        cur.execute(f"pragma table_info({table})")
+        return {str(r[1]) for r in cur.fetchall()}
+
+    def _pick_name_cols(cols: Set[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        if "name" in cols:
+            return "name", None, None
+        first = "first_name" if "first_name" in cols else None
+        last = "last_name" if "last_name" in cols else None
+        if first or last:
+            return None, first, last
+        for c in ("title", "username", "phone", "phone_number"):
+            if c in cols:
+                return c, None, None
+        return None, None, None
+
+    for db in dbs:
+        wanted = sorted(i for i in dialog_ids if i not in out)
+        if not wanted:
+            break
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        except Exception:
+            continue
+        try:
+            cur = con.cursor()
+
+            def _fill_from_table(table: str) -> None:
+                nonlocal wanted
+                if not wanted:
+                    return
+                try:
+                    cols = _table_cols(con, table)
+                except Exception:
+                    return
+                name_col, first_col, last_col = _pick_name_cols(cols)
+                if name_col:
+                    select_cols = f"id, {name_col}"
+                elif first_col or last_col:
+                    parts = [c for c in (first_col, last_col) if c]
+                    select_cols = "id, " + ", ".join(parts)
+                else:
+                    return
+                ph = ",".join("?" for _ in wanted)
+                try:
+                    cur.execute(
+                        f"select {select_cols} from {table} where id in ({ph})",
+                        tuple(wanted),
+                    )
+                    rows = cur.fetchall()
+                except Exception:
+                    return
+                for r in rows:
+                    if not r:
+                        continue
+                    try:
+                        rid = int(r[0])
+                    except Exception:
+                        continue
+                    if rid in out:
+                        continue
+                    if len(r) == 2:
+                        v = r[1]
+                        nm = (str(v).strip() if v is not None else "") or None
+                    else:
+                        nm_parts = [str(x).strip() for x in r[1:] if x is not None and str(x).strip()]
+                        nm = " ".join(nm_parts).strip() if nm_parts else None
+                    if nm:
+                        out[rid] = nm
+                wanted = sorted(i for i in dialog_ids if i not in out)
+
+            # Unofficial "dialogs" usually map to users first; fall back to chats.
+            _fill_from_table("users")
+            _fill_from_table("chats")
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    return out
+
 def _iter_srcset_urls(val: str) -> Iterable[str]:
     for part in val.split(","):
         part = part.strip()
@@ -1116,12 +1249,43 @@ def _cmd_check_links(
             print(_c(f"... and {split_leftover_total - len(split_leftover_kept)} more", _Ansi.DIM))
         print()
 
+    rels_for_name_lookup: List[str] = []
+    for m in outside_kept[:max_missing]:
+        rels_for_name_lookup.append(os.path.relpath(m.html_file, root))
+    for m in missing_kept[:max_missing]:
+        rels_for_name_lookup.append(os.path.relpath(m.html_file, root))
+    official_ids: Set[str] = set()
+    unofficial_ids: Set[int] = set()
+    for rel_html in rels_for_name_lookup:
+        cid = _chat_id_from_rel_html_for_check(rel_html)
+        if cid:
+            official_ids.add(cid)
+        did = _unofficial_dialog_id_from_rel_html_for_check(rel_html)
+        if did is not None:
+            unofficial_ids.add(did)
+    official_names = _lookup_official_chat_names_for_check(root, official_ids)
+    unofficial_names = _lookup_unofficial_dialog_names_for_check(root, unofficial_ids)
+
+    def _name_prefix_for_rel_html(rel_html: str) -> str:
+        cid = _chat_id_from_rel_html_for_check(rel_html)
+        if cid:
+            nm = official_names.get(cid)
+            if nm:
+                return f"({nm}) "
+        did = _unofficial_dialog_id_from_rel_html_for_check(rel_html)
+        if did is not None:
+            nm2 = unofficial_names.get(did)
+            if nm2:
+                return f"({nm2}) "
+        return ""
+
     if outside_total:
         print(_c("References that resolve outside the provided root:", _Ansi.YELLOW))
         for i, m in enumerate(outside_kept[:max_missing], start=1):
             rel_html = os.path.relpath(m.html_file, root)
             note = f" [{m.note}]" if m.note else ""
-            print(f"{i:>4}. {rel_html}:{m.line_no} {m.attr}=\"{m.url}\" -> {m.resolved_path}{note}")
+            pfx = _name_prefix_for_rel_html(rel_html)
+            print(f"{i:>4}. {pfx}{rel_html}:{m.line_no} {m.attr}=\"{m.url}\" -> {m.resolved_path}{note}")
         if outside_total > len(outside_kept):
             print(_c(f"... and {outside_total - len(outside_kept)} more", _Ansi.DIM))
         print()
@@ -1131,7 +1295,8 @@ def _cmd_check_links(
         for i, m in enumerate(missing_kept[:max_missing], start=1):
             rel_html = os.path.relpath(m.html_file, root)
             note = f" [{m.note}]" if m.note else ""
-            print(f"{i:>4}. {rel_html}:{m.line_no} {m.attr}=\"{m.url}\" -> {m.resolved_path}{note}")
+            pfx = _name_prefix_for_rel_html(rel_html)
+            print(f"{i:>4}. {pfx}{rel_html}:{m.line_no} {m.attr}=\"{m.url}\" -> {m.resolved_path}{note}")
         if missing_total > len(missing_kept):
             print(_c(f"... and {missing_total - len(missing_kept)} more", _Ansi.DIM))
 
