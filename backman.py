@@ -349,6 +349,28 @@ def _classify_media_ref_for_check(url: str) -> Optional[str]:
         return "chat_local"
     return None
 
+def _target_chat_id_from_url_for_check(url: str) -> Optional[str]:
+    if _should_skip_url(url):
+        return None
+    u = _normalize_url_to_fs_path(url)
+    if not u:
+        return None
+    u2 = _strip_leading_dot_segments(u).replace("\\", "/").lstrip("/")
+    m = re.match(r"^chats/chat_(\d+)(?:/|$)", u2)
+    if not m:
+        return None
+    return m.group(1)
+
+def _source_chat_id_from_html_path_for_check(html_path: str, root: str) -> Optional[str]:
+    try:
+        rel = os.path.relpath(html_path, root).replace("\\", "/")
+    except Exception:
+        return None
+    m = re.search(r"(?:^|/)chats/chat_(\d+)(?:/|$)", rel)
+    if not m:
+        return None
+    return m.group(1)
+
 def _iter_srcset_urls(val: str) -> Iterable[str]:
     for part in val.split(","):
         part = part.strip()
@@ -399,6 +421,12 @@ def _scan_html_file_for_bad_refs(
     List[LinkSchemeRef],
     int,
     int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
 ]:
     """
     Returns:
@@ -407,7 +435,9 @@ def _scan_html_file_for_bad_refs(
       outside_total, outside_kept,
       split_leftover_total, split_leftover_kept,
       scheme_total, scheme_kept,
-      media_shared_refs, media_chat_local_refs
+      media_shared_refs, media_chat_local_refs,
+      media_shared_ok, media_chat_local_ok,
+      cross_chat_total, cross_chat_ok
     """
     total = 0
     skipped = 0
@@ -422,7 +452,12 @@ def _scan_html_file_for_bad_refs(
     scheme_kept: List[LinkSchemeRef] = []
     media_shared_refs = 0
     media_chat_local_refs = 0
+    media_shared_ok = 0
+    media_chat_local_ok = 0
+    cross_chat_total = 0
+    cross_chat_ok = 0
     in_style_block = False
+    src_chat_id = _source_chat_id_from_html_path_for_check(html_path, root)
 
     scheme_prefixes_l = tuple((scheme_prefixes or ()))
 
@@ -490,12 +525,17 @@ def _scan_html_file_for_bad_refs(
                     total += 1
                     attr = m.group("prefix").split("=", 1)[0].strip()
                     _maybe_keep_scheme(ln, attr, url)
+                    cls = None
                     if _is_media_url_for_check(url):
                         cls = _classify_media_ref_for_check(url)
                         if cls == "shared":
                             media_shared_refs += 1
                         elif cls == "chat_local":
                             media_chat_local_refs += 1
+                    tgt_chat_id = _target_chat_id_from_url_for_check(url)
+                    is_cross_chat = bool(tgt_chat_id and src_chat_id and tgt_chat_id != src_chat_id)
+                    if is_cross_chat:
+                        cross_chat_total += 1
                     if scope == "media" and not _is_media_url_for_check(url):
                         skipped += 1
                         continue
@@ -512,6 +552,12 @@ def _scan_html_file_for_bad_refs(
                         continue
                     if exists:
                         ok += 1
+                        if cls == "shared":
+                            media_shared_ok += 1
+                        elif cls == "chat_local":
+                            media_chat_local_ok += 1
+                        if is_cross_chat:
+                            cross_chat_ok += 1
                         continue
                     missing_total += 1
                     if len(missing_kept) < max_keep:
@@ -522,12 +568,17 @@ def _scan_html_file_for_bad_refs(
                     for url in _iter_srcset_urls(val):
                         total += 1
                         _maybe_keep_scheme(ln, "srcset", url)
+                        cls = None
                         if _is_media_url_for_check(url):
                             cls = _classify_media_ref_for_check(url)
                             if cls == "shared":
                                 media_shared_refs += 1
                             elif cls == "chat_local":
                                 media_chat_local_refs += 1
+                        tgt_chat_id = _target_chat_id_from_url_for_check(url)
+                        is_cross_chat = bool(tgt_chat_id and src_chat_id and tgt_chat_id != src_chat_id)
+                        if is_cross_chat:
+                            cross_chat_total += 1
                         if scope == "media" and not _is_media_url_for_check(url):
                             skipped += 1
                             continue
@@ -544,6 +595,12 @@ def _scan_html_file_for_bad_refs(
                             continue
                         if exists:
                             ok += 1
+                            if cls == "shared":
+                                media_shared_ok += 1
+                            elif cls == "chat_local":
+                                media_chat_local_ok += 1
+                            if is_cross_chat:
+                                cross_chat_ok += 1
                             continue
                         missing_total += 1
                         if len(missing_kept) < max_keep:
@@ -556,12 +613,17 @@ def _scan_html_file_for_bad_refs(
                     if not in_style_block and 'style="' not in line_l and "style='" not in line_l:
                         skipped += 1
                         continue
+                    cls = None
                     if _is_media_url_for_check(url):
                         cls = _classify_media_ref_for_check(url)
                         if cls == "shared":
                             media_shared_refs += 1
                         elif cls == "chat_local":
                             media_chat_local_refs += 1
+                    tgt_chat_id = _target_chat_id_from_url_for_check(url)
+                    is_cross_chat = bool(tgt_chat_id and src_chat_id and tgt_chat_id != src_chat_id)
+                    if is_cross_chat:
+                        cross_chat_total += 1
                     if scope == "media" and not _is_media_url_for_check(url):
                         skipped += 1
                         continue
@@ -578,6 +640,12 @@ def _scan_html_file_for_bad_refs(
                         continue
                     if exists:
                         ok += 1
+                        if cls == "shared":
+                            media_shared_ok += 1
+                        elif cls == "chat_local":
+                            media_chat_local_ok += 1
+                        if is_cross_chat:
+                            cross_chat_ok += 1
                         continue
                     missing_total += 1
                     if len(missing_kept) < max_keep:
@@ -586,7 +654,7 @@ def _scan_html_file_for_bad_refs(
                 if end_style_after:
                     in_style_block = False
     except Exception:
-        return 0, 0, 0, 0, [], 0, [], 0, [], 0, [], 0, 0
+        return 0, 0, 0, 0, [], 0, [], 0, [], 0, [], 0, 0, 0, 0, 0, 0
 
     return (
         total,
@@ -602,6 +670,10 @@ def _scan_html_file_for_bad_refs(
         scheme_kept,
         media_shared_refs,
         media_chat_local_refs,
+        media_shared_ok,
+        media_chat_local_ok,
+        cross_chat_total,
+        cross_chat_ok,
     )
 
 def _cmd_check_links(
@@ -618,6 +690,37 @@ def _cmd_check_links(
     count_media_files: bool,
 ) -> int:
     root = os.path.abspath(root)
+
+    # When pointed at a parent folder that contains multiple HTML exports,
+    # report each detected backup separately.
+    detected_html_roots = find_html_export_roots(root)
+    if (
+        not json_out
+        and len(detected_html_roots) > 1
+        and root not in detected_html_roots
+    ):
+        print(_c(f"Root: {root}", _Ansi.BOLD))
+        print(f"Detected backups: {len(detected_html_roots)}")
+        overall_rc = 0
+        for i, dr in enumerate(detected_html_roots, start=1):
+            print()
+            print(_c(f"Backup {i}/{len(detected_html_roots)}: {dr}", _Ansi.BOLD))
+            rc = _cmd_check_links(
+                dr,
+                json_out=False,
+                max_missing=max_missing,
+                scope=scope,
+                allow_outside_root=allow_outside_root,
+                check_split_leftovers=check_split_leftovers,
+                fail_fast=fail_fast,
+                list_schemes=list_schemes,
+                max_schemes=max_schemes,
+                count_media_files=count_media_files,
+            )
+            if rc != 0:
+                overall_rc = 1
+        return overall_rc
+
     html_files = sorted(_iter_all_html_files(root))
     is_multi_export_root = os.path.isfile(os.path.join(root, "export_results.html")) or os.path.isdir(os.path.join(root, "chats"))
 
@@ -630,6 +733,10 @@ def _cmd_check_links(
     scheme_total = 0
     media_shared_refs_total = 0
     media_chat_local_refs_total = 0
+    media_shared_ok_total = 0
+    media_chat_local_ok_total = 0
+    cross_chat_refs_total = 0
+    cross_chat_refs_ok_total = 0
     missing_kept: List[LinkMissingRef] = []
     outside_kept: List[LinkMissingRef] = []
     split_leftover_kept: List[LinkMissingRef] = []
@@ -653,6 +760,10 @@ def _cmd_check_links(
             sc_kept,
             ms_total,
             ml_total,
+            ms_ok,
+            ml_ok,
+            xc_total,
+            xc_ok,
         ) = _scan_html_file_for_bad_refs(
             p,
             root,
@@ -673,6 +784,10 @@ def _cmd_check_links(
         scheme_total += sc_total
         media_shared_refs_total += ms_total
         media_chat_local_refs_total += ml_total
+        media_shared_ok_total += ms_ok
+        media_chat_local_ok_total += ml_ok
+        cross_chat_refs_total += xc_total
+        cross_chat_refs_ok_total += xc_ok
 
         for m in m_kept:
             if len(missing_kept) >= max_missing:
@@ -720,6 +835,10 @@ def _cmd_check_links(
             "ok_refs": ok_refs,
             "media_shared_refs_total": media_shared_refs_total,
             "media_chat_local_refs_total": media_chat_local_refs_total,
+            "media_shared_refs_ok": media_shared_ok_total,
+            "media_chat_local_refs_ok": media_chat_local_ok_total,
+            "cross_chat_refs_total": cross_chat_refs_total,
+            "cross_chat_refs_ok": cross_chat_refs_ok_total,
             "scheme_refs_total": scheme_total if scheme_prefixes else None,
             "scheme_refs": [
                 {"html_file": m.html_file, "line_no": m.line_no, "attr": m.attr, "url": m.url}
@@ -771,8 +890,12 @@ def _cmd_check_links(
     )
     print(
         "Media refs (links): "
-        f"shared_media_dir={media_shared_refs_total} "
-        f"chat_local_dirs={media_chat_local_refs_total}"
+        f"shared_media_dir={media_shared_refs_total} ok={media_shared_ok_total} "
+        f"chat_local_dirs={media_chat_local_refs_total} ok={media_chat_local_ok_total}"
+    )
+    print(
+        "Cross-chat refs (links): "
+        f"total={cross_chat_refs_total} ok={cross_chat_refs_ok_total}"
     )
     if count_media_files:
         print(
