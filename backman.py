@@ -693,22 +693,32 @@ def _cmd_check_links(
 ) -> int:
     root = os.path.abspath(root)
 
-    # When pointed at a parent folder that contains multiple HTML exports,
+    # When pointed at a parent folder that contains multiple backups,
     # report each detected backup separately.
-    detected_html_roots = find_html_export_roots(root)
+    detected_html_roots = [os.path.abspath(p) for p in find_html_export_roots(root)]
+    detected_json_roots = [os.path.abspath(os.path.dirname(p)) for p in find_result_jsons(root)]
+    detected_sqlite_roots = [os.path.abspath(os.path.dirname(p)) for p in find_unofficial_telegram_sqlite_dbs(root)]
+    detected_backup_roots = sorted(
+        {
+            p
+            for p in (detected_html_roots + detected_json_roots + detected_sqlite_roots)
+            if os.path.isdir(p)
+        },
+        key=lambda p: (p.count(os.sep), p),
+    )
     if (
         not _disable_auto_grouping
         and not json_out
-        and len(detected_html_roots) > 1
+        and len(detected_backup_roots) > 1
     ):
         print(_c(f"Root: {root}", _Ansi.BOLD))
-        print(f"Detected backups: {len(detected_html_roots)}")
+        print(f"Detected backups: {len(detected_backup_roots)}")
         overall_rc = 0
-        for i, dr in enumerate(detected_html_roots, start=1):
+        for i, dr in enumerate(detected_backup_roots, start=1):
             print()
-            print(_c(f"Backup {i}/{len(detected_html_roots)}: {dr}", _Ansi.BOLD))
+            print(_c(f"Backup {i}/{len(detected_backup_roots)}: {dr}", _Ansi.BOLD))
             subroots = tuple(
-                p for p in detected_html_roots
+                p for p in detected_backup_roots
                 if _is_ancestor_dir(dr, p)
             )
             rc = _cmd_check_links(
