@@ -1083,6 +1083,7 @@ def _cmd_check_links(
     print(
         "Ref classes (exclusive): "
         f"total={total_refs} "
+        f"missing={missing_total} "
         f"non_files={bucket_non_local_total} "
         f"cross_chat={bucket_cross_chat_total} "
         f"media_shared={bucket_media_shared_total} "
