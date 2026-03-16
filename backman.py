@@ -36,7 +36,7 @@ RESULT_NAMES = ("result.json", "results.json")
 UNOFFICIAL_SQLITE_NAMES = ("database.sqlite",)
 
 BACKMAN_EXPORT_META = ".backman_export_meta.json"
-BACKMAN_VERSION = "0.7.0"
+BACKMAN_VERSION = "0.7.2"
 
 class _Ansi:
     RESET = "\033[0m"
