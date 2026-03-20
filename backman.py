@@ -351,7 +351,7 @@ def _looks_like_external_host_ref(url: str) -> bool:
     if _looks_like_ipv4_literal(host):
         return True
     # Be permissive for host-like tokens seen in message text (including underscores).
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", host):
+    if not re.fullmatch(r"[\w.-]+", host):
         return False
     tld = host.rsplit(".", 1)[-1].lower()
     if tld in _LIKELY_FILE_EXTS:
