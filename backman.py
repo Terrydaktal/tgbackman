@@ -33,7 +33,6 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 RESULT_NAMES = ("result.json", "results.json")
-UNOFFICIAL_SQLITE_NAMES = ("database.sqlite",)
 
 BACKMAN_EXPORT_META = ".backman_export_meta.json"
 BACKMAN_VERSION = "0.7.2"
@@ -2851,7 +2850,7 @@ def find_unofficial_telegram_sqlite_dbs(root: str) -> List[str]:
     hits: List[str] = []
     for dirpath, _, filenames in os.walk(root):
         for fn in filenames:
-            if fn in UNOFFICIAL_SQLITE_NAMES:
+            if fn.endswith(".sqlite"):
                 p = os.path.join(dirpath, fn)
                 if _is_unofficial_telegram_sqlite_db(p):
                     hits.append(p)
@@ -3548,7 +3547,7 @@ def main() -> int:
         "--dedupe-unofficial-sqlite",
         action="store_true",
         help=(
-            "For unofficial SQLite backups: suppress database.sqlite files outside .telegram_backup/ "
+            "For unofficial SQLite backups: suppress .sqlite files outside .telegram_backup/ "
             "when a .telegram_backup DB exists under the same folder (avoids duplicates)."
         ),
     )
@@ -3697,8 +3696,8 @@ def main() -> int:
     if sqlite_hits:
         if args.dedupe_unofficial_sqlite:
             # Many unofficial backups include both:
-            # - <root>/database.sqlite (often a copied/derived view)
-            # - <root>/**/.telegram_backup/<account>/database.sqlite (canonical backing store)
+            # - <root>/*.sqlite (often a copied/derived view)
+            # - <root>/**/.telegram_backup/<account>/*.sqlite (canonical backing store)
             # When both exist under the same folder, prefer the .telegram_backup DB to avoid duplicates.
             canon = [
                 p
@@ -3725,7 +3724,7 @@ def main() -> int:
         print("Expected either:", file=sys.stderr)
         print("- JSON exports: result.json/results.json", file=sys.stderr)
         print("- HTML exports: export_results.html (multi-chat) or messages.html + css/ + js/ (single-chat)", file=sys.stderr)
-        print("- Unofficial SQLite backups: database.sqlite (with chats/messages/users tables)", file=sys.stderr)
+        print("- Unofficial SQLite backups: *.sqlite (with chats/messages/users tables)", file=sys.stderr)
         return 1
 
     # Nested export detection: multiple export roots under the input root

@@ -18,7 +18,7 @@
 - Official Telegram JSON exports
   - has `result.json` or `results.json`
 - Unofficial legacy SQLite backups
-  - `database.sqlite` with `messages/chats/users` tables
+  - `*.sqlite` with `messages/chats/users` tables
 
 ## Requirements
 
@@ -156,7 +156,7 @@ python3 backman.py --dedupe-unofficial-sqlite "/path/to/Telegram Backup"
 
 Behavior:
 
-- prefers `database.sqlite` under `.telegram_backup/...`
+- prefers `*.sqlite` under `.telegram_backup/...`
 - suppresses sibling/parent duplicate DB views under same tree
 
 ## Converted vs Original Single-Chat HTML
