@@ -3598,6 +3598,10 @@ def main() -> int:
     ap.add_argument("--check-list-schemes", default="")
     ap.add_argument("--check-max-schemes", type=int, default=200)
     ap.add_argument("--check-count-media-files", action="store_true")
+    ap.add_argument(
+        "--export-db",
+        help="Path to a SQLite database where all messages will be imported.",
+    )
     args = ap.parse_args()
 
     root = os.path.abspath(args.path)
@@ -3609,6 +3613,7 @@ def main() -> int:
         ("--split-multi-html", args.split_multi_html),
         ("--check-links", args.check_links),
         ("--repair-html-links", args.repair_html_links),
+        ("--export-db", args.export_db),
     ]
     enabled = [name for name, on in action_flags if on]
     if len(enabled) > 1:
@@ -3658,6 +3663,19 @@ def main() -> int:
         print(f"HTML files changed: {changed}")
         print(f"Links rewritten: {rewritten}")
         return 0
+
+    if args.export_db:
+        from db_indexer import index_backup_folder
+        db_path = os.path.abspath(args.export_db)
+        try:
+            chats_count, msgs_count = index_backup_folder(
+                root, db_path, log_fn=lambda msg: print(_c(msg, _Ansi.CYAN))
+            )
+            print(_c(f"Successfully indexed {msgs_count} messages across {chats_count} chats.", _Ansi.GREEN))
+            return 0
+        except Exception as e:
+            print(_c(f"Database ingestion failed: {e}", _Ansi.RED), file=sys.stderr)
+            return 3
 
     reports: List[ExportReport] = []
     json_hits = find_result_jsons(root)
