@@ -3,3 +3,8 @@ __pycache__/
 .venv
 .venv/
 .antigravitycli/
+
+# tgsearch compilation and local rules/outputs
+tgsearch/target/
+tgsearch/out/
+tgsearch/rules/
