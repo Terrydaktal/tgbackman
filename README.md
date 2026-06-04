@@ -18,7 +18,12 @@ A premium, high-performance command-line toolbox designed to manage, repair, spl
 ├── check_html_links.py                # Scanner to verify that all local asset links (href/src) resolve
 ├── fix_split_in_place.py              # Media relocalizer for split exports (avoids asset duplication)
 ├── fix_split_subfolder_ranges.py      # Standardizes unknown/non-standard range subfolder names
-└── backfill_split_export_meta.py      # Meta-file backfiller to register split folders in backman
+├── backfill_split_export_meta.py      # Meta-file backfiller to register split folders in backman
+└── tgsearch/                          # High-performance compiled Rust search companion
+    ├── Cargo.toml                     # Rust project manifest
+    ├── README.md                      # Rust search utility documentation
+    ├── src/                           # Rust search companion source code
+    └── rules/                         # Directory for anonymization & sanitization rules
 ```
 
 ---
@@ -197,9 +202,14 @@ python3 find_backup_overlaps.py "/media/lewis/1b/sqlitedb/telegram_backup.db"
 ```
 
 ### 8️⃣ Step 8: Search Companion Ingestion
-Navigate to `/home/lewis/Dev/rag` and invoke the ultra-fast Rust search companion `tgsearch` to perform query searches, deduplication, and case-insensitive username sanitization:
+Navigate to the `tgsearch/` subdirectory and invoke the ultra-fast Rust search companion `tgsearch` to perform query searches, deduplication, and case-insensitive username sanitization:
 ```bash
-/home/lewis/Dev/rag/target/release/tgsearch "/media/lewis/1b/sqlitedb/telegram_backup.db" "makeup OR alcohol" --no-time -l 80 --dedupe --no-header --sanitise "/home/lewis/Dev/rag/rules/bad_language_rules.txt"
+# Navigate and build (if not already built)
+cd tgsearch
+cargo build --release
+
+# Execute query searches
+./target/release/tgsearch "/media/lewis/1b/sqlitedb/telegram_backup.db" "makeup OR alcohol" --no-time -l 80 --dedupe --no-header --sanitise "rules/bad_language_rules.txt"
 ```
 
 ---
