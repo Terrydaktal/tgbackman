@@ -8,3 +8,6 @@ __pycache__/
 tgsearch/target/
 tgsearch/out/
 tgsearch/rules/
+
+# tgbackman compilation and target
+tgbackman/target/

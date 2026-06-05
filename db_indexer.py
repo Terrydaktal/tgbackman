@@ -294,13 +294,27 @@ def setup_database(db_path: str) -> sqlite3.Connection:
             chat_id TEXT PRIMARY KEY,
             chat_name TEXT,
             chat_type TEXT,
-            backup_path TEXT
+            backup_path TEXT,
+            is_active INTEGER DEFAULT 0,
+            last_backup_unix INTEGER
         );
     """)
     
     # In-place migration: add backup_path if database already exists
     try:
         cursor.execute("ALTER TABLE chats ADD COLUMN backup_path TEXT;")
+    except sqlite3.OperationalError:
+        pass # Column already exists
+
+    # In-place migration: add is_active if database already exists
+    try:
+        cursor.execute("ALTER TABLE chats ADD COLUMN is_active INTEGER DEFAULT 0;")
+    except sqlite3.OperationalError:
+        pass # Column already exists
+
+    # In-place migration: add last_backup_unix if database already exists
+    try:
+        cursor.execute("ALTER TABLE chats ADD COLUMN last_backup_unix INTEGER;")
     except sqlite3.OperationalError:
         pass # Column already exists
     
@@ -880,12 +894,19 @@ def parse_sqlite_backup_file(path: str, conn: sqlite3.Connection, batch_size: in
         src_conn.close()
         return 0
 
-    src_cursor.execute("SELECT message_id, source_id, source_type, sender_id, text, time FROM messages")
+    has_media_cols = "media_type" in m_cols and "media_file" in m_cols
+    if has_media_cols:
+        src_cursor.execute("SELECT message_id, source_id, source_type, sender_id, text, time, media_type, media_file FROM messages")
+    else:
+        src_cursor.execute("SELECT message_id, source_id, source_type, sender_id, text, time, NULL, NULL FROM messages")
     
     messages_batch = []
     total_inserted = 0
-    
-    for mid, sid, stype, sender_id, text, t_val in src_cursor:
+    for row in src_cursor:
+        mid, sid, stype, sender_id, text, t_val = row[0], row[1], row[2], row[3], row[4], row[5]
+        mtype = row[6] if has_media_cols else None
+        mfile = row[7] if has_media_cols else None
+        
         if mid is None or sid is None:
             continue
         chat_id = f"{stype}_{sid}"
@@ -903,18 +924,39 @@ def parse_sqlite_backup_file(path: str, conn: sqlite3.Connection, batch_size: in
                 ts_iso = dt.isoformat().replace("+00:00", "Z")
             except Exception:
                 pass
+
+        mapped_mtype = None
+        if mtype:
+            mt_l = mtype.lower()
+            if mt_l == "photo":
+                mapped_mtype = "photo"
+            elif mt_l == "document" and mfile:
+                mfile_l = mfile.lower()
+                if mfile_l.startswith("t_voice") or any(mfile_l.endswith(ext) for ext in (".ogg", ".wav", ".m4a", ".mp3", ".flac")):
+                    mapped_mtype = "voice_message"
+                elif mfile_l.startswith("t_video") or any(mfile_l.endswith(ext) for ext in (".mp4", ".gif", ".3gp", ".avi", ".mov", ".mkv")):
+                    mapped_mtype = "video"
+                else:
+                    mapped_mtype = "file"
+            else:
+                mapped_mtype = mt_l
                 
+        mpath = f"files/{mfile}" if mfile else None
+        
         messages_batch.append((
             int(mid), chat_id, sender, sender_id_s, ts_iso, ts_unix,
-            str(text).strip() if text else "", None, None, None, None
+            str(text).strip() if text else "", mapped_mtype, mpath, None, None
         ))
         
         if len(messages_batch) >= batch_size:
             dest_cursor.executemany(
-                """INSERT OR IGNORE INTO messages 
+                """INSERT INTO messages 
                 (message_id, chat_id, sender, sender_id, timestamp, timestamp_unix, 
                 text, media_type, media_path, reply_to_id, forwarded_from) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                  media_type = COALESCE(messages.media_type, excluded.media_type),
+                  media_path = COALESCE(messages.media_path, excluded.media_path)""",
                 messages_batch
             )
             total_inserted += dest_cursor.rowcount
@@ -923,10 +965,13 @@ def parse_sqlite_backup_file(path: str, conn: sqlite3.Connection, batch_size: in
             
     if messages_batch:
         dest_cursor.executemany(
-            """INSERT OR IGNORE INTO messages 
+            """INSERT INTO messages 
             (message_id, chat_id, sender, sender_id, timestamp, timestamp_unix, 
             text, media_type, media_path, reply_to_id, forwarded_from) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, message_id) DO UPDATE SET
+              media_type = COALESCE(messages.media_type, excluded.media_type),
+              media_path = COALESCE(messages.media_path, excluded.media_path)""",
             messages_batch
         )
         total_inserted += dest_cursor.rowcount
@@ -1022,3 +1067,52 @@ def index_backup_folder(root_path: str, db_path: str, log_fn=print) -> Tuple[int
     
     log_fn("Database optimization completed successfully.")
     return chats_count, msgs_count
+
+
+if __name__ == "__main__":
+    import argparse
+
+    class _Ansi:
+        RESET = "\033[0m"
+        CYAN = "\033[36m"
+        GREEN = "\033[32m"
+        RED = "\033[31m"
+
+    def _use_color() -> bool:
+        if os.environ.get("NO_COLOR"):
+            return False
+        try:
+            return sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb")
+        except Exception:
+            return False
+
+    def _c(s: str, code: str) -> str:
+        if not _use_color():
+            return s
+        return f"{code}{s}{_Ansi.RESET}"
+
+    ap = argparse.ArgumentParser(description="Telegram Backup SQLite Indexer")
+    ap.add_argument("path", help="Telegram export folder (will be scanned recursively)")
+    ap.add_argument(
+        "--export-db",
+        required=True,
+        help="Path to a SQLite database where all messages will be imported.",
+    )
+    args = ap.parse_args()
+
+    root = os.path.abspath(args.path)
+    if not os.path.exists(root):
+        print(f"Path does not exist: {root}", file=sys.stderr)
+        sys.exit(2)
+
+    db_path = os.path.abspath(args.export_db)
+    try:
+        chats_count, msgs_count = index_backup_folder(
+            root, db_path, log_fn=lambda msg: print(_c(msg, _Ansi.CYAN))
+        )
+        print(_c(f"Successfully indexed {msgs_count} messages across {chats_count} chats.", _Ansi.GREEN))
+        sys.exit(0)
+    except Exception as e:
+        print(_c(f"Database ingestion failed: {e}", _Ansi.RED), file=sys.stderr)
+        sys.exit(3)
+
