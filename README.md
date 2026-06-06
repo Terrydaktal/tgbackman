@@ -93,6 +93,7 @@ This section outlines what each script does, its inputs, and its outputs.
 
 ### 6. [check_html_links.py](check_html_links.py)
 * **Purpose**: Scans all `.html` files in a backup folder and verifies that local on-disk assets (such as images, avatars, or media) referred to by `href`, `src`, `poster`, CSS `url()`, or `srcset` paths actually exist.
+* **Notes**: This tool can be run both **before** the split (to audit raw multi-exports) and **after** the split (to verify that all relative media files resolve correctly within the single-chat folders).
 * **Inputs**:
   - A directory containing Telegram HTML backups.
 * **CLI Invocation Example**:
@@ -101,7 +102,8 @@ This section outlines what each script does, its inputs, and its outputs.
   ```
 
 ### 7. [fix_split_in_place.py](fix_split_in_place.py)
-* **Purpose**: Fixes split multi-chat HTML exports in-place by relocalizing leftover `../../chats/chat_XXX/...` media references to keep single chat folders standalone without duplicating massive media folders.
+* **Purpose**: Fixes split multi-chat HTML exports in-place by relocalizing leftover `../../chats/chat_XXX/...` media references to keep single chat folders standalone.
+* **Operation**: For each message referencing external media in the source multi-export, it **makes a local copy** of that media and saves it under `<split_chat>/media/`, then updates the HTML href/src/srcset links in-place to point to the local media folder. This renders the single chat folder completely standalone, self-contained, and portable.
 * **Inputs**:
   - `single_root`: Split output directory.
   - `--multi-root`: Original multi-chat HTML export root.
@@ -159,10 +161,16 @@ python3 split_multi_html.py "/media/user/1b/Telegram Backup/RawMultiExport"
 ```
 
 ### 3️⃣ Step 3: Relocalize Split Assets in Place
-Relocalize media file paths in split chats to avoid massive asset duplication while maintaining fully-functioning local files:
-```bash
-python3 fix_split_in_place.py "/media/user/1b/Telegram Backup/SplitChats" --multi-root "/media/user/1b/Telegram Backup/RawMultiExport"
-```
+  Relocalize media file paths in split chats to make them fully standalone. This copies referenced media from other chats into the local `media/` folder and rewrites links in-place:
+  ```bash
+  python3 fix_split_in_place.py "/media/user/1b/Telegram Backup/SplitChats" --multi-root "/media/user/1b/Telegram Backup/RawMultiExport"
+  ```
+  
+  > [!TIP]
+  > **Post-Split Link Check**: You can run [check_html_links.py](check_html_links.py) on your split directories at this point to verify that all relative paths and copied media files resolve successfully:
+  > ```bash
+  > python3 check_html_links.py "/media/user/1b/Telegram Backup/SplitChats"
+  > ```
 
 ### 4️⃣ Step 4: Chronological Subfolder Naming and Metadata Backfill
 Standardize subfolder names based on actual minimum/maximum UTC timestamps (supports HTML, JSON, and SQLite formats), then backfill `.backman_export_meta.json` so they are fully discovered by the main scanner:
