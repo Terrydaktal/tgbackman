@@ -1,10 +1,24 @@
 use clap::Parser;
 use colored::*;
 use rusqlite::{params, Connection, Result};
-use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+
+use db_search::query::SearchQuery;
+use db_search::sqlite_fts::{prepare_fts_query, rowid_match_subquery, SearchMode};
+use fuzzy_rank::message::{sort_matches, MessageCandidate, MessageField, MessageQuery};
+
+mod models;
+mod render;
+
+use models::{ContextRow, MatchRow, MergedGroup};
+use render::{apply_sanitisation, format_ts, highlight_term, normalize_sender};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Search Telegram SQLite backups with context windows.")]
+#[command(
+    author,
+    version,
+    about = "Search Telegram SQLite backups with context windows."
+)]
 struct Cli {
     /// Path to the SQLite database file
     db_path: String,
@@ -49,257 +63,74 @@ struct Cli {
     no_header: bool,
 }
 
-struct MatchRow {
-    _id: i64,
-    chat_name: String,
-    chat_id: String,
-    message_id: i64,
-    backup_path: Option<String>,
-    timestamp_unix: Option<i64>,
-    sender: Option<String>,
-    text: Option<String>,
-    media_path: Option<String>,
-}
+fn rerank_matches(query: &str, matches: &mut Vec<MatchRow>) {
+    let Some(message_query) = MessageQuery::new(query) else {
+        return;
+    };
 
-struct ContextRow {
-    _message_id: i64,
-    timestamp: Option<String>,
-    sender: String,
-    text: String,
-    media_type: Option<String>,
-    media_path: Option<String>,
-    is_match: bool,
-}
+    let key_strings = matches
+        .iter()
+        .map(|row| row._id.to_string())
+        .collect::<Vec<_>>();
+    let index_by_key = key_strings
+        .iter()
+        .enumerate()
+        .map(|(idx, key)| (key.clone(), idx))
+        .collect::<HashMap<_, _>>();
 
-struct MergedGroup {
-    chat_id: String,
-    chat_name: String,
-    backup_path: Option<String>,
-    match_ids: Vec<i64>,
-    min_id: i64,
-    max_id: i64,
-}
-
-fn replace_case_insensitive(text: &str, name: &str, replacement: &str) -> String {
-    if name.is_empty() {
-        return text.to_string();
-    }
-    
-    let mut result = String::new();
-    let text_lower = text.to_lowercase();
-    let name_lower = name.to_lowercase();
-    
-    let mut last_idx = 0;
-    while let Some(start_idx) = text_lower[last_idx..].find(&name_lower) {
-        let absolute_start = last_idx + start_idx;
-        let absolute_end = absolute_start + name_lower.len();
-        
-        result.push_str(&text[last_idx..absolute_start]);
-        result.push_str(replacement);
-        
-        last_idx = absolute_end;
-    }
-    
-    result.push_str(&text[last_idx..]);
-    result
-}
-
-fn apply_sanitisation(text: &str, pairs: &[(String, String)]) -> String {
-    let mut current = text.to_string();
-    for (target, replacement) in pairs {
-        current = replace_case_insensitive(&current, target, replacement);
-    }
-    current
-}
-
-fn parse_query_tokens(query: &str) -> Vec<(String, bool)> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    
-    for c in query.chars() {
-        if c == '"' {
-            if in_quotes {
-                if !current.trim().is_empty() {
-                    tokens.push((current.clone(), true));
-                }
-                current.clear();
-                in_quotes = false;
-            } else {
-                if !current.trim().is_empty() {
-                    for w in current.split_whitespace() {
-                        tokens.push((w.to_string(), false));
-                    }
-                }
-                current.clear();
-                in_quotes = true;
+    let mut ranked = matches
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| {
+            let text = row.text.as_deref()?.trim();
+            if text.is_empty() {
+                return None;
             }
-        } else {
-            current.push(c);
-        }
+
+            let fields = [
+                MessageField {
+                    priority: 0,
+                    value: row.chat_name.as_str(),
+                },
+                MessageField {
+                    priority: 1,
+                    value: text,
+                },
+            ];
+
+            message_query.search_rank(MessageCandidate {
+                key: key_strings[idx].as_str(),
+                fields: &fields,
+                score: row.timestamp_unix.unwrap_or_default() as f64,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if ranked.is_empty() {
+        return;
     }
-    
-    if !current.trim().is_empty() {
-        if in_quotes {
-            tokens.push((current.clone(), true));
-        } else {
-            for w in current.split_whitespace() {
-                tokens.push((w.to_string(), false));
+
+    sort_matches(&mut ranked);
+
+    let mut used = vec![false; matches.len()];
+    let mut reordered = Vec::with_capacity(matches.len());
+
+    for ranked_match in ranked {
+        if let Some(&idx) = index_by_key.get(ranked_match.key) {
+            if !used[idx] {
+                reordered.push(matches[idx].clone());
+                used[idx] = true;
             }
         }
     }
-    
-    tokens
-}
 
-fn normalize_sender(sender: &str) -> String {
-    let s = sender.to_lowercase();
-    let trimmed = s.trim();
-    if trimmed.starts_with("siwel") || trimmed.starts_with("lewis") {
-        "lewis".to_string()
-    } else if trimmed.starts_with("deleted account") || trimmed.starts_with("deleted") {
-        "deleted".to_string()
-    } else {
-        trimmed.to_string()
+    for (idx, row) in matches.iter().cloned().enumerate() {
+        if !used[idx] {
+            reordered.push(row);
+        }
     }
-}
 
-fn format_ts(iso_str: &str) -> String {
-    if iso_str.is_empty() {
-        return "?".to_string();
-    }
-    // Attempt to parse ISO-8601 UTC string (e.g. "2026-05-24T21:16:00Z")
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(&iso_str.replace("Z", "+00:00")) {
-        let local_dt: DateTime<Utc> = parsed.with_timezone(&Utc);
-        return local_dt.format("%Y-%m-%d %H:%M:%S").to_string();
-    }
-    iso_str.replace('T', " ").replace('Z', "")
-}
-
-fn highlight_term(text: &str, query: &str, dim_non_matches: bool) -> String {
-    if query.is_empty() {
-        return if dim_non_matches { text.dimmed().to_string() } else { text.to_string() };
-    }
-    
-    let tokens = parse_query_tokens(query);
-    let mut terms = Vec::new();
-    
-    for (t, is_quoted) in tokens {
-        if is_quoted {
-            if !t.is_empty() {
-                terms.push(t.to_lowercase());
-            }
-        } else {
-            let t_lower = t.to_lowercase();
-            if t_lower == "or" || t_lower == "and" || t_lower == "not" {
-                continue;
-            }
-            let cleaned = t.trim_matches(|c: char| !c.is_alphanumeric() && c != '*');
-            let cleaned_no_star = cleaned.trim_end_matches('*');
-            if !cleaned_no_star.is_empty() {
-                terms.push(cleaned_no_star.to_lowercase());
-            }
-        }
-    }
-    
-    if terms.is_empty() {
-        return if dim_non_matches { text.dimmed().to_string() } else { text.to_string() };
-    }
-    
-    let text_lower = text.to_lowercase();
-    let mut ranges = Vec::new();
-    
-    for term in &terms {
-        let mut last_idx = 0;
-        while let Some(start_idx) = text_lower[last_idx..].find(term) {
-            let abs_start = last_idx + start_idx;
-            let abs_end = abs_start + term.len();
-            ranges.push((abs_start, abs_end));
-            last_idx = abs_start + 1; // Slide by 1 to find all occurrences
-        }
-    }
-    
-    if ranges.is_empty() {
-        return if dim_non_matches { text.dimmed().to_string() } else { text.to_string() };
-    }
-    
-    // Sort ranges by start index, and then by end index descending
-    ranges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-    
-    // Merge overlapping ranges
-    let mut merged = Vec::new();
-    let mut current = ranges[0];
-    
-    for r in ranges.into_iter().skip(1) {
-        if r.0 <= current.1 {
-            // Overlaps or contiguous, extend current
-            if r.1 > current.1 {
-                current.1 = r.1;
-            }
-        } else {
-            merged.push(current);
-            current = r;
-        }
-    }
-    merged.push(current);
-    
-    // Render the text using merged ranges
-    let mut result = String::new();
-    let mut last_idx = 0;
-    
-    for (start, end) in merged {
-        if start > last_idx {
-            let before = &text[last_idx..start];
-            if dim_non_matches {
-                result.push_str(&before.dimmed().to_string());
-            } else {
-                result.push_str(before);
-            }
-        }
-        let matched = &text[start..end];
-        result.push_str(&matched.red().bold().to_string());
-        last_idx = end;
-    }
-    
-    if last_idx < text.len() {
-        let after = &text[last_idx..];
-        if dim_non_matches {
-            result.push_str(&after.dimmed().to_string());
-        } else {
-            result.push_str(after);
-        }
-    }
-    
-    result
-}
-
-fn prepare_fts_query(query: &str, exact: bool) -> String {
-    if exact {
-        return query.to_string();
-    }
-    
-    let tokens = parse_query_tokens(query);
-    let mut parts = Vec::new();
-    
-    for (text, is_quoted) in tokens {
-        if is_quoted {
-            parts.push(format!("\"{}\"", text));
-        } else {
-            if text.to_lowercase() == "or" {
-                parts.push("OR".to_string());
-                continue;
-            }
-            let cleaned = text.trim_matches(|c: char| !c.is_alphanumeric() && c != '*');
-            if !cleaned.is_empty() {
-                if cleaned.ends_with('*') {
-                    parts.push(cleaned.to_string());
-                } else {
-                    parts.push(format!("{}*", cleaned));
-                }
-            }
-        }
-    }
-    parts.join(" ")
+    *matches = reordered;
 }
 
 fn main() -> Result<()> {
@@ -371,7 +202,16 @@ fn main() -> Result<()> {
     };
 
     // 1. Resolve matching message entry points
-    let fts_query = prepare_fts_query(&args.query, args.exact);
+    let search_query = SearchQuery::new(args.query.clone());
+    let prepared_fts_query = prepare_fts_query(
+        &search_query,
+        if args.exact {
+            SearchMode::Exact
+        } else {
+            SearchMode::Prefix
+        },
+    );
+    let fts_query = prepared_fts_query.match_query;
     let mut chat_filter_clause = String::new();
     let mut params_vec: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(fts_query)];
 
@@ -395,15 +235,16 @@ fn main() -> Result<()> {
     let limit_param_idx = params_vec.len() + 1;
     params_vec.push(rusqlite::types::Value::Integer(sql_limit));
 
+    let rowid_subquery = rowid_match_subquery("messages_fts", 1);
     let find_matches_query = format!(
         "SELECT m.id, m.chat_id, m.message_id, c.chat_name, c.backup_path, m.timestamp_unix, m.sender, m.text, m.media_path
          FROM messages m
          JOIN chats c ON m.chat_id = c.chat_id
-         WHERE m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1)
+         WHERE m.id IN ({})
          {}
          ORDER BY m.timestamp_unix DESC
          LIMIT ?{}",
-        chat_filter_clause, limit_param_idx
+        rowid_subquery, chat_filter_clause, limit_param_idx
     );
 
     let mut stmt = conn.prepare(&find_matches_query)?;
@@ -445,9 +286,14 @@ fn main() -> Result<()> {
                         } else if !t1.is_empty() && !t2.is_empty() {
                             let is_media_marker1 = t1 == "[file]" || t1 == "[photo]";
                             let is_media_marker2 = t2 == "[file]" || t2 == "[photo]";
-                            if (is_media_marker1 || is_media_marker2) && row.media_path == accepted.media_path {
+                            if (is_media_marker1 || is_media_marker2)
+                                && row.media_path == accepted.media_path
+                            {
                                 true
-                            } else if t1.len() >= 10 && t2.len() >= 10 && (t1.contains(t2) || t2.contains(t1)) {
+                            } else if t1.len() >= 10
+                                && t2.len() >= 10
+                                && (t1.contains(t2) || t2.contains(t1))
+                            {
                                 true
                             } else {
                                 false
@@ -461,9 +307,9 @@ fn main() -> Result<()> {
                 let same_time = match (row.timestamp_unix, accepted.timestamp_unix) {
                     (Some(ts1), Some(ts2)) => {
                         let diff = (ts1 - ts2).abs();
-                        diff <= 15 || 
-                        (diff >= 3585 && diff <= 3615) || 
-                        (diff >= 7185 && diff <= 7215)
+                        diff <= 15
+                            || (diff >= 3585 && diff <= 3615)
+                            || (diff >= 7185 && diff <= 7215)
                     }
                     _ => false,
                 };
@@ -480,6 +326,8 @@ fn main() -> Result<()> {
         }
     }
 
+    rerank_matches(&args.query, &mut matches);
+
     if args.dedupe && args.limit >= 0 {
         matches.truncate(args.limit as usize);
     }
@@ -494,15 +342,15 @@ fn main() -> Result<()> {
         "SELECT COUNT(*), COUNT(DISTINCT m.chat_id)
          FROM messages m
          JOIN chats c ON m.chat_id = c.chat_id
-         WHERE m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1)
+         WHERE m.id IN ({})
          {}",
-        chat_filter_clause
+        rowid_subquery, chat_filter_clause
     );
 
     let mut count_stmt = conn.prepare(&count_query)?;
     let count_params = &params_vec[0..params_vec.len() - 1];
     let mut count_rows = count_stmt.query(rusqlite::params_from_iter(count_params.iter()))?;
-    
+
     let mut total_matches = 0;
     let mut total_chats = 0;
     if let Some(row) = count_rows.next()? {
@@ -525,13 +373,21 @@ fn main() -> Result<()> {
 
     // 2. Group matches into non-overlapping context window segments (merging overlapping ranges)
     let mut chat_order = Vec::new();
-    let mut chat_to_matches: std::collections::HashMap<String, Vec<MatchRow>> = std::collections::HashMap::new();
+    let mut chat_to_matches: std::collections::HashMap<String, Vec<MatchRow>> =
+        std::collections::HashMap::new();
 
     for m in matches {
         if !chat_to_matches.contains_key(&m.chat_id) {
-            chat_order.push((m.chat_id.clone(), m.chat_name.clone(), m.backup_path.clone()));
+            chat_order.push((
+                m.chat_id.clone(),
+                m.chat_name.clone(),
+                m.backup_path.clone(),
+            ));
         }
-        chat_to_matches.entry(m.chat_id.clone()).or_default().push(m);
+        chat_to_matches
+            .entry(m.chat_id.clone())
+            .or_default()
+            .push(m);
     }
 
     let mut merged_groups = Vec::new();
@@ -594,28 +450,28 @@ fn main() -> Result<()> {
         let low_bound = g.min_id - args.context;
         let high_bound = g.max_id + args.context;
 
-        let rows = context_stmt.query_map(
-            params![g.chat_id, low_bound, high_bound],
-            |row| {
-                let msg_id: i64 = row.get(0)?;
-                let is_m = g.match_ids.contains(&msg_id);
-                Ok(ContextRow {
-                    _message_id: msg_id,
-                    timestamp: row.get(1)?,
-                    sender: row.get(2)?,
-                    text: row.get(3)?,
-                    media_type: row.get(4)?,
-                    media_path: row.get(5)?,
-                    is_match: is_m,
-                })
-            },
-        )?;
+        let rows = context_stmt.query_map(params![g.chat_id, low_bound, high_bound], |row| {
+            let msg_id: i64 = row.get(0)?;
+            let is_m = g.match_ids.contains(&msg_id);
+            Ok(ContextRow {
+                _message_id: msg_id,
+                timestamp: row.get(1)?,
+                sender: row.get(2)?,
+                text: row.get(3)?,
+                media_type: row.get(4)?,
+                media_path: row.get(5)?,
+                is_match: is_m,
+            })
+        })?;
 
         println!();
         let backup_p = g.backup_path.as_deref().unwrap_or("Unknown path");
         let header_name = apply_sanitisation(&g.chat_name, &sanitise_pairs);
         let header = if g.match_ids.len() == 1 {
-            format!(" Chat: {} | Message ID: {} | Path: {} ", header_name, g.min_id, backup_p)
+            format!(
+                " Chat: {} | Message ID: {} | Path: {} ",
+                header_name, g.min_id, backup_p
+            )
         } else {
             format!(
                 " Chat: {} | Message IDs: {}-{} ({} matches) | Path: {} ",
@@ -663,7 +519,7 @@ fn main() -> Result<()> {
                 } else {
                     "Attachment".to_string()
                 };
-                
+
                 if display_text.is_empty() {
                     display_text = format!("[{} Path: {}]", m_type_cap, m_path);
                 } else {
@@ -679,12 +535,18 @@ fn main() -> Result<()> {
                 // Display matching message (no leading arrows or indentation)
                 print!("{}", time_prefix);
                 print!("{}", format!("{}:", display_sender).bold().cyan());
-                println!(" {}", highlight_term(&display_text_sanitised, &highlight_query, false));
+                println!(
+                    " {}",
+                    highlight_term(&display_text_sanitised, &highlight_query, false)
+                );
             } else {
                 // Display context message (no leading indentation)
                 print!("{}", time_prefix);
                 print!("{}", format!("{}:", display_sender).cyan());
-                println!(" {}", highlight_term(&display_text_sanitised, &highlight_query, true));
+                println!(
+                    " {}",
+                    highlight_term(&display_text_sanitised, &highlight_query, true)
+                );
             }
         }
     }

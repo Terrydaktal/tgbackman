@@ -3,6 +3,7 @@ __pycache__/
 .venv
 .venv/
 .antigravitycli/
+sqlitedb/
 
 # tgsearch compilation and local rules/outputs
 tgsearch/target/
@@ -11,3 +12,19 @@ tgsearch/rules/
 
 # tgbackman compilation and target
 tgbackman/target/
+
+# Telegram user authorization and local incremental-export staging
+*.session
+*.session-journal
+.partial-*
+.dry-run-*
+.tgbackman.lock
+*.tgbackman.lock
+credentials.env
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/

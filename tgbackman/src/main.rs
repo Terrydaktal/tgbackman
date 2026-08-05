@@ -1,347 +1,24 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Hide console window on Windows in release
 
-use eframe::egui;
-use std::collections::{HashMap, HashSet};
 use chrono::{TimeZone, Utc};
-use std::sync::{Arc, Mutex, OnceLock};
+use eframe::egui;
 use regex::Regex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
-enum CalcMessage {
-    Progress(String),
-    Finished(HashMap<String, Vec<String>>),
-    Error(String),
-}
+mod cache;
+mod inventory;
+mod model;
 
-enum LoadMessage {
-    Loading(String),
-    Finished(Vec<ChatGroup>),
-    Error(String),
-}
-
-enum CompareMessage {
-    Loading(String),
-    Finished(ActiveComparison),
-    Error(String),
-}
-
-enum SingleChatMessage {
-    Loading(String),
-    Finished(ActiveChatView),
-    Error(String),
-}
-
-#[allow(dead_code)]
-#[derive(Clone)]
-struct ActiveChatView {
-    backup_name: String,
-    chat_id: String,
-    messages: Vec<BackupMessage>,
-    scroll_to_bottom: bool,
-    search_query: String,
-    filtered_indices: Vec<usize>,
-    search_matches_count: usize,
-    current_search_match_idx: Option<usize>,
-    scroll_to_row_idx: Option<usize>,
-}
-
-#[derive(Clone)]
-struct BackupMessage {
-    message_id: i64,
-    sender: String,
-    timestamp_unix: i64,
-    timestamp_str: String,
-    text: String,
-    clean_text: String,
-    media_type: Option<String>,
-    media_path: Option<String>,
-}
-
-#[derive(Clone)]
-struct AlignedMessageRow {
-    msg_a: Option<BackupMessage>,
-    msg_b: Option<BackupMessage>,
-    is_discrepancy: bool,
-}
-
-#[derive(Clone)]
-struct ActiveComparison {
-    backup_a_letter: char,
-    backup_b_letter: char,
-    backup_a_name: String,
-    backup_b_name: String,
-    rows: Vec<AlignedMessageRow>,
-    discrepancies: Vec<usize>,
-    current_discrepancy_idx: Option<usize>,
-    scroll_to_row_idx: Option<usize>,
-}
-
-
-fn get_cache_path(db_path: &str) -> String {
-    if db_path.ends_with(".db") {
-        format!("{}_overlaps.json", &db_path[..db_path.len() - 3])
-    } else {
-        format!("{}_overlaps.json", db_path)
-    }
-}
-
-fn get_backup_execution_time(backup_path: &str) -> Option<i64> {
-    let media_dirs = [
-        "files", "photos", "video_files", "voice_messages", 
-        "audio_files", "sticker_files", "stickers", "documents", "animations"
-    ];
-
-    let mut max_mtime: Option<i64> = None;
-
-    // Helper to recursively scan a directory for files and find max mtime
-    fn scan_dir_max_mtime(dir: &std::path::Path, max_val: &mut Option<i64>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if let Ok(ft) = entry.file_type() {
-                    if ft.is_dir() {
-                        scan_dir_max_mtime(&entry.path(), max_val);
-                    } else if ft.is_file() {
-                        if let Ok(meta) = entry.metadata() {
-                            if let Ok(modified) = meta.modified() {
-                                if let Ok(dur) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-                                    let secs = dur.as_secs() as i64;
-                                    *max_val = Some(max_val.map_or(secs, |mv| mv.max(secs)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Scan matching media directories under backup_path
-    if let Ok(entries) = std::fs::read_dir(backup_path) {
-        for entry in entries.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_dir() {
-                    let path = entry.path();
-                    if let Some(name_str) = path.file_name().and_then(|n| n.to_str()) {
-                        let name_lower = name_str.to_lowercase();
-                        if media_dirs.contains(&name_lower.as_str()) {
-                            scan_dir_max_mtime(&path, &mut max_mtime);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // If we found a max mtime from the media files, return it!
-    if let Some(mtime) = max_mtime {
-        return Some(mtime);
-    }
-
-    // Fallback: check metadata of database.sqlite, messages.html, result.json, results.json, and the backup_path directory itself
-    let check_paths = [
-        format!("{}/database.sqlite", backup_path),
-        format!("{}/messages.html", backup_path),
-        format!("{}/result.json", backup_path),
-        format!("{}/results.json", backup_path),
-        backup_path.to_string(),
-    ];
-    
-    for path in &check_paths {
-        if let Ok(meta) = std::fs::metadata(path) {
-            if let Ok(modified) = meta.modified() {
-                if let Ok(dur) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-                    return Some(dur.as_secs() as i64);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-// Union-Find helper for alias linking
-struct UnionFind {
-    parent: HashMap<String, String>,
-}
-
-impl UnionFind {
-    fn new() -> Self {
-        UnionFind { parent: HashMap::new() }
-    }
-
-    fn find(&mut self, x: &str) -> String {
-        if !self.parent.contains_key(x) {
-            self.parent.insert(x.to_string(), x.to_string());
-            return x.to_string();
-        }
-        let px = self.parent.get(x).unwrap().clone();
-        if px == x {
-            return x.to_string();
-        }
-        let root = self.find(&px);
-        self.parent.insert(x.to_string(), root.clone());
-        root
-    }
-
-    fn union(&mut self, x: &str, y: &str) {
-        let root_x = self.find(x);
-        let root_y = self.find(y);
-        if root_x != root_y {
-            self.parent.insert(root_x, root_y);
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct MediaStats {
-    photos_count: i64,
-    photos_resolved: i64,
-    videos_count: i64,
-    videos_resolved: i64,
-    voice_count: i64,
-    voice_resolved: i64,
-    files_count: i64,
-    files_resolved: i64,
-}
-
-#[derive(Clone)]
-struct BackupInfo {
-    chat_id: String,
-    name: String,
-    path: String,
-    min_id: Option<i64>,
-    max_id: Option<i64>,
-    count: i64,
-    min_ts: String,
-    max_ts: String,
-    min_unix: Option<i64>,
-    max_unix: Option<i64>,
-    is_active: bool,
-    last_backup_unix: Option<i64>,
-    media_stats: Option<MediaStats>,
-}
-
-impl BackupInfo {
-    fn compute_media_stats(&self, db_path: &str) -> MediaStats {
-        let mut photos_count = 0;
-        let mut photos_resolved = 0;
-        let mut videos_count = 0;
-        let mut videos_resolved = 0;
-        let mut voice_count = 0;
-        let mut voice_resolved = 0;
-        let mut files_count = 0;
-        let mut files_resolved = 0;
-
-        if let Ok(conn) = rusqlite::Connection::open(db_path) {
-            let stmt = conn.prepare(
-                "SELECT media_type, media_path FROM messages WHERE chat_id = ? AND media_type IN ('photo', 'video', 'voice_message', 'file')"
-            );
-            if let Ok(mut stmt) = stmt {
-                let rows = stmt.query_map(rusqlite::params![self.chat_id], |row| {
-                    let mt: Option<String> = row.get(0)?;
-                    let mp: Option<String> = row.get(1)?;
-                    Ok((mt, mp))
-                });
-                if let Ok(rows) = rows {
-                    for row in rows {
-                        if let Ok((media_type, media_path)) = row {
-                            if let Some(mt) = media_type {
-                                let path_exists = if let Some(ref mp) = media_path {
-                                    if mp.is_empty() {
-                                        false
-                                    } else {
-                                        let base = std::path::Path::new(&self.path);
-                                        let mut exists = base.join(mp).exists();
-                                        if !exists {
-                                            let normalized = mp.replace("\\", "/");
-                                            let parts: Vec<&str> = normalized.split('/').collect();
-                                            let known_folders = [
-                                                "photos", "video_files", "voice_messages", "audio_files",
-                                                "stickers", "sticker_files", "files", "documents", "animations"
-                                            ];
-                                            for i in (0..parts.len()).rev() {
-                                                if known_folders.contains(&parts[i].to_lowercase().as_str()) {
-                                                    let subpath = parts[i..].join("/");
-                                                    if base.join(&subpath).exists() {
-                                                        exists = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if !exists {
-                                            if let Some(fname) = std::path::Path::new(mp).file_name() {
-                                                if base.join(fname).exists() {
-                                                    exists = true;
-                                                } else if base.join("files").join(fname).exists() {
-                                                    exists = true;
-                                                }
-                                            }
-                                        }
-                                        exists
-                                    }
-                                } else {
-                                    false
-                                };
-                                
-                                match mt.as_str() {
-                                    "photo" => {
-                                        photos_count += 1;
-                                        if path_exists {
-                                            photos_resolved += 1;
-                                        }
-                                    }
-                                    "video" => {
-                                        videos_count += 1;
-                                        if path_exists {
-                                            videos_resolved += 1;
-                                        }
-                                    }
-                                    "voice_message" => {
-                                        voice_count += 1;
-                                        if path_exists {
-                                            voice_resolved += 1;
-                                        }
-                                    }
-                                    "file" => {
-                                        files_count += 1;
-                                        if path_exists {
-                                            files_resolved += 1;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        MediaStats {
-            photos_count,
-            photos_resolved,
-            videos_count,
-            videos_resolved,
-            voice_count,
-            voice_resolved,
-            files_count,
-            files_resolved,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct ChatGroup {
-    name: String,
-    max_count: i64,
-    backups: Vec<BackupInfo>,
-}
-
-impl ChatGroup {
-    fn is_active(&self) -> bool {
-        self.backups.iter().any(|b| b.is_active)
-    }
-}
+use cache::{
+    cache_is_fresh, default_database_path, get_cache_path, get_clusters_cache_path,
+    get_media_cache_path,
+};
+use inventory::UnionFind;
+use model::{
+    ActiveChatView, ActiveComparison, AlignedMessageRow, BackupInfo, BackupMessage, CalcMessage,
+    ChatGroup, CompareMessage, LoadMessage, MediaCalcMessage, MediaStats, SingleChatMessage,
+};
 
 struct OverlapApp {
     db_path: String,
@@ -354,6 +31,8 @@ struct OverlapApp {
     calculating_overlaps: bool,
     rx: Option<std::sync::mpsc::Receiver<CalcMessage>>,
     cached_results: HashMap<String, Vec<String>>,
+    calculating_media: bool,
+    media_rx: Option<std::sync::mpsc::Receiver<MediaCalcMessage>>,
     loading_data: bool,
     load_rx: Option<std::sync::mpsc::Receiver<LoadMessage>>,
     active_comparison: Arc<Mutex<Option<ActiveComparison>>>,
@@ -366,9 +45,8 @@ struct OverlapApp {
 
 impl Default for OverlapApp {
     fn default() -> Self {
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
         OverlapApp {
-            db_path: format!("/media/{}/1b/sqlitedb/telegram_backup.db", user),
+            db_path: default_database_path(),
             groups: Vec::new(),
             filtered_groups: Vec::new(),
             selected_group_idx: None,
@@ -378,6 +56,8 @@ impl Default for OverlapApp {
             calculating_overlaps: false,
             rx: None,
             cached_results: HashMap::new(),
+            calculating_media: false,
+            media_rx: None,
             loading_data: false,
             load_rx: None,
             active_comparison: Arc::new(Mutex::new(None)),
@@ -391,12 +71,17 @@ impl Default for OverlapApp {
 }
 
 fn strip_boundaries(word: &str) -> String {
-    let start = word.find(|c: char| c.is_alphanumeric()).unwrap_or(word.len());
+    let start = word
+        .find(|c: char| c.is_alphanumeric())
+        .unwrap_or(word.len());
     let sub = &word[start..];
-    let end = sub.rfind(|c: char| c.is_alphanumeric()).map(|idx| {
-        let c = sub[idx..].chars().next().unwrap();
-        idx + c.len_utf8()
-    }).unwrap_or(0);
+    let end = sub
+        .rfind(|c: char| c.is_alphanumeric())
+        .map(|idx| {
+            let c = sub[idx..].chars().next().unwrap();
+            idx + c.len_utf8()
+        })
+        .unwrap_or(0);
     sub[..end].to_lowercase()
 }
 
@@ -405,21 +90,21 @@ fn clean_text_for_match(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    
+
     let trimmed = text.trim();
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         return trimmed.to_string();
     }
-    
+
     let mut clean = text.trim();
-    
+
     // 1. Strip legacy forwarded headers like {{FWD: ...}} at start
     if clean.starts_with("{{FWD:") {
         if let Some(end_fwd) = clean.find("}}") {
             clean = clean[end_fwd + 2..].trim_start();
         }
     }
-    
+
     // 2. Strip legacy double bracket prefixes/blocks like [[Webpage]] at start
     if clean.starts_with("[[") {
         if let Some(end_meta) = clean.find("]]") {
@@ -428,24 +113,23 @@ fn clean_text_for_match(text: &str) -> String {
     }
 
     let t = clean.to_lowercase();
-    
+
     // Compile regexes statically for fast reuse
     static URL_RE: OnceLock<Regex> = OnceLock::new();
-    let url_re = URL_RE.get_or_init(|| {
-        Regex::new(r#"(?i)(?:https?://|tel:|mailto:|tg:)[^\s'"“‘’”<>]+"#).unwrap()
-    });
-    
+    let url_re = URL_RE
+        .get_or_init(|| Regex::new(r#"(?i)(?:https?://|tel:|mailto:|tg:)[^\s'"“‘’”<>]+"#).unwrap());
+
     static DOMAIN_RE: OnceLock<Regex> = OnceLock::new();
     let domain_re = DOMAIN_RE.get_or_init(|| {
         Regex::new(r#"(?i)\b[a-z0-9\-]+\.[a-z]{2,24}(?:\.[a-z]{2,24})*\b"#).unwrap()
     });
-    
+
     // 1. Replace URLs with space
     let t_url = url_re.replace_all(&t, " ");
-    
+
     // 2. Replace Domains with space
     let t_dom = domain_re.replace_all(&t_url, " ");
-    
+
     // Stage 1: Split by whitespace, and deduplicate adjacent words using their boundary-stripped normalized form
     let words: Vec<&str> = t_dom.split_whitespace().collect();
     let mut stage1_words: Vec<&str> = Vec::new();
@@ -463,9 +147,9 @@ fn clean_text_for_match(text: &str) -> String {
             }
         }
     }
-    
+
     let t_stage1 = stage1_words.join(" ");
-    
+
     // Stage 2: Keep only alphanumeric characters and spaces
     let mut clean_chars = String::new();
     for c in t_stage1.chars() {
@@ -475,7 +159,7 @@ fn clean_text_for_match(text: &str) -> String {
             clean_chars.push(' ');
         }
     }
-    
+
     // Stage 3: Split, final adjacent deduplication, and join
     let final_words: Vec<&str> = clean_chars.split_whitespace().collect();
     let mut deduped: Vec<&str> = Vec::new();
@@ -486,7 +170,7 @@ fn clean_text_for_match(text: &str) -> String {
             deduped.push(w);
         }
     }
-    
+
     deduped.join(" ").trim().to_string()
 }
 
@@ -516,13 +200,20 @@ fn count_missing_messages(
     let mut stmt_b = conn.prepare(
         "SELECT timestamp_unix, text FROM messages WHERE chat_id = ? AND timestamp_unix BETWEEN ? AND ?"
     )?;
-    let mut rows_b = stmt_b.query(rusqlite::params![chat_b_id, start_unix - 3605, end_unix + 3605])?;
+    let mut rows_b = stmt_b.query(rusqlite::params![
+        chat_b_id,
+        start_unix - 3605,
+        end_unix + 3605
+    ])?;
     let mut b_by_ts: HashMap<i64, Vec<String>> = HashMap::new();
     while let Some(row) = rows_b.next()? {
         let ts: Option<i64> = row.get(0)?;
         let txt: Option<String> = row.get(1)?;
         if let Some(t) = ts {
-            b_by_ts.entry(t).or_default().push(clean_text_for_match(&txt.unwrap_or_default()));
+            b_by_ts
+                .entry(t)
+                .or_default()
+                .push(clean_text_for_match(&txt.unwrap_or_default()));
         }
     }
 
@@ -567,187 +258,799 @@ fn format_unix_to_ts(unix_ts: i64) -> String {
     }
 }
 
+struct ChatRow {
+    chat_id: String,
+    name: String,
+    path: Option<String>,
+    is_active: bool,
+    is_blacklisted: bool,
+    last_backup_unix: Option<i64>,
+    last_backup_run_unix: Option<i64>,
+    last_backup_run_status: String,
+    last_backup_source: String,
+    last_backup_confidence: String,
+    last_backup_evidence: String,
+    min_msg_id: Option<i64>,
+    max_msg_id: Option<i64>,
+    msg_count: Option<i64>,
+    min_timestamp: Option<String>,
+    max_timestamp: Option<String>,
+    min_timestamp_unix: Option<i64>,
+    max_timestamp_unix: Option<i64>,
+}
+
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
+        rusqlite::params![table],
+        |row| row.get(0),
+    )
+}
+
+fn ensure_blacklist_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS telegram_backup_blacklist (
+             target_key TEXT PRIMARY KEY,
+             peer_kind TEXT NOT NULL,
+             peer_id INTEGER NOT NULL,
+             title TEXT NOT NULL,
+             reason TEXT,
+             created_unix INTEGER NOT NULL,
+             UNIQUE(peer_kind, peer_id)
+         )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn blacklisted_chat_ids(conn: &rusqlite::Connection) -> Result<HashSet<String>, rusqlite::Error> {
+    if !table_exists(conn, "telegram_backup_targets")?
+        || !table_exists(conn, "telegram_backup_target_chats")?
+    {
+        return Ok(HashSet::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT targets.chat_id
+         FROM telegram_backup_targets AS targets
+         JOIN telegram_backup_blacklist AS blacklist
+           ON blacklist.target_key = targets.target_key
+           OR (blacklist.peer_kind = targets.peer_kind AND blacklist.peer_id = targets.peer_id)
+         UNION
+         SELECT DISTINCT links.chat_id
+         FROM telegram_backup_targets AS targets
+         JOIN telegram_backup_blacklist AS blacklist
+           ON blacklist.target_key = targets.target_key
+           OR (blacklist.peer_kind = targets.peer_kind AND blacklist.peer_id = targets.peer_id)
+         JOIN telegram_backup_target_chats AS links ON links.target_key = targets.target_key",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+fn set_chat_ids_blacklisted(
+    conn: &mut rusqlite::Connection,
+    chat_ids: &[String],
+    blacklisted: bool,
+) -> Result<usize, rusqlite::Error> {
+    ensure_blacklist_schema(conn)?;
+    let tx = conn.transaction()?;
+    let mut affected = 0;
+    for chat_id in chat_ids {
+        if blacklisted {
+            affected += tx.execute(
+                "INSERT OR IGNORE INTO telegram_backup_blacklist (
+                     target_key, peer_kind, peer_id, title, reason, created_unix
+                 )
+                 SELECT targets.target_key, targets.peer_kind, targets.peer_id,
+                        targets.title, 'Added in tgbackman', ?
+                 FROM telegram_backup_targets AS targets
+                 WHERE targets.chat_id = ? OR EXISTS (
+                     SELECT 1 FROM telegram_backup_target_chats AS links
+                     WHERE links.target_key = targets.target_key AND links.chat_id = ?
+                 )",
+                rusqlite::params![Utc::now().timestamp(), chat_id, chat_id],
+            )?;
+            tx.execute(
+                "UPDATE chats SET is_active=0 WHERE chat_id=?",
+                rusqlite::params![chat_id],
+            )?;
+        } else {
+            affected += tx.execute(
+                "DELETE FROM telegram_backup_blacklist
+                 WHERE target_key IN (
+                     SELECT targets.target_key
+                     FROM telegram_backup_targets AS targets
+                     WHERE targets.chat_id = ? OR EXISTS (
+                         SELECT 1 FROM telegram_backup_target_chats AS links
+                         WHERE links.target_key = targets.target_key AND links.chat_id = ?
+                     )
+                 )",
+                rusqlite::params![chat_id, chat_id],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(affected)
+}
+
+fn materialize_discovered_chats(conn: &rusqlite::Connection) -> Result<usize, rusqlite::Error> {
+    if !table_exists(conn, "telegram_backup_targets")?
+        || !table_exists(conn, "telegram_backup_target_chats")?
+    {
+        return Ok(0);
+    }
+
+    // Older `map --all` runs recorded unmatched Telegram dialogs as targets
+    // without adding them to `chats`, which is the GUI inventory and active
+    // selection table. Materialize enabled targets and disabled blacklist
+    // tombstones with no archive link. The latter must remain visible so the
+    // user can remove their never-back-up rule after purging their contents.
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO chats (
+             chat_id, chat_name, chat_type, backup_path, is_active,
+             last_backup_unix, msg_count
+         )
+         SELECT targets.chat_id,
+                targets.title,
+                CASE targets.peer_kind
+                    WHEN 'user' THEN 'personal_chat'
+                    ELSE targets.peer_kind
+                END,
+                targets.output_dir,
+                0,
+                NULL,
+                0
+         FROM telegram_backup_targets AS targets
+         WHERE (
+                 COALESCE(targets.enabled, 1) = 1
+                 OR EXISTS (
+                     SELECT 1 FROM telegram_backup_blacklist AS blacklist
+                     WHERE blacklist.target_key = targets.target_key
+                        OR (blacklist.peer_kind = targets.peer_kind AND blacklist.peer_id = targets.peer_id)
+                 )
+               )
+           AND NOT EXISTS (
+               SELECT 1 FROM telegram_backup_target_chats AS links
+               WHERE links.target_key = targets.target_key
+           )",
+        [],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO telegram_backup_target_chats (
+             target_key, chat_id, match_method, linked_unix
+         )
+         SELECT targets.target_key,
+                targets.chat_id,
+                'telegram-discovered',
+                ?
+         FROM telegram_backup_targets AS targets
+         JOIN chats ON chats.chat_id = targets.chat_id
+         WHERE (
+                 COALESCE(targets.enabled, 1) = 1
+                 OR EXISTS (
+                     SELECT 1 FROM telegram_backup_blacklist AS blacklist
+                     WHERE blacklist.target_key = targets.target_key
+                        OR (blacklist.peer_kind = targets.peer_kind AND blacklist.peer_id = targets.peer_id)
+                 )
+               )
+           AND NOT EXISTS (
+               SELECT 1 FROM telegram_backup_target_chats AS links
+               WHERE links.target_key = targets.target_key
+           )",
+        rusqlite::params![Utc::now().timestamp()],
+    )?;
+
+    Ok(inserted)
+}
+
+fn zero_message_migrated_predecessors(
+    conn: &rusqlite::Connection,
+) -> Result<HashSet<String>, rusqlite::Error> {
+    if !table_exists(conn, "telegram_backup_target_chats")? {
+        return Ok(HashSet::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT links.chat_id
+         FROM telegram_backup_target_chats AS links
+         WHERE links.match_method = 'telegram-migrated-from'
+           AND NOT EXISTS (
+               SELECT 1 FROM messages
+               WHERE messages.chat_id = links.chat_id
+           )",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+fn apply_authoritative_target_links(
+    conn: &rusqlite::Connection,
+    uf: &mut UnionFind,
+) -> Result<HashMap<String, String>, rusqlite::Error> {
+    if !table_exists(conn, "telegram_backup_targets")?
+        || !table_exists(conn, "telegram_backup_target_chats")?
+    {
+        return Ok(HashMap::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT targets.target_key, targets.title, links.chat_id
+         FROM telegram_backup_targets AS targets
+         JOIN telegram_backup_target_chats AS links
+           ON links.target_key = targets.target_key
+         WHERE COALESCE(targets.enabled, 1) = 1
+         ORDER BY targets.target_key, links.chat_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let links: Vec<(String, String, String)> = rows.collect::<Result<_, _>>()?;
+
+    let mut first_chat_by_target: HashMap<String, String> = HashMap::new();
+    for (target_key, _, chat_id) in &links {
+        if let Some(first_chat) = first_chat_by_target.get(target_key) {
+            uf.union(first_chat, chat_id);
+        } else {
+            first_chat_by_target.insert(target_key.clone(), chat_id.clone());
+        }
+    }
+
+    // Prefer the current Telegram title only when a logical group maps to one
+    // unambiguous enabled target. This keeps renamed predecessor archives under
+    // the current conversation name without guessing across unrelated targets.
+    let mut titles_by_root: HashMap<String, HashSet<String>> = HashMap::new();
+    for (_, title, chat_id) in links {
+        let root = uf.find(&chat_id);
+        titles_by_root.entry(root).or_default().insert(title);
+    }
+    Ok(titles_by_root
+        .into_iter()
+        .filter_map(|(root, titles)| {
+            if titles.len() == 1 {
+                Some((root, titles.into_iter().next().unwrap()))
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+/// Return the stable Telegram peer identity attached to each indexed chat.
+///
+/// Display names are mutable (and are not unique), while the peer kind/id is
+/// stable.  Keeping this mapping separate lets clustering avoid joining two
+/// unrelated conversations that happen to share a title.
+fn target_peer_identities(
+    conn: &rusqlite::Connection,
+) -> Result<HashMap<String, String>, rusqlite::Error> {
+    if !table_exists(conn, "telegram_backup_targets")?
+        || !table_exists(conn, "telegram_backup_target_chats")?
+    {
+        return Ok(HashMap::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT links.chat_id, targets.peer_kind, targets.peer_id
+         FROM telegram_backup_targets AS targets
+         JOIN telegram_backup_target_chats AS links
+           ON links.target_key = targets.target_key
+         UNION
+         SELECT targets.chat_id, targets.peer_kind, targets.peer_id
+         FROM telegram_backup_targets AS targets",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+
+    let mut identities = HashMap::new();
+    for row in rows {
+        let (chat_id, peer_kind, peer_id) = row?;
+        identities.insert(chat_id, format!("{}:{}", peer_kind, peer_id));
+    }
+    Ok(identities)
+}
+
+/// Return normalized target titles which are used by more than one stable
+/// Telegram peer.  These names must be shown with an identity suffix because
+/// a title alone cannot tell the conversations apart.
+fn ambiguous_target_title_norms(
+    conn: &rusqlite::Connection,
+) -> Result<HashSet<String>, rusqlite::Error> {
+    if !table_exists(conn, "telegram_backup_targets")? {
+        return Ok(HashSet::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT title, peer_kind, peer_id
+         FROM telegram_backup_targets",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+
+    let mut identities_by_title: HashMap<String, HashSet<String>> = HashMap::new();
+    for row in rows {
+        let (title, peer_kind, peer_id) = row?;
+        let norm = title.trim().to_lowercase();
+        if !norm.is_empty() {
+            identities_by_title
+                .entry(norm)
+                .or_default()
+                .insert(format!("{}:{}", peer_kind, peer_id));
+        }
+    }
+
+    Ok(identities_by_title
+        .into_iter()
+        .filter_map(|(title, identities)| (identities.len() > 1).then_some(title))
+        .collect())
+}
+
+fn ambiguous_target_roots(
+    conn: &rusqlite::Connection,
+    uf: &mut UnionFind,
+) -> Result<HashSet<String>, rusqlite::Error> {
+    if !table_exists(conn, "telegram_backup_targets")? {
+        return Ok(HashSet::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT title, peer_kind, peer_id, chat_id
+         FROM telegram_backup_targets",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    let mut identities_by_title: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut roots_by_title: HashMap<String, HashSet<String>> = HashMap::new();
+    for row in rows {
+        let (title, peer_kind, peer_id, chat_id) = row?;
+        let norm = title.trim().to_lowercase();
+        if norm.is_empty() {
+            continue;
+        }
+        identities_by_title
+            .entry(norm.clone())
+            .or_default()
+            .insert(format!("{}:{}", peer_kind, peer_id));
+        roots_by_title
+            .entry(norm)
+            .or_default()
+            .insert(uf.find(&chat_id));
+    }
+
+    let mut ambiguous_roots = HashSet::new();
+    for (title, identities) in identities_by_title {
+        if identities.len() > 1 {
+            if let Some(roots) = roots_by_title.remove(&title) {
+                ambiguous_roots.extend(roots);
+            }
+        }
+    }
+    Ok(ambiguous_roots)
+}
+
+fn incompatible_peer_identities(
+    first: &str,
+    second: &str,
+    identities: &HashMap<String, String>,
+) -> bool {
+    matches!((identities.get(first), identities.get(second)), (Some(a), Some(b)) if a != b)
+}
+
 // Main logic to parse DB and cluster aliased backups
-fn run_inventory(conn: &rusqlite::Connection) -> Result<Vec<ChatGroup>, rusqlite::Error> {
+fn run_inventory(
+    conn: &rusqlite::Connection,
+    db_path: &str,
+) -> Result<Vec<ChatGroup>, rusqlite::Error> {
     let start_total = std::time::Instant::now();
-    
-    let mut stmt = conn.prepare("SELECT chat_id, chat_name, backup_path, COALESCE(is_active, 0), last_backup_unix FROM chats")?;
+
+    let _ = conn.execute(
+        "ALTER TABLE chats ADD COLUMN is_active INTEGER DEFAULT 0;",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN last_backup_unix INTEGER;", []);
+    let _ = conn.execute(
+        "ALTER TABLE chats ADD COLUMN last_backup_run_unix INTEGER;",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chats ADD COLUMN last_backup_run_status TEXT;",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN last_backup_source TEXT;", []);
+    let _ = conn.execute(
+        "ALTER TABLE chats ADD COLUMN last_backup_confidence TEXT;",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chats ADD COLUMN last_backup_evidence TEXT;",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN min_msg_id INTEGER;", []);
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN max_msg_id INTEGER;", []);
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN msg_count INTEGER;", []);
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN min_timestamp TEXT;", []);
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN max_timestamp TEXT;", []);
+    let _ = conn.execute(
+        "ALTER TABLE chats ADD COLUMN min_timestamp_unix INTEGER;",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chats ADD COLUMN max_timestamp_unix INTEGER;",
+        [],
+    );
+
+    ensure_blacklist_schema(conn)?;
+    let discovered = materialize_discovered_chats(conn)?;
+    if discovered > 0 {
+        println!(
+            "Added {} Telegram-discovered chat(s) with no backup to the inventory.",
+            discovered
+        );
+    }
+    let blacklisted_chat_ids = blacklisted_chat_ids(conn)?;
+    let hidden_migrated_chats = zero_message_migrated_predecessors(conn)?;
+    if !hidden_migrated_chats.is_empty() {
+        println!(
+            "Hiding {} zero-message migrated predecessor(s) from the inventory.",
+            hidden_migrated_chats.len()
+        );
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT chat_id, chat_name, backup_path, COALESCE(is_active, 0), last_backup_unix, \
+         last_backup_run_unix, COALESCE(last_backup_run_status, ''), \
+         min_msg_id, max_msg_id, msg_count, min_timestamp, max_timestamp, min_timestamp_unix, max_timestamp_unix, \
+         COALESCE(last_backup_source, ''), COALESCE(last_backup_confidence, ''), \
+         COALESCE(last_backup_evidence, '') FROM chats"
+    )?;
     let mut rows = stmt.query([])?;
     let mut chats = Vec::new();
-    let mut mtime_calls = 0;
-    let mut mtime_time = std::time::Duration::ZERO;
-    
+
     while let Some(row) = rows.next()? {
         let chat_id: String = row.get(0)?;
+        if hidden_migrated_chats.contains(&chat_id) {
+            continue;
+        }
         let name: Option<String> = row.get(1)?;
         let path: Option<String> = row.get(2)?;
         let active: i32 = row.get(3)?;
-        let mut last_backup: Option<i64> = row.get(4)?;
-        
-        if last_backup.is_none() {
-            let start_m = std::time::Instant::now();
-            mtime_calls += 1;
-            if let Some(ts) = get_backup_execution_time(path.as_deref().unwrap_or("")) {
-                let _ = conn.execute("UPDATE chats SET last_backup_unix = ? WHERE chat_id = ?", rusqlite::params![ts, chat_id]);
-                last_backup = Some(ts);
-            }
-            mtime_time += start_m.elapsed();
-        }
-        
-        chats.push((chat_id, name.unwrap_or_default(), path, active != 0, last_backup));
+        let last_backup: Option<i64> = row.get(4)?;
+        let last_backup_run: Option<i64> = row.get(5)?;
+        let last_backup_run_status: String = row.get(6)?;
+        let min_msg_id: Option<i64> = row.get(7)?;
+        let max_msg_id: Option<i64> = row.get(8)?;
+        let msg_count: Option<i64> = row.get(9)?;
+        let min_timestamp: Option<String> = row.get(10)?;
+        let max_timestamp: Option<String> = row.get(11)?;
+        let min_timestamp_unix: Option<i64> = row.get(12)?;
+        let max_timestamp_unix: Option<i64> = row.get(13)?;
+        let last_backup_source: String = row.get(14)?;
+        let last_backup_confidence: String = row.get(15)?;
+        let last_backup_evidence: String = row.get(16)?;
+
+        chats.push(ChatRow {
+            is_blacklisted: blacklisted_chat_ids.contains(&chat_id),
+            chat_id,
+            name: name.unwrap_or_default(),
+            path,
+            is_active: active != 0,
+            last_backup_unix: last_backup,
+            last_backup_run_unix: last_backup_run,
+            last_backup_run_status,
+            last_backup_source,
+            last_backup_confidence,
+            last_backup_evidence,
+            min_msg_id,
+            max_msg_id,
+            msg_count,
+            min_timestamp,
+            max_timestamp,
+            min_timestamp_unix,
+            max_timestamp_unix,
+        });
     }
-    
-    println!("Phase 1 (Chats fetch + mtimes): {:?}", start_total.elapsed());
-    println!("  -> mtime calls: {}, time: {:?}", mtime_calls, mtime_time);
-    
+
+    println!("Phase 1 (Chats fetch): {:?}", start_total.elapsed());
+
+    let target_peer_identities = target_peer_identities(conn)?;
+    let ambiguous_target_titles = ambiguous_target_title_norms(conn)?;
+
     let start_fuzzy = std::time::Instant::now();
     let mut uf = UnionFind::new();
+    let clusters_cache_path = get_clusters_cache_path(db_path);
 
-    // 1. FUZZY ALIAS LINKING via oldest signatures
-    let mut exact_signatures: HashMap<(i64, String), Vec<String>> = HashMap::new();
-    for (cid, _, _, _, _) in &chats {
+    let mut loaded_cache = false;
+    if cache_is_fresh(&clusters_cache_path, db_path) {
+        if let Ok(file) = std::fs::File::open(&clusters_cache_path) {
+            if let Ok(parent_map) = serde_json::from_reader::<_, HashMap<String, String>>(file) {
+                uf.parent = parent_map;
+                loaded_cache = true;
+                println!("Loaded cached chat clusters from {}", clusters_cache_path);
+
+                // A cache written before stable peer identities were enforced
+                // may have merged two unrelated same-title peers.  Reject it
+                // rather than displaying a stale duplicate collapse.
+                let mut identities_by_root: HashMap<String, HashSet<String>> = HashMap::new();
+                for chat in &chats {
+                    if let Some(identity) = target_peer_identities.get(&chat.chat_id) {
+                        let root = uf.find(&chat.chat_id);
+                        identities_by_root
+                            .entry(root)
+                            .or_default()
+                            .insert(identity.clone());
+                    }
+                }
+                if identities_by_root.values().any(|set| set.len() > 1) {
+                    println!("Ignoring chat-cluster cache containing unrelated Telegram peers.");
+                    uf = UnionFind::new();
+                    loaded_cache = false;
+                }
+            }
+        }
+    } else if std::path::Path::new(&clusters_cache_path).exists() {
+        println!("Ignoring stale chat-cluster cache: {}", clusters_cache_path);
+    }
+
+    if !loaded_cache {
+        // 1. FUZZY ALIAS LINKING via oldest signatures
+        let mut exact_signatures: HashMap<(i64, String), Vec<String>> = HashMap::new();
         let mut stmt_msgs = conn.prepare(
             "SELECT timestamp_unix, text FROM messages WHERE chat_id = ? AND text != '' AND timestamp_unix IS NOT NULL ORDER BY timestamp_unix ASC LIMIT 50"
         )?;
-        let mut rows_msgs = stmt_msgs.query(rusqlite::params![cid])?;
-        while let Some(row) = rows_msgs.next()? {
-            let ts: i64 = row.get(0)?;
-            let text: String = row.get(1)?;
-            let clean_text = text.trim();
-            if clean_text.len() >= 6 {
-                exact_signatures.entry((ts, clean_text.to_string())).or_default().push(cid.clone());
-            }
-        }
-    }
-
-    let mut exact_shared_counts: HashMap<(String, String), i32> = HashMap::new();
-    for (_, cids) in exact_signatures {
-        if cids.len() < 2 {
-            continue;
-        }
-        let unique_cids: HashSet<String> = cids.into_iter().collect();
-        let unique_cids: Vec<String> = unique_cids.into_iter().collect();
-        for i in 0..unique_cids.len() {
-            for j in i + 1..unique_cids.len() {
-                let c1 = unique_cids[i].clone();
-                let c2 = unique_cids[j].clone();
-                let pair = if c1 < c2 { (c1, c2) } else { (c2, c1) };
-                *exact_shared_counts.entry(pair).or_default() += 1;
-            }
-        }
-    }
-
-    for (pair, count) in exact_shared_counts {
-        if count >= 3 {
-            uf.union(&pair.0, &pair.1);
-        }
-    }
-    
-    println!("Phase 2 (Fuzzy linking): {:?}", start_fuzzy.elapsed());
-    
-    let start_joins = std::time::Instant::now();
-
-    // 2. SAME-NAME DUPLICATES LINKING
-    let mut chats_by_norm_name: HashMap<String, Vec<String>> = HashMap::new();
-    for (cid, name, _, _, _) in &chats {
-        if !name.is_empty() {
-            let norm = name.trim().to_lowercase();
-            if norm != "deleted account" && norm != "telegram" && norm != "group" && norm != "unknown" {
-                chats_by_norm_name.entry(norm).or_default().push(cid.clone());
-            }
-        }
-    }
-
-    for (_, cids) in chats_by_norm_name {
-        if cids.len() < 2 {
-            continue;
-        }
-        for i in 0..cids.len() {
-            for j in i + 1..cids.len() {
-                let c1 = &cids[i];
-                let c2 = &cids[j];
-                if uf.find(c1) == uf.find(c2) {
-                    continue;
-                }
-                let mut stmt_join = conn.prepare(
-                    "SELECT COUNT(*) FROM messages a JOIN messages b ON a.timestamp_unix = b.timestamp_unix WHERE a.chat_id = ? AND b.chat_id = ? AND a.text = b.text AND a.text != '' AND length(a.text) >= 6"
-                )?;
-                let count: i64 = stmt_join.query_row(rusqlite::params![c1, c2], |r| r.get(0))?;
-                if count >= 3 {
-                    uf.union(c1, c2);
+        for c in &chats {
+            let mut rows_msgs = stmt_msgs.query(rusqlite::params![c.chat_id])?;
+            while let Some(row) = rows_msgs.next()? {
+                let ts: i64 = row.get(0)?;
+                let text: String = row.get(1)?;
+                let clean_text = text.trim();
+                if clean_text.len() >= 6 {
+                    exact_signatures
+                        .entry((ts, clean_text.to_string()))
+                        .or_default()
+                        .push(c.chat_id.clone());
                 }
             }
         }
+
+        let mut exact_shared_counts: HashMap<(String, String), i32> = HashMap::new();
+        for (_, cids) in exact_signatures {
+            if cids.len() < 2 {
+                continue;
+            }
+            let unique_cids: HashSet<String> = cids.into_iter().collect();
+            let unique_cids: Vec<String> = unique_cids.into_iter().collect();
+            for i in 0..unique_cids.len() {
+                for j in i + 1..unique_cids.len() {
+                    let c1 = unique_cids[i].clone();
+                    let c2 = unique_cids[j].clone();
+                    if incompatible_peer_identities(&c1, &c2, &target_peer_identities) {
+                        continue;
+                    }
+                    let pair = if c1 < c2 { (c1, c2) } else { (c2, c1) };
+                    *exact_shared_counts.entry(pair).or_default() += 1;
+                }
+            }
+        }
+
+        for (pair, count) in exact_shared_counts {
+            if count >= 3 {
+                uf.union(&pair.0, &pair.1);
+            }
+        }
+
+        println!("Phase 2 (Fuzzy linking): {:?}", start_fuzzy.elapsed());
+
+        let start_joins = std::time::Instant::now();
+
+        // 2. SAME-NAME DUPLICATES LINKING
+        let mut chats_by_norm_name: HashMap<String, Vec<String>> = HashMap::new();
+        for c in &chats {
+            if !c.name.is_empty() {
+                let norm = c.name.trim().to_lowercase();
+                if norm != "deleted account"
+                    && norm != "telegram"
+                    && norm != "group"
+                    && norm != "unknown"
+                {
+                    chats_by_norm_name
+                        .entry(norm)
+                        .or_default()
+                        .push(c.chat_id.clone());
+                }
+            }
+        }
+
+        let mut stmt_join = conn.prepare(
+            "SELECT COUNT(*) FROM messages a JOIN messages b ON a.timestamp_unix = b.timestamp_unix WHERE a.chat_id = ? AND b.chat_id = ? AND a.text = b.text AND a.text != '' AND length(a.text) >= 6"
+        )?;
+
+        for (_, cids) in chats_by_norm_name {
+            if cids.len() < 2 {
+                continue;
+            }
+            for i in 0..cids.len() {
+                for j in i + 1..cids.len() {
+                    let c1 = &cids[i];
+                    let c2 = &cids[j];
+                    if incompatible_peer_identities(c1, c2, &target_peer_identities) {
+                        continue;
+                    }
+                    if uf.find(c1) == uf.find(c2) {
+                        continue;
+                    }
+                    let count: i64 =
+                        stmt_join.query_row(rusqlite::params![c1, c2], |r| r.get(0))?;
+                    if count >= 3 {
+                        uf.union(c1, c2);
+                    }
+                }
+            }
+        }
+
+        println!("Phase 3 (Same-name joins): {:?}", start_joins.elapsed());
+    } else {
+        println!(
+            "Phase 2 & 3 (Clustering): skipped (loaded from cache in {:?})",
+            start_fuzzy.elapsed()
+        );
     }
-    
-    println!("Phase 3 (Same-name joins): {:?}", start_joins.elapsed());
-    
+
+    let preferred_group_names = apply_authoritative_target_links(conn, &mut uf)?;
+    let ambiguous_target_roots = ambiguous_target_roots(conn, &mut uf)?;
+
     let start_stats = std::time::Instant::now();
 
-    // Query stats for all chats in a single GROUP BY query to avoid N separate scans
+    // Query fresh stats for every chat. The cached columns are denormalized
+    // display data and can be stale after an API exporter writes directly to
+    // `messages`; trusting them hides newly imported messages and dates.
+    let _ = conn.execute("BEGIN TRANSACTION;", []);
+
     let mut stats_map = HashMap::new();
-    let mut stmt_stats = conn.prepare(
-        "SELECT chat_id, MIN(message_id), MAX(message_id), COUNT(*), MIN(timestamp), MAX(timestamp), MIN(timestamp_unix), MAX(timestamp_unix) FROM messages GROUP BY chat_id"
+    let mut stmt_update_stats = conn.prepare(
+        "UPDATE chats SET min_msg_id = ?, max_msg_id = ?, msg_count = ?, min_timestamp = ?, max_timestamp = ?, min_timestamp_unix = ?, max_timestamp_unix = ? WHERE chat_id = ?"
     )?;
-    let mut rows_stats = stmt_stats.query([])?;
-    while let Some(row) = rows_stats.next()? {
-        let cid: String = row.get(0)?;
-        let min_id: Option<i64> = row.get(1)?;
-        let max_id: Option<i64> = row.get(2)?;
-        let count: i64 = row.get(3)?;
-        let min_ts: Option<String> = row.get(4)?;
-        let max_ts: Option<String> = row.get(5)?;
-        let min_unix: Option<i64> = row.get(6)?;
-        let max_unix: Option<i64> = row.get(7)?;
-        
-        stats_map.insert(cid, (min_id, max_id, count, min_ts, max_ts, min_unix, max_unix));
+    let mut stmt_calc_stats = conn.prepare(
+        "SELECT MIN(message_id), MAX(message_id), COUNT(*), MIN(timestamp), MAX(timestamp), MIN(timestamp_unix), MAX(timestamp_unix) FROM messages WHERE chat_id = ?"
+    )?;
+
+    for c in &chats {
+        let mut rows_calc = stmt_calc_stats.query(rusqlite::params![c.chat_id])?;
+        if let Some(row) = rows_calc.next()? {
+            let min_id: Option<i64> = row.get(0)?;
+            let max_id: Option<i64> = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            let min_ts: Option<String> = row.get(3)?;
+            let max_ts: Option<String> = row.get(4)?;
+            let min_unix: Option<i64> = row.get(5)?;
+            let max_unix: Option<i64> = row.get(6)?;
+
+            let stats_changed = c.min_msg_id != min_id
+                || c.max_msg_id != max_id
+                || c.msg_count != Some(count)
+                || c.min_timestamp != min_ts
+                || c.max_timestamp != max_ts
+                || c.min_timestamp_unix != min_unix
+                || c.max_timestamp_unix != max_unix;
+            if stats_changed {
+                stmt_update_stats.execute(rusqlite::params![
+                    min_id, max_id, count, &min_ts, &max_ts, min_unix, max_unix, c.chat_id
+                ])?;
+            }
+            stats_map.insert(
+                c.chat_id.clone(),
+                (min_id, max_id, count, min_ts, max_ts, min_unix, max_unix),
+            );
+        }
     }
+
+    let _ = conn.execute("COMMIT TRANSACTION;", []);
 
     // Mappings and Stats
     let mut logical_groups: HashMap<String, Vec<BackupInfo>> = HashMap::new();
-    for (cid, name, path, is_active, last_backup_unix) in chats {
+    for c in chats {
+        let cid = c.chat_id;
+        let name = c.name;
+        let path = c.path;
+        let is_active = c.is_active;
+        let is_blacklisted = c.is_blacklisted;
+        let last_backup_unix = c.last_backup_unix;
+        let last_backup_run_unix = c.last_backup_run_unix;
+        let last_backup_run_status = c.last_backup_run_status;
+        let last_backup_source = c.last_backup_source;
+        let last_backup_confidence = c.last_backup_confidence;
+        let last_backup_evidence = c.last_backup_evidence;
+
         let norm_name = name.trim().to_lowercase();
-        if (norm_name == "deleted account" || norm_name == "telegram" || norm_name == "group" || norm_name == "unknown") && uf.find(&cid) == cid {
+        let has_messages = stats_map
+            .get(&cid)
+            .is_some_and(|(_, _, count, _, _, _, _)| *count > 0);
+        if has_messages
+            && (norm_name == "deleted account"
+                || norm_name == "telegram"
+                || norm_name == "group"
+                || norm_name == "unknown")
+            && uf.find(&cid) == cid
+        {
             continue;
         }
-        
+
         let root = uf.find(&cid);
-        
+
         if let Some(stats) = stats_map.get(&cid) {
             let (min_id, max_id, count, min_ts, max_ts, min_unix, max_unix) = stats;
-            if min_id.is_some() && *count > 0 {
-                let format_ts = |ts_str: &Option<String>| -> String {
-                    match ts_str {
-                        Some(s) => s.replace("T", " ").replace("Z", ""),
-                        None => "Unknown".to_string()
-                    }
-                };
-                
-                logical_groups.entry(root).or_default().push(BackupInfo {
-                    chat_id: cid,
-                    name: if name.is_empty() { "Unknown".to_string() } else { name },
-                    path: path.unwrap_or_default(),
-                    min_id: *min_id,
-                    max_id: *max_id,
-                    count: *count,
-                    min_ts: format_ts(min_ts),
-                    max_ts: format_ts(max_ts),
-                    min_unix: *min_unix,
-                    max_unix: *max_unix,
-                    is_active,
-                    last_backup_unix,
-                    media_stats: None,
-                });
-            }
+            let format_ts = |ts_str: &Option<String>| -> String {
+                match ts_str {
+                    Some(s) => s.replace("T", " ").replace("Z", ""),
+                    None => "Unknown".to_string(),
+                }
+            };
+
+            logical_groups.entry(root).or_default().push(BackupInfo {
+                chat_id: cid.clone(),
+                name: if name.is_empty() {
+                    "Unknown".to_string()
+                } else if ambiguous_target_titles.contains(&norm_name) {
+                    target_peer_identities
+                        .get(&cid)
+                        .map(|identity| format!("{} [{}]", name, identity))
+                        .unwrap_or_else(|| name.clone())
+                } else {
+                    name.clone()
+                },
+                path: path.clone().unwrap_or_default(),
+                min_id: *min_id,
+                max_id: *max_id,
+                count: *count,
+                min_ts: format_ts(min_ts),
+                max_ts: format_ts(max_ts),
+                min_unix: *min_unix,
+                max_unix: *max_unix,
+                is_active,
+                is_blacklisted,
+                last_backup_unix,
+                last_backup_run_unix,
+                last_backup_run_status,
+                last_backup_source,
+                last_backup_confidence,
+                last_backup_evidence,
+                media_stats: None,
+            });
         }
     }
-    
+
     println!("Phase 4 (Stats queries): {:?}", start_stats.elapsed());
-    
+
+    // Keep the cluster cache newer than the database writes above. This also
+    // refreshes a previously loaded cache so the next load can safely reuse it.
+    if let Ok(file) = std::fs::File::create(&clusters_cache_path) {
+        let _ = serde_json::to_writer_pretty(file, &uf.parent);
+    }
+
     let start_groups = std::time::Instant::now();
 
     let mut result_groups = Vec::new();
-    for (_, mut entries) in logical_groups {
+    for (root, mut entries) in logical_groups {
         if entries.is_empty() {
             continue;
         }
@@ -756,8 +1059,15 @@ fn run_inventory(conn: &rusqlite::Connection) -> Result<Vec<ChatGroup>, rusqlite
         let names: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
         let mut names_vec: Vec<String> = names.into_iter().collect();
         names_vec.sort();
-        let display_name = names_vec.join(" / ");
-        
+        let display_name = if ambiguous_target_roots.contains(&root) {
+            names_vec.join(" / ")
+        } else {
+            preferred_group_names
+                .get(&root)
+                .cloned()
+                .unwrap_or_else(|| names_vec.join(" / "))
+        };
+
         result_groups.push(ChatGroup {
             name: display_name,
             max_count,
@@ -766,30 +1076,129 @@ fn run_inventory(conn: &rusqlite::Connection) -> Result<Vec<ChatGroup>, rusqlite
     }
 
     result_groups.sort_by(|a, b| b.max_count.cmp(&a.max_count));
-    println!("Phase 5 (Grouping + final sorting): {:?}", start_groups.elapsed());
-    
+    println!(
+        "Phase 5 (Grouping + final sorting): {:?}",
+        start_groups.elapsed()
+    );
+
     Ok(result_groups)
 }
 
 impl OverlapApp {
     fn load_cache(&mut self) {
+        self.cached_results.clear();
         let cache_path = get_cache_path(&self.db_path);
-        if let Ok(file) = std::fs::File::open(&cache_path) {
-            if let Ok(cache) = serde_json::from_reader(file) {
-                self.cached_results = cache;
-                self.status_msg = format!("Loaded database and found cached overlaps for {} groups.", self.cached_results.len());
-                return;
+        if cache_is_fresh(&cache_path, &self.db_path) {
+            if let Ok(file) = std::fs::File::open(&cache_path) {
+                if let Ok(cache) = serde_json::from_reader(file) {
+                    self.cached_results = cache;
+                    self.status_msg = format!(
+                        "Loaded database and found cached overlaps for {} groups.",
+                        self.cached_results.len()
+                    );
+                    return;
+                }
             }
         }
-        self.cached_results.clear();
-        self.status_msg = "Database loaded. No cached overlaps found. Click '🔄 Recompute All Overlaps'.".to_string();
+        self.status_msg =
+            "Database loaded. No cached overlaps found. Click '🔄 Recompute All Overlaps'."
+                .to_string();
+    }
+
+    fn load_media_cache(&mut self) {
+        for group in &mut self.groups {
+            for backup in &mut group.backups {
+                backup.media_stats = None;
+            }
+        }
+        let cache_path = get_media_cache_path(&self.db_path);
+        if cache_is_fresh(&cache_path, &self.db_path) {
+            if let Ok(file) = std::fs::File::open(&cache_path) {
+                if let Ok(cache) = serde_json::from_reader::<_, HashMap<String, MediaStats>>(file) {
+                    for group in &mut self.groups {
+                        for b in &mut group.backups {
+                            let key = format!("{}:{}", b.chat_id, b.path);
+                            if let Some(stats) = cache.get(&key) {
+                                b.media_stats = Some(stats.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn recompute_all_media_stats(&mut self, ctx: egui::Context) {
+        self.calculating_media = true;
+        self.status_msg = "Starting media stats calculation...".to_string();
+
+        let db_path = self.db_path.clone();
+        let groups = self.groups.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.media_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let mut all_stats = HashMap::new();
+
+            // Collect all backups
+            let mut backups_to_calc = Vec::new();
+            for group in &groups {
+                for b in &group.backups {
+                    backups_to_calc.push(b.clone());
+                }
+            }
+
+            let total = backups_to_calc.len();
+            for (idx, b) in backups_to_calc.iter().enumerate() {
+                let msg = format!(
+                    "Recomputing media stats: {} of {} ({})",
+                    idx + 1,
+                    total,
+                    b.name
+                );
+                let _ = tx.send(MediaCalcMessage::Progress(msg));
+                ctx.request_repaint();
+
+                let stats = b.compute_media_stats(&db_path);
+                let key = format!("{}:{}", b.chat_id, b.path);
+                all_stats.insert(key, stats);
+            }
+
+            // Write cache to file
+            let cache_path = get_media_cache_path(&db_path);
+            match std::fs::File::create(&cache_path) {
+                Ok(file) => {
+                    if let Err(e) = serde_json::to_writer_pretty(file, &all_stats) {
+                        let _ = tx.send(MediaCalcMessage::Error(format!(
+                            "Failed to write cache: {}",
+                            e
+                        )));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(MediaCalcMessage::Error(format!(
+                        "Failed to create cache file: {}",
+                        e
+                    )));
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+
+            let _ = tx.send(MediaCalcMessage::Finished(all_stats));
+            ctx.request_repaint();
+        });
     }
 
     fn select_group(&mut self, idx: usize) {
         self.selected_group_idx = Some(idx);
         let group = &self.groups[idx];
         if group.backups.len() < 2 {
-            self.comparison_results = vec!["Only 1 backup available in this group. No overlap analysis needed.".to_string()];
+            self.comparison_results = vec![
+                "Only 1 backup available in this group. No overlap analysis needed.".to_string(),
+            ];
         } else if let Some(results) = self.cached_results.get(&group.name) {
             self.comparison_results = results.clone();
         } else {
@@ -823,11 +1232,17 @@ impl OverlapApp {
             let _ = conn.execute("PRAGMA temp_store = MEMORY;", []);
 
             let mut all_results = HashMap::new();
-            let groups_to_calc: Vec<&ChatGroup> = groups.iter().filter(|g| g.backups.len() >= 2).collect();
+            let groups_to_calc: Vec<&ChatGroup> =
+                groups.iter().filter(|g| g.backups.len() >= 2).collect();
             let total_to_calc = groups_to_calc.len();
 
             for (idx, group) in groups_to_calc.into_iter().enumerate() {
-                let msg = format!("Recomputing: group {} of {} ({})", idx + 1, total_to_calc, group.name);
+                let msg = format!(
+                    "Recomputing: group {} of {} ({})",
+                    idx + 1,
+                    total_to_calc,
+                    group.name
+                );
                 let _ = tx.send(CalcMessage::Progress(msg));
                 ctx.request_repaint();
 
@@ -836,11 +1251,13 @@ impl OverlapApp {
                     for j in i + 1..group.backups.len() {
                         let a = &group.backups[i];
                         let b = &group.backups[j];
-                        
+
                         let letter_a = (b'A' + i as u8) as char;
                         let letter_b = (b'A' + j as u8) as char;
 
-                        if let (Some(a_min), Some(a_max), Some(b_min), Some(b_max)) = (a.min_unix, a.max_unix, b.min_unix, b.max_unix) {
+                        if let (Some(a_min), Some(a_max), Some(b_min), Some(b_max)) =
+                            (a.min_unix, a.max_unix, b.min_unix, b.max_unix)
+                        {
                             let mut a_contains_b = false;
                             let mut b_contains_a = false;
                             if a_min <= b_min + 86400 && a_max >= b_max - 86400 {
@@ -855,15 +1272,28 @@ impl OverlapApp {
                             if overlap_start <= overlap_end {
                                 let overlap_days = (overlap_end - overlap_start) as f64 / 86400.0;
                                 let relationship = if b_contains_a {
-                                    format!("Backup {} fully contains the chronological span of Backup {}!", letter_b, letter_a)
+                                    format!(
+                                        "Backup {} fully contains the chronological span of Backup {}!",
+                                        letter_b, letter_a
+                                    )
                                 } else if a_contains_b {
-                                    format!("Backup {} fully contains the chronological span of Backup {}!", letter_a, letter_b)
+                                    format!(
+                                        "Backup {} fully contains the chronological span of Backup {}!",
+                                        letter_a, letter_b
+                                    )
                                 } else {
-                                    format!("Backup {} and Backup {} overlap chronologically by {:.1} days!", letter_a, letter_b, overlap_days)
+                                    format!(
+                                        "Backup {} and Backup {} overlap chronologically by {:.1} days!",
+                                        letter_a, letter_b, overlap_days
+                                    )
                                 };
 
                                 results.push(format!("⚖️ {}", relationship));
-                                results.push(format!("    Overlap span: {} to {}", format_unix_to_ts(overlap_start), format_unix_to_ts(overlap_end)));
+                                results.push(format!(
+                                    "    Overlap span: {} to {}",
+                                    format_unix_to_ts(overlap_start),
+                                    format_unix_to_ts(overlap_end)
+                                ));
 
                                 match count_missing_messages(&conn, &a.chat_id, &b.chat_id, overlap_start, overlap_end) {
                                     Ok(missing_a_in_b) => {
@@ -886,7 +1316,10 @@ impl OverlapApp {
                                     Err(e) => results.push(format!("    ❌ ERROR: Failed to count missing messages for Backup B: {}", e))
                                 }
                             } else {
-                                results.push(format!("⚠️ Backup {} and Backup {} do not overlap chronologically.", letter_a, letter_b));
+                                results.push(format!(
+                                    "⚠️ Backup {} and Backup {} do not overlap chronologically.",
+                                    letter_a, letter_b
+                                ));
                             }
                         }
                         results.push("".to_string()); // Divider
@@ -911,7 +1344,8 @@ impl OverlapApp {
             self.filtered_groups = (0..self.groups.len()).collect();
         } else {
             let query = self.search_query.to_lowercase();
-            self.filtered_groups = self.groups
+            self.filtered_groups = self
+                .groups
                 .iter()
                 .enumerate()
                 .filter(|(_, g)| g.name.to_lowercase().contains(&query))
@@ -924,6 +1358,7 @@ impl OverlapApp {
         self.loading_data = true;
         self.status_msg = "Opening database...".to_string();
         self.groups.clear();
+        self.filtered_groups.clear();
         self.selected_group_idx = None;
         self.comparison_results.clear();
 
@@ -939,8 +1374,32 @@ impl OverlapApp {
                 Ok(c) => {
                     let _ = c.execute("PRAGMA cache_size = -1048576;", []);
                     let _ = c.execute("PRAGMA temp_store = MEMORY;", []);
-                    let _ = c.execute("ALTER TABLE chats ADD COLUMN is_active INTEGER DEFAULT 0;", []);
+                    let _ = c.execute(
+                        "ALTER TABLE chats ADD COLUMN is_active INTEGER DEFAULT 0;",
+                        [],
+                    );
                     let _ = c.execute("ALTER TABLE chats ADD COLUMN last_backup_unix INTEGER;", []);
+                    let _ = c.execute(
+                        "ALTER TABLE chats ADD COLUMN last_backup_run_unix INTEGER;",
+                        [],
+                    );
+                    let _ = c.execute(
+                        "ALTER TABLE chats ADD COLUMN last_backup_run_status TEXT;",
+                        [],
+                    );
+                    let _ = c.execute("ALTER TABLE chats ADD COLUMN min_msg_id INTEGER;", []);
+                    let _ = c.execute("ALTER TABLE chats ADD COLUMN max_msg_id INTEGER;", []);
+                    let _ = c.execute("ALTER TABLE chats ADD COLUMN msg_count INTEGER;", []);
+                    let _ = c.execute("ALTER TABLE chats ADD COLUMN min_timestamp TEXT;", []);
+                    let _ = c.execute("ALTER TABLE chats ADD COLUMN max_timestamp TEXT;", []);
+                    let _ = c.execute(
+                        "ALTER TABLE chats ADD COLUMN min_timestamp_unix INTEGER;",
+                        [],
+                    );
+                    let _ = c.execute(
+                        "ALTER TABLE chats ADD COLUMN max_timestamp_unix INTEGER;",
+                        [],
+                    );
                     c
                 }
                 Err(e) => {
@@ -950,15 +1409,20 @@ impl OverlapApp {
                 }
             };
 
-            let _ = tx.send(LoadMessage::Loading("Scanning backup folders and calculating timeline boundaries...".to_string()));
+            let _ = tx.send(LoadMessage::Loading(
+                "Scanning backup folders and calculating timeline boundaries...".to_string(),
+            ));
             ctx.request_repaint();
 
-            match run_inventory(&conn) {
+            match run_inventory(&conn, &db_path) {
                 Ok(groups) => {
                     let _ = tx.send(LoadMessage::Finished(groups));
                 }
                 Err(e) => {
-                    let _ = tx.send(LoadMessage::Error(format!("Failed to run inventory: {}", e)));
+                    let _ = tx.send(LoadMessage::Error(format!(
+                        "Failed to run inventory: {}",
+                        e
+                    )));
                 }
             }
             ctx.request_repaint();
@@ -970,18 +1434,21 @@ impl OverlapApp {
             let group = &self.groups[group_idx];
             let backup_a = &group.backups[idx_a];
             let backup_b = &group.backups[idx_b];
-            
+
             let letter_a = (b'A' + idx_a as u8) as char;
             let letter_b = (b'A' + idx_b as u8) as char;
 
             self.loading_comparison = true;
-            self.status_msg = format!("Loading side-by-side messages for {} vs {}...", letter_a, letter_b);
+            self.status_msg = format!(
+                "Loading side-by-side messages for {} vs {}...",
+                letter_a, letter_b
+            );
 
             let db_path = self.db_path.clone();
-            
+
             let chat_a_id = backup_a.chat_id.clone();
             let chat_b_id = backup_b.chat_id.clone();
-            
+
             let min_a = backup_a.min_unix.unwrap_or(0);
             let max_a = backup_a.max_unix.unwrap_or(0);
             let min_b = backup_b.min_unix.unwrap_or(0);
@@ -989,7 +1456,7 @@ impl OverlapApp {
 
             let start_unix = min_a.max(min_b);
             let end_unix = max_a.min(max_b);
-            
+
             let backup_a_name = format!("Backup {} ({})", letter_a, backup_a.name);
             let backup_b_name = format!("Backup {} ({})", letter_b, backup_b.name);
 
@@ -997,7 +1464,9 @@ impl OverlapApp {
             self.compare_rx = Some(rx);
 
             std::thread::spawn(move || {
-                let _ = tx.send(CompareMessage::Loading("Connecting to database...".to_string()));
+                let _ = tx.send(CompareMessage::Loading(
+                    "Connecting to database...".to_string(),
+                ));
                 ctx.request_repaint();
 
                 let conn = match rusqlite::Connection::open(&db_path) {
@@ -1009,7 +1478,9 @@ impl OverlapApp {
                     }
                 };
 
-                let _ = tx.send(CompareMessage::Loading("Fetching Backup A messages in overlap range...".to_string()));
+                let _ = tx.send(CompareMessage::Loading(
+                    "Fetching Backup A messages in overlap range...".to_string(),
+                ));
                 ctx.request_repaint();
 
                 let mut stmt_a = match conn.prepare(
@@ -1023,20 +1494,23 @@ impl OverlapApp {
                     }
                 };
 
-                let rows_a = match stmt_a.query_map(rusqlite::params![chat_a_id, start_unix, end_unix], |r| {
-                    let text: String = r.get(4)?;
-                    let clean_text = clean_text_for_match(&text);
-                    Ok(BackupMessage {
-                        message_id: r.get(0)?,
-                        sender: r.get(1)?,
-                        timestamp_unix: r.get(2)?,
-                        timestamp_str: r.get(3)?,
-                        text,
-                        clean_text,
-                        media_type: r.get(5)?,
-                        media_path: r.get(6)?,
-                    })
-                }) {
+                let rows_a = match stmt_a.query_map(
+                    rusqlite::params![chat_a_id, start_unix, end_unix],
+                    |r| {
+                        let text: String = r.get(4)?;
+                        let clean_text = clean_text_for_match(&text);
+                        Ok(BackupMessage {
+                            message_id: r.get(0)?,
+                            sender: r.get(1)?,
+                            timestamp_unix: r.get(2)?,
+                            timestamp_str: r.get(3)?,
+                            text,
+                            clean_text,
+                            media_type: r.get(5)?,
+                            media_path: r.get(6)?,
+                        })
+                    },
+                ) {
                     Ok(mapped) => {
                         let mut msgs = Vec::new();
                         for item in mapped {
@@ -1053,7 +1527,9 @@ impl OverlapApp {
                     }
                 };
 
-                let _ = tx.send(CompareMessage::Loading("Fetching Backup B messages in overlap range...".to_string()));
+                let _ = tx.send(CompareMessage::Loading(
+                    "Fetching Backup B messages in overlap range...".to_string(),
+                ));
                 ctx.request_repaint();
 
                 let mut stmt_b = match conn.prepare(
@@ -1067,20 +1543,23 @@ impl OverlapApp {
                     }
                 };
 
-                let rows_b = match stmt_b.query_map(rusqlite::params![chat_b_id, start_unix - 3605, end_unix + 3605], |r| {
-                    let text: String = r.get(4)?;
-                    let clean_text = clean_text_for_match(&text);
-                    Ok(BackupMessage {
-                        message_id: r.get(0)?,
-                        sender: r.get(1)?,
-                        timestamp_unix: r.get(2)?,
-                        timestamp_str: r.get(3)?,
-                        text,
-                        clean_text,
-                        media_type: r.get(5)?,
-                        media_path: r.get(6)?,
-                    })
-                }) {
+                let rows_b = match stmt_b.query_map(
+                    rusqlite::params![chat_b_id, start_unix - 3605, end_unix + 3605],
+                    |r| {
+                        let text: String = r.get(4)?;
+                        let clean_text = clean_text_for_match(&text);
+                        Ok(BackupMessage {
+                            message_id: r.get(0)?,
+                            sender: r.get(1)?,
+                            timestamp_unix: r.get(2)?,
+                            timestamp_str: r.get(3)?,
+                            text,
+                            clean_text,
+                            media_type: r.get(5)?,
+                            media_path: r.get(6)?,
+                        })
+                    },
+                ) {
                     Ok(mapped) => {
                         let mut msgs = Vec::new();
                         for item in mapped {
@@ -1097,7 +1576,9 @@ impl OverlapApp {
                     }
                 };
 
-                let _ = tx.send(CompareMessage::Loading("Aligning message streams side-by-side...".to_string()));
+                let _ = tx.send(CompareMessage::Loading(
+                    "Aligning message streams side-by-side...".to_string(),
+                ));
                 ctx.request_repaint();
 
                 let mut matched_b_ids = HashSet::new();
@@ -1112,7 +1593,7 @@ impl OverlapApp {
                 for a in &rows_a {
                     let mut matched_b: Option<BackupMessage> = None;
                     let is_a_media = a.clean_text.starts_with('[') && a.clean_text.ends_with(']');
-                    
+
                     'outer: for &offset in &[0, 3600, -3600] {
                         let target_ts = a.timestamp_unix + offset;
                         for candidate_ts in (target_ts - 5)..=(target_ts + 5) {
@@ -1121,11 +1602,12 @@ impl OverlapApp {
                                     if matched_b_ids.contains(&b.message_id) {
                                         continue;
                                     }
-                                    let is_b_media = b.clean_text.starts_with('[') && b.clean_text.ends_with(']');
-                                    
-                                    if a.clean_text == b.clean_text 
-                                        || (a.clean_text.is_empty() && is_b_media) 
-                                        || (b.clean_text.is_empty() && is_a_media) 
+                                    let is_b_media = b.clean_text.starts_with('[')
+                                        && b.clean_text.ends_with(']');
+
+                                    if a.clean_text == b.clean_text
+                                        || (a.clean_text.is_empty() && is_b_media)
+                                        || (b.clean_text.is_empty() && is_a_media)
                                     {
                                         matched_b = Some(b.clone());
                                         break 'outer;
@@ -1164,13 +1646,15 @@ impl OverlapApp {
                 }
 
                 aligned_rows.sort_by_key(|r| {
-                    r.msg_a.as_ref()
+                    r.msg_a
+                        .as_ref()
                         .or(r.msg_b.as_ref())
                         .map(|m| m.timestamp_unix)
                         .unwrap_or(0)
                 });
 
-                let discrepancies: Vec<usize> = aligned_rows.iter()
+                let discrepancies: Vec<usize> = aligned_rows
+                    .iter()
                     .enumerate()
                     .filter(|(_, r)| r.is_discrepancy)
                     .map(|(idx, _)| idx)
@@ -1182,8 +1666,16 @@ impl OverlapApp {
                     backup_a_name,
                     backup_b_name,
                     rows: aligned_rows,
-                    current_discrepancy_idx: if discrepancies.is_empty() { None } else { Some(0) },
-                    scroll_to_row_idx: if discrepancies.is_empty() { None } else { Some(discrepancies[0]) },
+                    current_discrepancy_idx: if discrepancies.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    },
+                    scroll_to_row_idx: if discrepancies.is_empty() {
+                        None
+                    } else {
+                        Some(discrepancies[0])
+                    },
                     discrepancies,
                 };
 
@@ -1197,7 +1689,7 @@ impl OverlapApp {
         if let Some(group_idx) = self.selected_group_idx {
             let group = &self.groups[group_idx];
             let backup = &group.backups[idx];
-            
+
             let letter = (b'A' + idx as u8) as char;
             self.loading_chat_view = true;
             self.status_msg = format!("Loading chat history for Backup {}...", letter);
@@ -1210,19 +1702,26 @@ impl OverlapApp {
             self.chat_view_rx = Some(rx);
 
             std::thread::spawn(move || {
-                let _ = tx.send(SingleChatMessage::Loading("Connecting to database...".to_string()));
+                let _ = tx.send(SingleChatMessage::Loading(
+                    "Connecting to database...".to_string(),
+                ));
                 ctx.request_repaint();
 
                 let conn = match rusqlite::Connection::open(&db_path) {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(SingleChatMessage::Error(format!("Failed to open DB: {}", e)));
+                        let _ = tx.send(SingleChatMessage::Error(format!(
+                            "Failed to open DB: {}",
+                            e
+                        )));
                         ctx.request_repaint();
                         return;
                     }
                 };
 
-                let _ = tx.send(SingleChatMessage::Loading("Fetching messages from database...".to_string()));
+                let _ = tx.send(SingleChatMessage::Loading(
+                    "Fetching messages from database...".to_string(),
+                ));
                 ctx.request_repaint();
 
                 let mut stmt = match conn.prepare(
@@ -1296,18 +1795,22 @@ impl eframe::App for OverlapApp {
                 Ok(LoadMessage::Finished(groups)) => {
                     self.groups = groups;
                     self.loading_data = false;
+                    self.filtered_groups.clear();
                     self.load_cache();
+                    self.load_media_cache();
                     self.filter_groups();
                     self.load_rx = None;
                 }
                 Ok(LoadMessage::Error(err)) => {
                     self.status_msg = err;
                     self.loading_data = false;
+                    self.filtered_groups.clear();
                     self.load_rx = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.loading_data = false;
+                    self.filtered_groups.clear();
                     self.load_rx = None;
                 }
             }
@@ -1322,7 +1825,8 @@ impl eframe::App for OverlapApp {
                 Ok(CalcMessage::Finished(results)) => {
                     self.cached_results = results;
                     self.calculating_overlaps = false;
-                    self.status_msg = "Overlaps calculation completed & cached successfully.".to_string();
+                    self.status_msg =
+                        "Overlaps calculation completed & cached successfully.".to_string();
                     self.rx = None;
                     if let Some(idx) = self.selected_group_idx {
                         self.select_group(idx);
@@ -1341,6 +1845,39 @@ impl eframe::App for OverlapApp {
             }
         }
 
+        // Poll background media stats calculations
+        if let Some(ref rx) = self.media_rx {
+            match rx.try_recv() {
+                Ok(MediaCalcMessage::Progress(msg)) => {
+                    self.status_msg = msg;
+                }
+                Ok(MediaCalcMessage::Finished(results)) => {
+                    for group in &mut self.groups {
+                        for b in &mut group.backups {
+                            let key = format!("{}:{}", b.chat_id, b.path);
+                            if let Some(stats) = results.get(&key) {
+                                b.media_stats = Some(stats.clone());
+                            }
+                        }
+                    }
+                    self.calculating_media = false;
+                    self.status_msg =
+                        "Media stats calculation completed & cached successfully.".to_string();
+                    self.media_rx = None;
+                }
+                Ok(MediaCalcMessage::Error(err)) => {
+                    self.status_msg = format!("Media stats calculation failed: {}", err);
+                    self.calculating_media = false;
+                    self.media_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.calculating_media = false;
+                    self.media_rx = None;
+                }
+            }
+        }
+
         // Poll background comparison loading
         if let Some(ref rx) = self.compare_rx {
             match rx.try_recv() {
@@ -1350,7 +1887,8 @@ impl eframe::App for OverlapApp {
                 Ok(CompareMessage::Finished(comp)) => {
                     *self.active_comparison.lock().unwrap() = Some(comp);
                     self.loading_comparison = false;
-                    self.status_msg = "Comparison messages aligned and loaded successfully.".to_string();
+                    self.status_msg =
+                        "Comparison messages aligned and loaded successfully.".to_string();
                     self.compare_rx = None;
                 }
                 Ok(CompareMessage::Error(err)) => {
@@ -1398,7 +1936,11 @@ impl eframe::App for OverlapApp {
 
         // Top Control Panel
         egui::TopBottomPanel::top("control_panel")
-            .frame(egui::Frame::none().inner_margin(12.0).fill(egui::Color32::from_rgb(25, 25, 30)))
+            .frame(
+                egui::Frame::none()
+                    .inner_margin(12.0)
+                    .fill(egui::Color32::from_rgb(25, 25, 30)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("📊 tgbackman");
@@ -1414,9 +1956,16 @@ impl eframe::App for OverlapApp {
                     ui.add_space(10.0);
                     if self.calculating_overlaps {
                         ui.add(egui::Spinner::new());
-                        ui.label("Computing...");
+                        ui.label("Computing Overlaps...");
                     } else if ui.button("🔄 Recompute All Overlaps").clicked() {
                         self.recompute_all_overlaps(ctx.clone());
+                    }
+                    ui.add_space(10.0);
+                    if self.calculating_media {
+                        ui.add(egui::Spinner::new());
+                        ui.label("Computing Media...");
+                    } else if ui.button("📊 Recompute Media Counts").clicked() {
+                        self.recompute_all_media_stats(ctx.clone());
                     }
                 });
                 ui.add_space(4.0);
@@ -1429,29 +1978,43 @@ impl eframe::App for OverlapApp {
         egui::SidePanel::left("left_panel")
             .resizable(true)
             .default_width(320.0)
-            .frame(egui::Frame::none().inner_margin(12.0).fill(egui::Color32::from_rgb(15, 15, 20)))
+            .frame(
+                egui::Frame::none()
+                    .inner_margin(12.0)
+                    .fill(egui::Color32::from_rgb(15, 15, 20)),
+            )
             .show(ctx, |ui| {
                 ui.label("🔍 Search Chats:");
                 if ui.text_edit_singleline(&mut self.search_query).changed() {
                     self.filter_groups();
                 }
                 ui.add_space(8.0);
-                
+
                 ui.heading("Conversations");
                 ui.separator();
-                
+
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let mut next_selected_idx = None;
                     let now = Utc::now().timestamp();
                     for &idx in &self.filtered_groups {
-                        let group = &self.groups[idx];
+                        // A refresh replaces `groups` asynchronously. Keep the
+                        // render loop defensive as well as clearing the index
+                        // list when a load starts; an invalid stale index must
+                        // never be able to panic the GUI.
+                        let Some(group) = self.groups.get(idx) else {
+                            continue;
+                        };
                         let selected = self.selected_group_idx == Some(idx);
-                        
-                        let latest_backup_unix = group.backups.iter()
-                            .filter_map(|b| b.last_backup_unix)
+
+                        let latest_backup_unix = group
+                            .backups
+                            .iter()
+                            .filter_map(|b| b.last_backup_run_unix.or(b.last_backup_unix))
                             .max();
-                        
-                        let ago_str = match latest_backup_unix {
+                        let latest_message_unix =
+                            group.backups.iter().filter_map(|b| b.max_unix).max();
+
+                        let format_age = |timestamp: Option<i64>| match timestamp {
                             Some(ts) => {
                                 let days = (now - ts) / 86400;
                                 if days >= 0 {
@@ -1462,16 +2025,29 @@ impl eframe::App for OverlapApp {
                             }
                             None => "never".to_string(),
                         };
-                        
-                        let item_color = if group.is_active() {
+                        let run_age = format_age(latest_backup_unix);
+                        let message_age = format_age(latest_message_unix);
+
+                        let group_blacklisted = group.is_blacklisted();
+                        let item_color = if group_blacklisted {
+                            egui::Color32::from_rgb(72, 74, 82) // Never-back-up rule
+                        } else if group.is_active() {
                             egui::Color32::from_rgb(46, 204, 113) // Green
+                        } else if group.max_count == 0 {
+                            egui::Color32::from_rgb(130, 135, 145) // Discovered, not backed up
                         } else {
-                            egui::Color32::from_rgb(231, 76, 60)  // Red
+                            egui::Color32::from_rgb(231, 76, 60) // Red
                         };
-                        let label_text = egui::RichText::new(format!("{} ({} msgs) • {}", group.name, group.max_count, ago_str))
-                            .color(item_color);
+                        let mut label_text = egui::RichText::new(format!(
+                            "{} ({} msgs) - {} - {}",
+                            group.name, group.max_count, message_age, run_age,
+                        ))
+                        .color(item_color);
+                        if group_blacklisted {
+                            label_text = label_text.strikethrough();
+                        }
                         let response = ui.selectable_label(selected, label_text);
-                        
+
                         if response.clicked() {
                             next_selected_idx = Some(idx);
                         }
@@ -1489,83 +2065,199 @@ impl eframe::App for OverlapApp {
             .frame(egui::Frame::none().inner_margin(16.0).fill(egui::Color32::from_rgb(20, 20, 25)))
             .show(ctx, |ui| {
                 if let Some(idx) = self.selected_group_idx {
-                    let mut recompute_media = false;
                     let mut toggle_group_active = None;
-                    
-                    {
+                    let mut toggle_group_blacklisted = None;
+
+                    egui::ScrollArea::vertical().id_source("central_scroll").show(ui, |ui| {
                         let group = &self.groups[idx];
-                        
+
                         ui.horizontal(|ui| {
                             let group_active = group.is_active();
-                            let status_color = if group_active {
+                            let group_blacklisted = group.is_blacklisted();
+                            let status_color = if group_blacklisted {
+                                egui::Color32::from_rgb(72, 74, 82) // dark grey
+                            } else if group_active {
                                 egui::Color32::from_rgb(46, 204, 113) // green
+                            } else if group.max_count == 0 {
+                                egui::Color32::from_rgb(130, 135, 145) // discovered only
                             } else {
                                 egui::Color32::from_rgb(231, 76, 60)  // red
                             };
-                            let status_text = if group_active { "Active" } else { "Inactive" };
-                            let label_text = egui::RichText::new(format!("Selected: {} ({})", group.name, status_text)).strong().color(status_color);
-                            if ui.selectable_label(false, label_text).on_hover_text("Click to toggle conversation Active status").clicked() {
+                            let status_text = if group_blacklisted {
+                                "Blacklisted · never backed up"
+                            } else if group_active && group.max_count == 0 {
+                                "Active · queued for first backup"
+                            } else if group_active {
+                                "Active"
+                            } else if group.max_count == 0 {
+                                "Discovered · not backed up"
+                            } else {
+                                "Inactive"
+                            };
+                            let mut label_text = egui::RichText::new(format!("Selected: {} ({})", group.name, status_text)).strong().color(status_color);
+                            if group_blacklisted {
+                                label_text = label_text.strikethrough();
+                            }
+                            if ui.selectable_label(false, label_text).on_hover_text(
+                                if group_blacklisted {
+                                    "Remove the blacklist rule before making this conversation active"
+                                } else {
+                                    "Click to toggle conversation Active status"
+                                }
+                            ).clicked() && !group_blacklisted {
                                 toggle_group_active = Some((idx, !group_active));
                             }
-                            
-                            ui.add_space(20.0);
-                            if ui.button("📊 Recompute Media Counts").on_hover_text("Scan backup directories and count/validate photos, videos, and voice messages").clicked() {
-                                recompute_media = true;
+
+                            let blacklist_label = if group_blacklisted {
+                                "Remove from blacklist"
+                            } else {
+                                "🚫 Never back up"
+                            };
+                            if ui.button(blacklist_label).on_hover_text(
+                                if group_blacklisted {
+                                    "Remove the permanent exclusion; this does not activate the chat"
+                                } else {
+                                    "Deactivate this chat and exclude it even from --all"
+                                }
+                            ).clicked() {
+                                toggle_group_blacklisted = Some((idx, !group_blacklisted));
                             }
+
+                            let now = Utc::now().timestamp();
+                            let latest_backup_unix = group
+                                .backups
+                                .iter()
+                                .filter_map(|b| b.last_backup_run_unix.or(b.last_backup_unix))
+                                .max();
+                            let latest_msg_unix = group.backups.iter().filter_map(|b| b.max_unix).max();
+
+                            let backup_ago = match latest_backup_unix {
+                                Some(ts) => {
+                                    let days = (now - ts) / 86400;
+                                    if days >= 0 {
+                                        format!("{}d ago", days)
+                                    } else {
+                                        "0d ago".to_string()
+                                    }
+                                }
+                                None => "never".to_string(),
+                            };
+
+                            let msg_ago = match latest_msg_unix {
+                                Some(ts) => {
+                                    let days = (now - ts) / 86400;
+                                    if days >= 0 {
+                                        format!("{}d ago", days)
+                                    } else {
+                                        "0d ago".to_string()
+                                    }
+                                }
+                                None => "never".to_string(),
+                            };
+
+                            ui.add_space(20.0);
+                            ui.colored_label(egui::Color32::from_rgb(150, 150, 160), "Last Backup:");
+                            ui.label(egui::RichText::new(&backup_ago).strong().color(egui::Color32::from_rgb(100, 180, 240)));
+                            ui.label("  |  ");
+                            ui.colored_label(egui::Color32::from_rgb(150, 150, 160), "Last Message:");
+                            ui.label(egui::RichText::new(&msg_ago).strong().color(egui::Color32::from_rgb(100, 180, 240)));
                         });
                         ui.separator();
                         ui.add_space(10.0);
-                        
+
                         ui.label("📅 Backup Chronological Timeline (Gantt Chart)");
                         ui.add_space(4.0);
-                        
+
                         // Render Gantt
                         draw_gantt_chart(ui, &group.backups);
-                        
+
                         ui.add_space(15.0);
-                        
+
                         // Render Backup Information Table
                         ui.heading("📦 Backup Inventories");
-                        egui::ScrollArea::vertical().id_source("inventories_scroll").max_height(200.0).show(ui, |ui| {
-                            for (b_idx, b) in group.backups.iter().enumerate() {
-                                let letter = (b'A' + b_idx as u8) as char;
-                                let backup_run_ts = match b.last_backup_unix {
+                        for (b_idx, b) in group.backups.iter().enumerate() {
+                            let letter = (b'A' + b_idx as u8) as char;
+                            let backup_run_ts = match b.last_backup_unix {
+                                Some(ts) => format_unix_to_ts(ts),
+                                None => "Unknown".to_string(),
+                            };
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(get_color_by_idx(b_idx), format!("Backup {}", letter));
+                                    ui.add_space(8.0);
+                                    if ui
+                                        .add_enabled(b.count > 0, egui::Button::new("💬 Open Chat").small())
+                                        .on_hover_text(if b.count > 0 {
+                                            "Open message history in a Telegram-styled window"
+                                        } else {
+                                            "This Telegram chat has not been backed up yet"
+                                        })
+                                        .clicked()
+                                    {
+                                        open_chat_idx = Some(b_idx);
+                                    }
+                                    let path_label = if b.count == 0 { "Planned path" } else { "Path" };
+                                    ui.label(format!("| {}: {}", path_label, b.path));
+                                });
+                                let run_status = if b.last_backup_run_status.is_empty() {
+                                    "unknown".to_string()
+                                } else {
+                                    b.last_backup_run_status.replace('_', " ")
+                                };
+                                let backup_attempt_ts = match b.last_backup_run_unix {
                                     Some(ts) => format_unix_to_ts(ts),
                                     None => "Unknown".to_string(),
                                 };
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(get_color_by_idx(b_idx), format!("Backup {}", letter));
-                                        ui.add_space(8.0);
-                                        if ui.small_button("💬 Open Chat").on_hover_text("Open message history in a Telegram-styled window").clicked() {
-                                            open_chat_idx = Some(b_idx);
-                                        }
-                                        ui.label(format!("| Path: {}", b.path));
-                                    });
-                                    ui.label(format!("   Last Backup Run: {}", backup_run_ts));
-                                    ui.label(format!("   Message IDs:     {} to {} (Total: {} messages)", b.min_id.unwrap_or(0), b.max_id.unwrap_or(0), b.count));
-                                    ui.label(format!("   Time span:       {} to {}", b.min_ts, b.max_ts));
-                                    if let Some(ref stats) = b.media_stats {
-                                        ui.horizontal(|ui| {
-                                            ui.label("   Media Assets:    ");
-                                            ui.colored_label(egui::Color32::from_rgb(100, 180, 240), format!("📷 Photos: {}/{}", stats.photos_resolved, stats.photos_count));
-                                            ui.label(" | ");
-                                            ui.colored_label(egui::Color32::from_rgb(100, 180, 240), format!("🎥 Videos: {}/{}", stats.videos_resolved, stats.videos_count));
-                                            ui.label(" | ");
-                                            ui.colored_label(egui::Color32::from_rgb(100, 180, 240), format!("🎤 Voice: {}/{}", stats.voice_resolved, stats.voice_count));
-                                            ui.label(" | ");
-                                            ui.colored_label(egui::Color32::from_rgb(100, 180, 240), format!("📂 Files: {}/{}", stats.files_resolved, stats.files_count));
-                                        });
-                                    } else {
-                                        ui.horizontal(|ui| {
-                                            ui.label("   Media Assets:    ");
-                                            ui.colored_label(egui::Color32::from_rgb(140, 150, 160), "Not scanned. Click '📊 Recompute Media Counts' at the top to scan.");
-                                        });
-                                    }
+                                ui.label(format!(
+                                    "   Last Backup Run: {} [{}]",
+                                    backup_attempt_ts, run_status
+                                ));
+                                let date_source = if b.last_backup_source.is_empty() {
+                                    "unclassified".to_string()
+                                } else {
+                                    b.last_backup_source.replace('_', " ")
+                                };
+                                ui.label(format!(
+                                    "   Last Content-Modifying Backup: {} [{}; {}]",
+                                    backup_run_ts,
+                                    b.last_backup_confidence,
+                                    date_source
+                                ))
+                                .on_hover_text(if b.last_backup_evidence.is_empty() {
+                                    "No backup-date evidence recorded"
+                                } else {
+                                    &b.last_backup_evidence
                                 });
-                                ui.add_space(4.0);
-                            }
-                        });
+                                ui.label(format!("   Message IDs:     {} to {} (Total: {} messages)", b.min_id.unwrap_or(0), b.max_id.unwrap_or(0), b.count));
+                                ui.label(format!("   Time span:       {} to {}", b.min_ts, b.max_ts));
+                                if b.count == 0 {
+                                    ui.horizontal(|ui| {
+                                        ui.label("   Media Assets:    ");
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(140, 150, 160),
+                                            "None yet — activate this chat to include it in the next backup.",
+                                        );
+                                    });
+                                } else if let Some(ref stats) = b.media_stats {
+                                    ui.horizontal(|ui| {
+                                        ui.label("   Media Assets:    ");
+                                        ui.colored_label(egui::Color32::from_rgb(100, 180, 240), format!("📷 Photos: {}/{}", stats.photos_resolved, stats.photos_count));
+                                        ui.label(" | ");
+                                        ui.colored_label(egui::Color32::from_rgb(100, 180, 240), format!("🎥 Videos: {}/{}", stats.videos_resolved, stats.videos_count));
+                                        ui.label(" | ");
+                                        ui.colored_label(egui::Color32::from_rgb(100, 180, 240), format!("🎤 Voice: {}/{}", stats.voice_resolved, stats.voice_count));
+                                        ui.label(" | ");
+                                        ui.colored_label(egui::Color32::from_rgb(100, 180, 240), format!("📂 Files: {}/{}", stats.files_resolved, stats.files_count));
+                                    });
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.label("   Media Assets:    ");
+                                        ui.colored_label(egui::Color32::from_rgb(140, 150, 160), "Not scanned. Click '📊 Recompute Media Counts' at the top to scan.");
+                                    });
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
 
                         if group.backups.len() >= 2 {
                             ui.add_space(8.0);
@@ -1582,16 +2274,67 @@ impl eframe::App for OverlapApp {
                                 }
                             });
                         }
-                    }
-                    
-                    if recompute_media {
-                        if let Some(group) = self.groups.get_mut(idx) {
-                            for b in &mut group.backups {
-                                b.media_stats = Some(b.compute_media_stats(&self.db_path));
+
+                        ui.add_space(15.0);
+                        ui.heading("⚖️ Containment & Overlaps Analysis");
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        for line in &self.comparison_results {
+                            if line.trim().is_empty() {
+                                ui.add_space(4.0);
+                            } else {
+                                ui.label(line);
+                            }
+                        }
+                    });
+
+                    if let Some((g_idx, blacklisted)) = toggle_group_blacklisted {
+                        let chat_ids: Vec<String> = self.groups[g_idx]
+                            .backups
+                            .iter()
+                            .map(|backup| backup.chat_id.clone())
+                            .collect();
+                        match rusqlite::Connection::open(&self.db_path) {
+                            Ok(mut conn) => match set_chat_ids_blacklisted(
+                                &mut conn,
+                                &chat_ids,
+                                blacklisted,
+                            ) {
+                                Ok(affected) if affected > 0 => {
+                                    if let Some(group) = self.groups.get_mut(g_idx) {
+                                        for backup in &mut group.backups {
+                                            backup.is_blacklisted = blacklisted;
+                                            if blacklisted {
+                                                backup.is_active = false;
+                                            }
+                                        }
+                                        self.status_msg = if blacklisted {
+                                            format!(
+                                                "Blacklisted {}. It is excluded from every backup mode.",
+                                                group.name
+                                            )
+                                        } else {
+                                            format!(
+                                                "Removed {} from the blacklist. It remains inactive.",
+                                                group.name
+                                            )
+                                        };
+                                    }
+                                }
+                                Ok(_) => {
+                                    self.status_msg = "No mapped Telegram target was found for this chat; refresh mappings before blacklisting it.".to_string();
+                                }
+                                Err(error) => {
+                                    self.status_msg = format!("Failed to update blacklist: {}", error);
+                                }
+                            },
+                            Err(error) => {
+                                self.status_msg = format!("Failed to open database: {}", error);
                             }
                         }
                     }
-                    
+
                     if let Some((g_idx, active)) = toggle_group_active {
                         if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
                             let val = if active { 1 } else { 0 };
@@ -1609,22 +2352,6 @@ impl eframe::App for OverlapApp {
                             }
                         }
                     }
-                    
-                    ui.add_space(15.0);
-                    ui.heading("⚖️ Containment & Overlaps Analysis");
-                    ui.separator();
-                    ui.add_space(4.0);
-                    
-                    egui::ScrollArea::vertical().id_source("overlaps_scroll").show(ui, |ui| {
-                        for line in &self.comparison_results {
-                            if line.trim().is_empty() {
-                                ui.add_space(4.0);
-                            } else {
-                                ui.label(line);
-                            }
-                        }
-                    });
-                    
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label("Select a conversation from the sidebar list to view timelines, Gantt spans, and overlaps analysis.");
@@ -1822,7 +2549,10 @@ impl eframe::App for OverlapApp {
             let title = {
                 let lock = active_comp_clone.lock().unwrap();
                 let comp = lock.as_ref().unwrap();
-                format!("⚖️ Side-by-Side Comparison: Backup {} vs {}", comp.backup_a_letter, comp.backup_b_letter)
+                format!(
+                    "⚖️ Side-by-Side Comparison: Backup {} vs {}",
+                    comp.backup_a_letter, comp.backup_b_letter
+                )
             };
 
             let viewport_id = egui::ViewportId::from_hash_of("side_by_side_comparison");
@@ -1834,31 +2564,52 @@ impl eframe::App for OverlapApp {
                 move |ctx, class| {
                     if class == egui::ViewportClass::Immediate {
                         egui::CentralPanel::default()
-                            .frame(egui::Frame::none().inner_margin(16.0).fill(egui::Color32::from_rgb(20, 20, 25)))
+                            .frame(
+                                egui::Frame::none()
+                                    .inner_margin(16.0)
+                                    .fill(egui::Color32::from_rgb(20, 20, 25)),
+                            )
                             .show(ctx, |ui| {
                                 let mut comp_lock = active_comp_clone.lock().unwrap();
                                 if let Some(ref mut comp) = *comp_lock {
                                     // Header controls
                                     ui.horizontal(|ui| {
-                                        ui.label(format!("Comparing overlapping messages. Total messages: {}.", comp.rows.len()));
+                                        ui.label(format!(
+                                            "Comparing overlapping messages. Total messages: {}.",
+                                            comp.rows.len()
+                                        ));
                                         ui.add_space(20.0);
                                         if !comp.discrepancies.is_empty() {
                                             let curr = comp.current_discrepancy_idx.unwrap_or(0);
-                                            ui.label(format!("⚠️ Discrepancy {} of {}", curr + 1, comp.discrepancies.len()));
-                                            
+                                            ui.label(format!(
+                                                "⚠️ Discrepancy {} of {}",
+                                                curr + 1,
+                                                comp.discrepancies.len()
+                                            ));
+
                                             if ui.button("⬅️ Previous Missing").clicked() {
-                                                let prev_idx = if curr == 0 { comp.discrepancies.len() - 1 } else { curr - 1 };
+                                                let prev_idx = if curr == 0 {
+                                                    comp.discrepancies.len() - 1
+                                                } else {
+                                                    curr - 1
+                                                };
                                                 comp.current_discrepancy_idx = Some(prev_idx);
-                                                comp.scroll_to_row_idx = Some(comp.discrepancies[prev_idx]);
+                                                comp.scroll_to_row_idx =
+                                                    Some(comp.discrepancies[prev_idx]);
                                             }
-                                            
+
                                             if ui.button("Next Missing ➡️").clicked() {
-                                                let next_idx = (curr + 1) % comp.discrepancies.len();
+                                                let next_idx =
+                                                    (curr + 1) % comp.discrepancies.len();
                                                 comp.current_discrepancy_idx = Some(next_idx);
-                                                comp.scroll_to_row_idx = Some(comp.discrepancies[next_idx]);
+                                                comp.scroll_to_row_idx =
+                                                    Some(comp.discrepancies[next_idx]);
                                             }
                                         } else {
-                                            ui.colored_label(egui::Color32::from_rgb(46, 204, 113), "✅ Perfect alignment! No discrepancies found.");
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(46, 204, 113),
+                                                "✅ Perfect alignment! No discrepancies found.",
+                                            );
                                         }
                                     });
                                     ui.separator();
@@ -1872,44 +2623,72 @@ impl eframe::App for OverlapApp {
                                     // Scrollable messages list
                                     let num_rows = comp.rows.len();
                                     let row_height = 95.0; // Estimated average height of a bubble message row
-                                    
+
                                     egui::Frame::none()
                                         .fill(egui::Color32::from_rgb(14, 22, 33)) // Telegram dark background
                                         .inner_margin(8.0)
                                         .show(ui, |ui| {
-                                            let mut scroll_area = egui::ScrollArea::vertical().id_source("compare_scroll_area");
+                                            let mut scroll_area = egui::ScrollArea::vertical()
+                                                .id_source("compare_scroll_area");
                                             if let Some(target_idx) = comp.scroll_to_row_idx {
                                                 let spacing_y = ui.spacing().item_spacing.y;
-                                                let target_y = (target_idx as f32 * (row_height + spacing_y) - 200.0).max(0.0);
-                                                scroll_area = scroll_area.scroll_offset(egui::vec2(0.0, target_y));
+                                                let target_y = (target_idx as f32
+                                                    * (row_height + spacing_y)
+                                                    - 200.0)
+                                                    .max(0.0);
+                                                scroll_area = scroll_area
+                                                    .scroll_offset(egui::vec2(0.0, target_y));
                                                 comp.scroll_to_row_idx = None; // Reset it!
                                             }
 
-                                            scroll_area.show_rows(ui, row_height, num_rows, |ui, row_range| {
-                                                for idx in row_range {
-                                                    let row = &comp.rows[idx];
-                                                    ui.columns(2, |cols| {
-                                                        // Column A
-                                                        cols[0].vertical(|ui| {
-                                                            if let Some(ref msg) = row.msg_a {
-                                                                render_message_bubble(ui, msg, row.is_discrepancy, true, false);
-                                                            } else {
-                                                                render_missing_placeholder(ui, "Missing in Backup A");
-                                                            }
-                                                        });
+                                            scroll_area.show_rows(
+                                                ui,
+                                                row_height,
+                                                num_rows,
+                                                |ui, row_range| {
+                                                    for idx in row_range {
+                                                        let row = &comp.rows[idx];
+                                                        ui.columns(2, |cols| {
+                                                            // Column A
+                                                            cols[0].vertical(|ui| {
+                                                                if let Some(ref msg) = row.msg_a {
+                                                                    render_message_bubble(
+                                                                        ui,
+                                                                        msg,
+                                                                        row.is_discrepancy,
+                                                                        true,
+                                                                        false,
+                                                                    );
+                                                                } else {
+                                                                    render_missing_placeholder(
+                                                                        ui,
+                                                                        "Missing in Backup A",
+                                                                    );
+                                                                }
+                                                            });
 
-                                                        // Column B
-                                                        cols[1].vertical(|ui| {
-                                                            if let Some(ref msg) = row.msg_b {
-                                                                render_message_bubble(ui, msg, row.is_discrepancy, false, false);
-                                                            } else {
-                                                                render_missing_placeholder(ui, "Missing in Backup B");
-                                                            }
+                                                            // Column B
+                                                            cols[1].vertical(|ui| {
+                                                                if let Some(ref msg) = row.msg_b {
+                                                                    render_message_bubble(
+                                                                        ui,
+                                                                        msg,
+                                                                        row.is_discrepancy,
+                                                                        false,
+                                                                        false,
+                                                                    );
+                                                                } else {
+                                                                    render_missing_placeholder(
+                                                                        ui,
+                                                                        "Missing in Backup B",
+                                                                    );
+                                                                }
+                                                            });
                                                         });
-                                                    });
-                                                    ui.add_space(6.0);
-                                                }
-                                            });
+                                                        ui.add_space(6.0);
+                                                    }
+                                                },
+                                            );
                                         });
 
                                     if ctx.input(|i| i.viewport().close_requested()) {
@@ -1918,7 +2697,7 @@ impl eframe::App for OverlapApp {
                                 }
                             });
                     }
-                }
+                },
             );
         }
 
@@ -1930,12 +2709,12 @@ impl eframe::App for OverlapApp {
 
 fn get_color_by_idx(idx: usize) -> egui::Color32 {
     let colors = [
-        egui::Color32::from_rgb(99, 102, 241),   // Premium Indigo
-        egui::Color32::from_rgb(16, 185, 129),   // Premium Emerald Green
-        egui::Color32::from_rgb(168, 85, 247),   // Premium Vibrant Purple
-        egui::Color32::from_rgb(245, 158, 11),   // Premium Amber/Gold
-        egui::Color32::from_rgb(244, 63, 94),    // Premium Rose/Coral
-        egui::Color32::from_rgb(6, 182, 212),    // Premium Cyan
+        egui::Color32::from_rgb(99, 102, 241), // Premium Indigo
+        egui::Color32::from_rgb(16, 185, 129), // Premium Emerald Green
+        egui::Color32::from_rgb(168, 85, 247), // Premium Vibrant Purple
+        egui::Color32::from_rgb(245, 158, 11), // Premium Amber/Gold
+        egui::Color32::from_rgb(244, 63, 94),  // Premium Rose/Coral
+        egui::Color32::from_rgb(6, 182, 212),  // Premium Cyan
     ];
     colors[idx % colors.len()]
 }
@@ -1945,10 +2724,14 @@ fn draw_gantt_chart(ui: &mut egui::Ui, backups: &[BackupInfo]) {
     let mut max_time = i64::MIN;
     for b in backups {
         if let Some(min_t) = b.min_unix {
-            if min_t < min_time { min_time = min_t; }
+            if min_t < min_time {
+                min_time = min_t;
+            }
         }
         if let Some(max_t) = b.max_unix {
-            if max_t > max_time { max_time = max_t; }
+            if max_t > max_time {
+                max_time = max_t;
+            }
         }
     }
 
@@ -1972,11 +2755,7 @@ fn draw_gantt_chart(ui: &mut egui::Ui, backups: &[BackupInfo]) {
     let painter = ui.painter_at(rect);
 
     // Draw frame background
-    painter.rect_filled(
-        rect,
-        5.0,
-        egui::Color32::from_rgb(30, 30, 35),
-    );
+    painter.rect_filled(rect, 5.0, egui::Color32::from_rgb(30, 30, 35));
 
     // Timeline boundaries within the canvas
     let chart_left = rect.left() + 90.0;
@@ -1988,11 +2767,25 @@ fn draw_gantt_chart(ui: &mut egui::Ui, backups: &[BackupInfo]) {
     }
 
     // Grid ticks (Years or Months)
-    let min_dt = Utc.timestamp_opt(timeline_min, 0).single().unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
-    let max_dt = Utc.timestamp_opt(timeline_max, 0).single().unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+    let min_dt = Utc
+        .timestamp_opt(timeline_min, 0)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+    let max_dt = Utc
+        .timestamp_opt(timeline_max, 0)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
 
-    let start_year = min_dt.format("%Y").to_string().parse::<i32>().unwrap_or(2015);
-    let end_year = max_dt.format("%Y").to_string().parse::<i32>().unwrap_or(2026);
+    let start_year = min_dt
+        .format("%Y")
+        .to_string()
+        .parse::<i32>()
+        .unwrap_or(2015);
+    let end_year = max_dt
+        .format("%Y")
+        .to_string()
+        .parse::<i32>()
+        .unwrap_or(2026);
 
     let font_id = egui::FontId::proportional(11.0);
 
@@ -2006,13 +2799,26 @@ fn draw_gantt_chart(ui: &mut egui::Ui, backups: &[BackupInfo]) {
                     let x_pos = chart_left + x_pct * chart_width;
 
                     painter.line_segment(
-                        [egui::pos2(x_pos, rect.top() + 5.0), egui::pos2(x_pos, rect.bottom() - 25.0)],
+                        [
+                            egui::pos2(x_pos, rect.top() + 5.0),
+                            egui::pos2(x_pos, rect.bottom() - 25.0),
+                        ],
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 65)),
                     );
 
                     let month_name = match m {
-                        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr", 5 => "May", 6 => "Jun",
-                        7 => "Jul", 8 => "Aug", 9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+                        1 => "Jan",
+                        2 => "Feb",
+                        3 => "Mar",
+                        4 => "Apr",
+                        5 => "May",
+                        6 => "Jun",
+                        7 => "Jul",
+                        8 => "Aug",
+                        9 => "Sep",
+                        10 => "Oct",
+                        11 => "Nov",
+                        12 => "Dec",
                         _ => "",
                     };
                     painter.text(
@@ -2035,7 +2841,10 @@ fn draw_gantt_chart(ui: &mut egui::Ui, backups: &[BackupInfo]) {
                     let x_pos = chart_left + x_pct * chart_width;
 
                     painter.line_segment(
-                        [egui::pos2(x_pos, rect.top() + 5.0), egui::pos2(x_pos, rect.bottom() - 25.0)],
+                        [
+                            egui::pos2(x_pos, rect.top() + 5.0),
+                            egui::pos2(x_pos, rect.bottom() - 25.0),
+                        ],
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 65)),
                     );
 
@@ -2091,22 +2900,30 @@ fn draw_gantt_chart(ui: &mut egui::Ui, backups: &[BackupInfo]) {
             if bar_rect.contains(hover_pos) {
                 painter.rect_stroke(bar_rect, 4.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
 
-                egui::show_tooltip(ui.ctx(), egui::Id::new(format!("gantt_tooltip_{}", idx)), |ui| {
-                    ui.style_mut().spacing.item_spacing.y = 4.0;
-                    ui.colored_label(color, format!("Backup {}", letter));
-                    ui.label(format!("Path: {}", b.path));
-                    ui.label(format!("Range: {} to {}", b.min_ts, b.max_ts));
-                    ui.label(format!("Messages: {} msgs", b.count));
-                    if let Some(ref stats) = b.media_stats {
-                        ui.label(format!(
-                            "Media: 📷 {}/{} | 🎥 {}/{} | 🎤 {}/{} | 📂 {}/{}",
-                            stats.photos_resolved, stats.photos_count,
-                            stats.videos_resolved, stats.videos_count,
-                            stats.voice_resolved, stats.voice_count,
-                            stats.files_resolved, stats.files_count
-                        ));
-                    }
-                });
+                egui::show_tooltip(
+                    ui.ctx(),
+                    egui::Id::new(format!("gantt_tooltip_{}", idx)),
+                    |ui| {
+                        ui.style_mut().spacing.item_spacing.y = 4.0;
+                        ui.colored_label(color, format!("Backup {}", letter));
+                        ui.label(format!("Path: {}", b.path));
+                        ui.label(format!("Range: {} to {}", b.min_ts, b.max_ts));
+                        ui.label(format!("Messages: {} msgs", b.count));
+                        if let Some(ref stats) = b.media_stats {
+                            ui.label(format!(
+                                "Media: 📷 {}/{} | 🎥 {}/{} | 🎤 {}/{} | 📂 {}/{}",
+                                stats.photos_resolved,
+                                stats.photos_count,
+                                stats.videos_resolved,
+                                stats.videos_count,
+                                stats.voice_resolved,
+                                stats.voice_count,
+                                stats.files_resolved,
+                                stats.files_count
+                            ));
+                        }
+                    },
+                );
             }
         }
     }
@@ -2116,7 +2933,10 @@ fn is_outgoing_sender(sender: &str) -> bool {
     let s = sender.to_lowercase();
     let me_name = std::env::var("USER").unwrap_or_default().to_lowercase();
     let me_rev: String = me_name.chars().rev().collect();
-    s == "me" || s == "self" || s == "outgoing" || (!me_name.is_empty() && (s == me_name || s == me_rev))
+    s == "me"
+        || s == "self"
+        || s == "outgoing"
+        || (!me_name.is_empty() && (s == me_name || s == me_rev))
 }
 
 fn get_sender_color(sender: &str) -> egui::Color32 {
@@ -2160,8 +2980,15 @@ fn render_telegram_media_box(ui: &mut egui::Ui, msg: &BackupMessage) {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(icon).size(18.0));
                 ui.vertical(|ui| {
-                    ui.strong(egui::RichText::new(file_name).color(egui::Color32::from_rgb(98, 172, 232)).size(11.0));
-                    ui.colored_label(egui::Color32::from_rgb(150, 170, 190), format!("Type: {}", mt));
+                    ui.strong(
+                        egui::RichText::new(file_name)
+                            .color(egui::Color32::from_rgb(98, 172, 232))
+                            .size(11.0),
+                    );
+                    ui.colored_label(
+                        egui::Color32::from_rgb(150, 170, 190),
+                        format!("Type: {}", mt),
+                    );
                 });
             });
         });
@@ -2176,21 +3003,21 @@ fn render_message_bubble(
 ) {
     let (bubble_color, border_color, border_width) = if is_discrepancy {
         (
-            egui::Color32::from_rgb(45, 25, 25), 
-            egui::Color32::from_rgb(231, 76, 60), 
-            1.0
+            egui::Color32::from_rgb(45, 25, 25),
+            egui::Color32::from_rgb(231, 76, 60),
+            1.0,
         )
     } else if is_left {
         (
-            egui::Color32::from_rgb(24, 37, 51), 
-            egui::Color32::from_rgb(33, 47, 61), 
-            0.0
+            egui::Color32::from_rgb(24, 37, 51),
+            egui::Color32::from_rgb(33, 47, 61),
+            0.0,
         )
     } else {
         (
-            egui::Color32::from_rgb(43, 82, 120), 
-            egui::Color32::from_rgb(52, 101, 145), 
-            0.0
+            egui::Color32::from_rgb(43, 82, 120),
+            egui::Color32::from_rgb(52, 101, 145),
+            0.0,
         )
     };
 
@@ -2198,9 +3025,19 @@ fn render_message_bubble(
 
     let rounding = if is_single_chat {
         if is_outgoing {
-            egui::Rounding { nw: 10.0, ne: 10.0, sw: 10.0, se: 2.0 }
+            egui::Rounding {
+                nw: 10.0,
+                ne: 10.0,
+                sw: 10.0,
+                se: 2.0,
+            }
         } else {
-            egui::Rounding { nw: 10.0, ne: 10.0, sw: 2.0, se: 10.0 }
+            egui::Rounding {
+                nw: 10.0,
+                ne: 10.0,
+                sw: 2.0,
+                se: 10.0,
+            }
         }
     } else {
         egui::Rounding::same(10.0)
@@ -2226,17 +3063,34 @@ fn render_message_bubble(
                     let show_sender_name = !is_single_chat || !is_outgoing;
                     if show_sender_name {
                         let sender_color = get_sender_color(&msg.sender);
-                        ui.strong(egui::RichText::new(&msg.sender).color(sender_color).size(12.5));
+                        ui.strong(
+                            egui::RichText::new(&msg.sender)
+                                .color(sender_color)
+                                .size(12.5),
+                        );
                         if is_discrepancy && !is_single_chat {
                             ui.add_space(4.0);
-                            ui.colored_label(egui::Color32::from_rgb(231, 76, 60), "⚠️ Missing opposite");
+                            ui.colored_label(
+                                egui::Color32::from_rgb(231, 76, 60),
+                                "⚠️ Missing opposite",
+                            );
                         }
                         ui.add_space(2.0);
                     } else if is_discrepancy {
-                        ui.colored_label(egui::Color32::from_rgb(231, 76, 60), "⚠️ Missing opposite");
+                        ui.colored_label(
+                            egui::Color32::from_rgb(231, 76, 60),
+                            "⚠️ Missing opposite",
+                        );
                     }
 
-                    ui.add(egui::Label::new(egui::RichText::new(&msg.text).color(egui::Color32::WHITE).size(13.0)).wrap(true));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&msg.text)
+                                .color(egui::Color32::WHITE)
+                                .size(13.0),
+                        )
+                        .wrap(true),
+                    );
 
                     if msg.media_type.is_some() || msg.media_path.is_some() {
                         ui.add_space(6.0);
@@ -2247,10 +3101,14 @@ fn render_message_bubble(
 
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let check_marks = if !is_single_chat && is_discrepancy { "⚠️" } else { "✓✓" };
+                            let check_marks = if !is_single_chat && is_discrepancy {
+                                "⚠️"
+                            } else {
+                                "✓✓"
+                            };
                             ui.colored_label(egui::Color32::from_rgb(110, 140, 160), check_marks);
                             ui.add_space(4.0);
-                            
+
                             let time_part = if msg.timestamp_str.len() >= 19 {
                                 msg.timestamp_str[11..19].to_string()
                             } else if msg.timestamp_str.len() >= 16 {
@@ -2260,7 +3118,10 @@ fn render_message_bubble(
                             };
                             ui.colored_label(egui::Color32::from_rgb(120, 145, 165), time_part);
                             ui.add_space(10.0);
-                            ui.colored_label(egui::Color32::from_rgb(90, 110, 130), format!("ID: {}", msg.message_id));
+                            ui.colored_label(
+                                egui::Color32::from_rgb(90, 110, 130),
+                                format!("ID: {}", msg.message_id),
+                            );
                         });
                     });
                 });
@@ -2293,7 +3154,7 @@ fn main() -> eframe::Result<()> {
             .with_title("tgbackman"),
         ..Default::default()
     };
-    
+
     eframe::run_native(
         "tgbackman_overlaps",
         options,
@@ -2310,15 +3171,381 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_backup_execution_time() {
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-        let path = format!("/media/{}/1b/Telegram Backup/Telegram (unofficial)/Aug_25_2015-present/.telegram_backup/+447926045540", user);
-        if let Some(ts) = get_backup_execution_time(&path) {
-            println!("FOUND TIME: {} -> {}", ts, format_unix_to_ts(ts));
-            assert!(ts > 0);
-        } else {
-            panic!("Could not get backup execution time!");
-        }
+    fn same_title_distinct_peers_remain_separate_and_are_disambiguated() {
+        let root = std::env::temp_dir().join(format!(
+            "tgbackman-same-title-peer-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("backup.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+             "CREATE TABLE chats (
+                 chat_id TEXT PRIMARY KEY,
+                 chat_name TEXT,
+                 chat_type TEXT,
+                 backup_path TEXT,
+                 is_active INTEGER DEFAULT 0
+             );
+             CREATE TABLE messages (
+                 message_id INTEGER NOT NULL,
+                 chat_id TEXT NOT NULL,
+                 timestamp TEXT,
+                 timestamp_unix INTEGER,
+                 text TEXT
+             );
+             CREATE TABLE telegram_backup_targets (
+                 target_key TEXT PRIMARY KEY,
+                 chat_id TEXT NOT NULL UNIQUE,
+                 peer_kind TEXT NOT NULL,
+                 peer_id INTEGER NOT NULL,
+                 title TEXT NOT NULL,
+                 enabled INTEGER NOT NULL,
+                 output_dir TEXT
+             );
+             CREATE TABLE telegram_backup_target_chats (
+                 target_key TEXT NOT NULL,
+                 chat_id TEXT NOT NULL,
+                 match_method TEXT NOT NULL,
+                 linked_unix INTEGER NOT NULL,
+                 PRIMARY KEY(target_key, chat_id),
+                 UNIQUE(chat_id)
+             );
+             INSERT INTO chats(chat_id, chat_name, backup_path) VALUES
+                 ('channel_2346865455', 'Super OTP 🦸‍♂️', '/backup/Super OTP'),
+                 ('dialog_6333492840', 'Super OTP 🦸‍♂️', '/backup/Super OTP');
+             INSERT INTO messages(message_id, chat_id, timestamp, timestamp_unix, text) VALUES
+                 (1, 'channel_2346865455', '1970-01-01T00:01:40Z', 100, 'same message one'),
+                 (2, 'channel_2346865455', '1970-01-01T00:01:41Z', 101, 'same message two'),
+                 (3, 'channel_2346865455', '1970-01-01T00:01:42Z', 102, 'same message three'),
+                 (1, 'dialog_6333492840', '1970-01-01T00:01:40Z', 100, 'same message one'),
+                 (2, 'dialog_6333492840', '1970-01-01T00:01:41Z', 101, 'same message two'),
+                 (3, 'dialog_6333492840', '1970-01-01T00:01:42Z', 102, 'same message three');
+             INSERT INTO telegram_backup_targets
+                 (target_key, chat_id, peer_kind, peer_id, title, enabled, output_dir) VALUES
+                 ('otp-channel', 'channel_2346865455', 'channel', 2346865455, 'Super OTP 🦸‍♂️', 1, '/backup/Super OTP'),
+                 ('otp-user', 'dialog_6333492840', 'user', 6333492840, 'Super OTP 🦸‍♂️', 1, '/backup/Super OTP');
+             INSERT INTO telegram_backup_target_chats
+                 (target_key, chat_id, match_method, linked_unix) VALUES
+                 ('otp-channel', 'channel_2346865455', 'telegram-discovered', 1),
+                 ('otp-user', 'dialog_6333492840', 'telegram-discovered', 1);",
+        )
+        .unwrap();
+
+        let groups = run_inventory(&conn, db.to_str().unwrap()).unwrap();
+        assert_eq!(groups.len(), 2);
+        let mut names: Vec<String> = groups.iter().map(|group| group.name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "Super OTP 🦸‍♂️ [channel:2346865455]".to_string(),
+                "Super OTP 🦸‍♂️ [user:6333492840]".to_string()
+            ]
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovered_target_is_visible_as_zero_message_chat() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tgbackman-discovered-chat-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("backup.db");
+        let mut conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chats (
+                 chat_id TEXT PRIMARY KEY,
+                 chat_name TEXT,
+                 chat_type TEXT,
+                 backup_path TEXT,
+                 is_active INTEGER DEFAULT 0,
+                 last_backup_unix INTEGER
+             );
+             CREATE TABLE messages (
+                 message_id INTEGER NOT NULL,
+                 chat_id TEXT NOT NULL,
+                 timestamp TEXT,
+                 timestamp_unix INTEGER,
+                 text TEXT
+             );
+             CREATE TABLE telegram_backup_targets (
+                 target_key TEXT PRIMARY KEY,
+                 chat_id TEXT NOT NULL UNIQUE,
+                 peer_kind TEXT NOT NULL,
+                 peer_id INTEGER NOT NULL,
+                 title TEXT NOT NULL,
+                 enabled INTEGER NOT NULL,
+                 output_dir TEXT
+             );
+             CREATE TABLE telegram_backup_target_chats (
+                 target_key TEXT NOT NULL,
+                 chat_id TEXT NOT NULL,
+                 match_method TEXT NOT NULL,
+                 linked_unix INTEGER NOT NULL,
+                 PRIMARY KEY(target_key, chat_id),
+                 UNIQUE(chat_id)
+             );
+             INSERT INTO telegram_backup_targets
+                 (target_key, chat_id, peer_kind, peer_id, title, enabled, output_dir)
+             VALUES
+                 ('new-chat-key', 'dialog_42', 'user', 42, 'New Telegram Chat', 1,
+                  '/backup/New Telegram Chat'),
+                 ('disabled-key', 'group_99', 'group', 99, 'Migrated predecessor', 0,
+                  '/backup/Migrated predecessor');",
+        )
+        .unwrap();
+
+        let groups = run_inventory(&conn, db.to_str().unwrap()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "New Telegram Chat");
+        assert_eq!(groups[0].max_count, 0);
+        assert!(!groups[0].is_active());
+        assert!(!groups[0].is_blacklisted());
+        assert_eq!(groups[0].backups[0].chat_id, "dialog_42");
+        assert_eq!(groups[0].backups[0].path, "/backup/New Telegram Chat");
+        assert_eq!(
+            conn.query_row(
+                "SELECT match_method FROM telegram_backup_target_chats WHERE target_key='new-chat-key'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "telegram-discovered"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM chats WHERE chat_id='group_99'",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            0
+        );
+
+        assert_eq!(
+            set_chat_ids_blacklisted(&mut conn, &["group_99".to_string()], true).unwrap(),
+            1
+        );
+        let groups = run_inventory(&conn, db.to_str().unwrap()).unwrap();
+        let blocked = groups
+            .iter()
+            .find(|group| group.name == "Migrated predecessor")
+            .unwrap();
+        assert_eq!(blocked.max_count, 0);
+        assert!(blocked.is_blacklisted());
+        assert!(!blocked.is_active());
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn viewer_blacklist_deactivates_aliases_and_can_be_removed() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chats (
+                 chat_id TEXT PRIMARY KEY,
+                 chat_name TEXT,
+                 is_active INTEGER DEFAULT 0
+             );
+             CREATE TABLE telegram_backup_targets (
+                 target_key TEXT PRIMARY KEY,
+                 chat_id TEXT NOT NULL UNIQUE,
+                 peer_kind TEXT NOT NULL,
+                 peer_id INTEGER NOT NULL,
+                 title TEXT NOT NULL
+             );
+             CREATE TABLE telegram_backup_target_chats (
+                 target_key TEXT NOT NULL,
+                 chat_id TEXT NOT NULL,
+                 match_method TEXT NOT NULL,
+                 linked_unix INTEGER NOT NULL,
+                 PRIMARY KEY(target_key, chat_id),
+                 UNIQUE(chat_id)
+             );
+             INSERT INTO chats(chat_id, chat_name, is_active)
+                 VALUES ('current', 'Current', 1), ('historical', 'Old name', 1);
+             INSERT INTO telegram_backup_targets
+                 (target_key, chat_id, peer_kind, peer_id, title)
+                 VALUES ('stable-key', 'current', 'channel', 123, 'Current');
+             INSERT INTO telegram_backup_target_chats
+                 (target_key, chat_id, match_method, linked_unix)
+                 VALUES ('stable-key', 'current', 'canonical', 1),
+                        ('stable-key', 'historical', 'telegram-migrated-from', 1);",
+        )
+        .unwrap();
+
+        let chat_ids = vec!["current".to_string(), "historical".to_string()];
+        assert_eq!(
+            set_chat_ids_blacklisted(&mut conn, &chat_ids, true).unwrap(),
+            1
+        );
+        assert_eq!(
+            blacklisted_chat_ids(&conn).unwrap(),
+            HashSet::from(["current".to_string(), "historical".to_string()])
+        );
+        assert_eq!(
+            conn.query_row("SELECT SUM(is_active) FROM chats", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        assert_eq!(
+            set_chat_ids_blacklisted(&mut conn, &chat_ids, false).unwrap(),
+            1
+        );
+        assert!(blacklisted_chat_ids(&conn).unwrap().is_empty());
+        assert_eq!(
+            conn.query_row("SELECT SUM(is_active) FROM chats", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn inventory_preserves_repaired_backup_date_and_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "tgbackman-date-evidence-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("backup.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chats (
+                 chat_id TEXT PRIMARY KEY,
+                 chat_name TEXT,
+                 backup_path TEXT,
+                 is_active INTEGER DEFAULT 0,
+                 last_backup_unix INTEGER,
+                 last_backup_source TEXT,
+                 last_backup_confidence TEXT,
+                 last_backup_evidence TEXT
+             );
+             CREATE TABLE messages (
+                 message_id INTEGER NOT NULL,
+                 chat_id TEXT NOT NULL,
+                 timestamp TEXT,
+                 timestamp_unix INTEGER,
+                 text TEXT
+             );
+             INSERT INTO chats(
+                 chat_id, chat_name, backup_path, last_backup_unix,
+                 last_backup_source, last_backup_confidence, last_backup_evidence
+             ) VALUES (
+                 'legacy', 'Legacy', '/rewritten/path', 300,
+                 'converted_desktop_export_asset_batch', 'high', 'preserved assets'
+             );
+             INSERT INTO messages(message_id, chat_id, timestamp, timestamp_unix, text)
+                 VALUES (1, 'legacy', '1970-01-01T00:03:20Z', 200, 'message');",
+        )
+        .unwrap();
+
+        let groups = run_inventory(&conn, db.to_str().unwrap()).unwrap();
+        let backup = &groups[0].backups[0];
+        assert_eq!(backup.last_backup_unix, Some(300));
+        assert_eq!(
+            backup.last_backup_source,
+            "converted_desktop_export_asset_batch"
+        );
+        assert_eq!(backup.last_backup_confidence, "high");
+        assert_eq!(backup.last_backup_evidence, "preserved assets");
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrated_predecessors_are_hidden_or_grouped_by_message_presence() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chats (chat_id TEXT PRIMARY KEY);
+             CREATE TABLE messages (
+                 message_id INTEGER NOT NULL,
+                 chat_id TEXT NOT NULL
+             );
+             CREATE TABLE telegram_backup_targets (
+                 target_key TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 enabled INTEGER NOT NULL
+             );
+             CREATE TABLE telegram_backup_target_chats (
+                 target_key TEXT NOT NULL,
+                 chat_id TEXT NOT NULL,
+                 match_method TEXT NOT NULL
+             );
+             INSERT INTO chats(chat_id) VALUES
+                 ('channel_3929875088'),
+                 ('group_5272174971'),
+                 ('historical_group');
+             INSERT INTO messages(message_id, chat_id)
+                 VALUES (1, 'historical_group');
+             INSERT INTO telegram_backup_targets(target_key, title, enabled)
+                 VALUES ('group-2-target', 'Group 2', 1);
+             INSERT INTO telegram_backup_target_chats
+                 (target_key, chat_id, match_method)
+             VALUES
+                 ('group-2-target', 'channel_3929875088', 'telegram-discovered'),
+                 ('group-2-target', 'group_5272174971', 'telegram-migrated-from'),
+                 ('group-2-target', 'historical_group', 'telegram-migrated-from');",
+        )
+        .unwrap();
+
+        let hidden = zero_message_migrated_predecessors(&conn).unwrap();
+        assert_eq!(hidden, HashSet::from(["group_5272174971".to_string()]));
+
+        let mut uf = UnionFind::new();
+        let preferred_names = apply_authoritative_target_links(&conn, &mut uf).unwrap();
+        let current_root = uf.find("channel_3929875088");
+        assert_eq!(uf.find("group_5272174971"), current_root);
+        assert_eq!(uf.find("historical_group"), current_root);
+        assert_eq!(preferred_names.get(&current_root).unwrap(), "Group 2");
+    }
+
+    #[test]
+    fn cache_freshness_rejects_newer_database_and_wal() {
+        let root =
+            std::env::temp_dir().join(format!("tgbackman-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("backup.db");
+        let cache = root.join("backup_clusters.json");
+        std::fs::write(&cache, b"{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(&db, b"sqlite").unwrap();
+        assert!(!cache_is_fresh(
+            cache.to_str().unwrap(),
+            db.to_str().unwrap()
+        ));
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(&cache, b"{}").unwrap();
+        assert!(cache_is_fresh(
+            cache.to_str().unwrap(),
+            db.to_str().unwrap()
+        ));
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(format!("{}-wal", db.display()), b"uncheckpointed").unwrap();
+        assert!(!cache_is_fresh(
+            cache.to_str().unwrap(),
+            db.to_str().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2327,7 +3554,7 @@ mod tests {
         let db_path = format!("/media/{}/1b/sqlitedb/telegram_backup.db", user);
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let start = std::time::Instant::now();
-        let result = run_inventory(&conn);
+        let result = run_inventory(&conn, &db_path);
         let duration = start.elapsed();
         println!("run_inventory took: {:?}", duration);
         assert!(result.is_ok());
@@ -2340,19 +3567,24 @@ mod tests {
         let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
         let db_path = format!("/media/{}/1b/sqlitedb/telegram_backup.db", user);
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let groups = run_inventory(&conn).unwrap();
-        
+        let groups = run_inventory(&conn, &db_path).unwrap();
+
         // Find split chat
         let mut found_split = false;
         for g in &groups {
             for b in &g.backups {
                 if b.chat_id == "2015-02-27T19-06-48Z__2015-06-14T00-52-25Z" {
                     let stats = b.compute_media_stats(&db_path);
-                    println!("Split stats: photos_resolved={}/{}, videos_resolved={}/{}, voice_resolved={}/{}, files_resolved={}/{}",
-                        stats.photos_resolved, stats.photos_count,
-                        stats.videos_resolved, stats.videos_count,
-                        stats.voice_resolved, stats.voice_count,
-                        stats.files_resolved, stats.files_count
+                    println!(
+                        "Split stats: photos_resolved={}/{}, videos_resolved={}/{}, voice_resolved={}/{}, files_resolved={}/{}",
+                        stats.photos_resolved,
+                        stats.photos_count,
+                        stats.videos_resolved,
+                        stats.videos_count,
+                        stats.voice_resolved,
+                        stats.voice_count,
+                        stats.files_resolved,
+                        stats.files_count
                     );
                     assert!(stats.photos_resolved > 0);
                     assert!(stats.videos_resolved > 0);
@@ -2363,18 +3595,23 @@ mod tests {
             }
         }
         assert!(found_split, "Should have found the split backup chat");
-        
+
         // Find unofficial chat
         let mut found_unofficial = false;
         for g in &groups {
             for b in &g.backups {
                 if b.chat_id == "group_293206044" {
                     let stats = b.compute_media_stats(&db_path);
-                    println!("Unofficial stats: photos_resolved={}/{}, videos_resolved={}/{}, voice_resolved={}/{}, files_resolved={}/{}",
-                        stats.photos_resolved, stats.photos_count,
-                        stats.videos_resolved, stats.videos_count,
-                        stats.voice_resolved, stats.voice_count,
-                        stats.files_resolved, stats.files_count
+                    println!(
+                        "Unofficial stats: photos_resolved={}/{}, videos_resolved={}/{}, voice_resolved={}/{}, files_resolved={}/{}",
+                        stats.photos_resolved,
+                        stats.photos_count,
+                        stats.videos_resolved,
+                        stats.videos_count,
+                        stats.voice_resolved,
+                        stats.voice_count,
+                        stats.files_resolved,
+                        stats.files_count
                     );
                     assert!(stats.photos_resolved > 0);
                     assert!(stats.videos_resolved > 0);
@@ -2384,7 +3621,9 @@ mod tests {
                 }
             }
         }
-        assert!(found_unofficial, "Should have found the unofficial backup chat");
+        assert!(
+            found_unofficial,
+            "Should have found the unofficial backup chat"
+        );
     }
 }
-

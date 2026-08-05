@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --dev
+      - run: uv run python -m unittest discover -s tests -p 'test_*.py'
+      - run: uv run python -m py_compile telegram_incremental_backup.py src/tgbackup/*.py src/tgbackup/db/*.py src/tgbackup/backup/*.py src/tgbackup/telegram/*.py
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path tgsearch/Cargo.toml
+      - run: cargo test --manifest-path tgbackman/Cargo.toml -- --skip test_run_inventory_performance --skip test_compute_media_stats_split_and_unofficial

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tgbackman"
+version = "0.1.0"
+description = "Incremental Telegram backup, archive indexing, and verification tools"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "ijson>=3.2,<4",
+  "Telethon>=1.36",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+tgbackman-backup = "tgbackup.cli:main"
+tgbackman-db-import = "tgbackup.database.importer:main"
+tgbackman-db-rebuild = "tgbackup.database.rebuild:main"
+tgbackman-db-range-repair = "tgbackup.database.range_repair:main"
+tgbackman-db-overlap-report = "tgbackup.database.overlap_cli:main"
+tgbackman-legacy-inspect = "tgbackup.legacy_tree.inspect_tree:main"
+tgbackman-legacy-split = "tgbackup.legacy_tree.split_html:main"
+tgbackman-legacy-repair-links = "tgbackup.legacy_tree.link_repair:main"
+tgbackman-legacy-check-links = "tgbackup.legacy_tree.check_links:main"
+tgbackman-legacy-relocate-media = "tgbackup.legacy_tree.media_relocator:main"
+tgbackman-legacy-backfill-metadata = "tgbackup.legacy_tree.backfill_metadata:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

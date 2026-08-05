@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility launcher for legacy-tree metadata backfilling."""
+"""Compatibility launcher for the database rebuild command."""
 from __future__ import annotations
 
 import sys
@@ -10,8 +10,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from tgbackup.legacy_tree.backfill_metadata import *  # noqa: F401,F403
-from tgbackup.legacy_tree.backfill_metadata import main
+from tgbackup.database.rebuild import main
 
 
 if __name__ == "__main__":
