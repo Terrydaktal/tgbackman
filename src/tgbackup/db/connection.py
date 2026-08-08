@@ -18,8 +18,9 @@ def open_database(
     """Open, validate, and migrate a tgbackman database.
 
     ``ensure_schema`` is injected by the application layer to keep connection
-    handling independent from migration DDL.  ``setup_database`` is retained
-    as an adapter for the legacy archival indexer.
+    handling independent from migration DDL. ``setup_database`` is an optional
+    migration hook for callers that need a custom database bootstrap policy;
+    the canonical schema service is used by default.
     """
     if not path.exists():
         raise ExportError(f"Database does not exist: {path}")
@@ -38,14 +39,8 @@ def open_database(
     if not archival_tables.issubset(required) or "raw_payload" not in message_columns:
         conn.close()
         if setup_database is None:
-            try:
-                from ..database.importer import setup_database as legacy_setup_database
-            except ImportError as exc:
-                raise ExportError(
-                    "This database needs the legacy archive-index migration, but db_indexer.py "
-                    "is not installed. Run from the tgbackman checkout or migrate the database first."
-                ) from exc
-            setup_database = legacy_setup_database
+            from .schema import setup_database as canonical_setup_database
+            setup_database = canonical_setup_database
         conn = setup_database(str(path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 30000")

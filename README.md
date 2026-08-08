@@ -30,9 +30,18 @@ tgbackman/
 │   │   └── range_repair.py
 │   ├── cli.py                         # `tgbackman-backup` entry point
 │   ├── config.py                      # Credentials, paths, parsers, permissions
-│   ├── db/                            # Runtime SQLite repositories
+│   ├── db/                            # Canonical schema, archive, provenance, repositories
+│   │   ├── schema.py                  # Tables, migrations, FTS, statistics
+│   │   ├── archive.py                 # Rich message conversion/upserts
+│   │   ├── sources.py                 # Source registration/media integrity
+│   │   └── repository.py              # Target/chat selection queries
 │   ├── telegram/                      # Telethon authentication and peer helpers
-│   └── backup/                        # API media integrity and resumable staging
+│   └── backup/                        # API media, target mapping, records, staging
+│       ├── targets.py                 # Stable peer identity/output policy
+│       ├── target_mapping.py          # Telegram dialog-to-chat mapping
+│       ├── records.py                 # Pure record/range helpers
+│       ├── media.py                   # Download/type/size/hash handling
+│       └── staging.py                 # Durable failed-run staging/resume
 ├── scripts/                           # Future optional convenience launchers
 ├── telegram_incremental_backup.py    # Compatibility launcher
 ├── db_indexer.py                      # Compatibility launcher; database-facing

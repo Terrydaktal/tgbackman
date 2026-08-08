@@ -65,6 +65,9 @@ from .config import (
 from .errors import ExportError
 from .db import (
     active_chats,
+    ensure_targets_schema as canonical_ensure_targets_schema,
+    refresh_chat_statistics as canonical_refresh_chat_statistics,
+    upsert_archival_message,
     blacklisted_target_keys,
     database_chats,
     load_targets,
@@ -97,6 +100,39 @@ from .backup.media import (
 )
 from .backup.staging import prune_completed_staging, staged_resume_after_id, verify_record_media
 from .telegram.client import connect_client, require_telethon, resolve_peer, target_input_peer
+from .backup.records import (
+    database_run_key,
+    json_safe,
+    range_dir_name,
+    range_dir_name_from_stats,
+    sender_label,
+)
+from .backup import target_mapping as target_mapping_service
+from .backup.target_mapping import (
+    auto_map_database_chats as _auto_map_database_chats,
+    cache_dialog,
+    consolidate_migrated_targets,
+    legacy_chat_id,
+    link_target_chat,
+    match_dialogs_to_database_chats,
+    materialize_unbacked_target_chats,
+    migrated_peer_destination,
+)
+from .backup.targets import (
+    database_peer_hint,
+    direct_target_output_dir,
+    entity_description,
+    generated_chat_id,
+    normalized_chat_name,
+    path_is_under,
+    target_key,
+    target_output_dir,
+)
+
+# Compatibility names retained for callers that historically imported these
+# schema helpers from exporter.py; implementation now lives in tgbackup.db.
+ensure_targets_schema = canonical_ensure_targets_schema
+refresh_chat_statistics = canonical_refresh_chat_statistics
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -110,279 +146,24 @@ def iso_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def target_output_dir(output_root: Path, target: Target) -> Path:
-    """Choose a stable per-peer directory, separating same-title chats."""
-    ensure_private_dir(output_root)
-    configured = Path(target.output_dir).expanduser().resolve() if target.output_dir else None
-    # A mapped directory is honored only when it is inside the command's
-    # output root.  This prevents an old absolute mapping (for example from a
-    # previous disk or machine) from silently redirecting a bulk run elsewhere.
-    if configured is not None and path_is_under(configured, output_root):
-        base = configured
-    else:
-        base = output_root / safe_component(target.title)
-    marker = base / ".tgbackman_target.json"
-    if marker.is_file():
-        try:
-            existing = json.loads(marker.read_text(encoding="utf-8"))
-            if str(existing.get("chat_id")) != target.chat_id:
-                base = output_root / f"{safe_component(target.title)}__{safe_component(target.chat_id)}"
-        except (OSError, ValueError, TypeError):
-            base = output_root / f"{safe_component(target.title)}__{safe_component(target.chat_id)}"
-    elif base.is_dir() and any(base.iterdir()):
-        # Never silently attach an old unmarked export to a newly mapped peer.
-        # A matching partial-state marker is the one safe exception because it
-        # allows an interrupted run to resume in place.
-        partial_matches = False
-        for state in base.glob(".partial-*/.partial_state.json"):
-            try:
-                partial_matches = json.loads(state.read_text(encoding="utf-8")).get("target_key") == target.target_key
-            except (OSError, ValueError, TypeError):
-                continue
-            if partial_matches:
-                break
-        if not partial_matches:
-            base = output_root / f"{safe_component(target.title)}__{safe_component(target.chat_id)}"
-    ensure_private_dir(base)
-    marker = base / ".tgbackman_target.json"
-    if not marker.exists():
-        marker.write_text(
-            json.dumps({"chat_id": target.chat_id, "target_key": target.target_key, "title": target.title}, indent=2)
-            + "\n",
-            encoding="utf-8",
-        )
-        with contextlib.suppress(OSError):
-            marker.chmod(0o600)
-    return base
+def upsert_target(*args: Any, **kwargs: Any) -> Target:
+    """Compatibility wrapper that keeps legacy monkey-patching working."""
+    target_mapping_service.entity_description = entity_description
+    target_mapping_service.target_key = target_key
+    return target_mapping_service.upsert_target(*args, **kwargs)
 
 
-def direct_target_output_dir(path: Path, target: Target, *, write_marker: bool) -> Path:
-    """Use an explicitly selected existing chat directory without adding a title level."""
-    if not path.is_dir():
-        raise ExportError(f"--chat-output-dir must be an existing directory: {path}")
-    marker = path / ".tgbackman_target.json"
-    if marker.exists():
-        try:
-            existing = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError) as exc:
-            raise ExportError(f"invalid target marker in {path}: {exc}") from exc
-        if str(existing.get("chat_id")) != target.chat_id:
-            raise ExportError(
-                f"{path} is already marked for chat_id={existing.get('chat_id')!r}, "
-                f"not {target.chat_id!r}"
-            )
-    elif write_marker:
-        marker.write_text(
-            json.dumps(
-                {"chat_id": target.chat_id, "target_key": target.target_key, "title": target.title},
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        with contextlib.suppress(OSError):
-            marker.chmod(0o600)
-    return path
-
-
-def ensure_targets_schema(conn: sqlite3.Connection) -> None:
-    existing_tables = {
-        str(row[0]) for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
-    }
-    # These denormalized columns are consumed by the GUI.  Keep them present
-    # for exporter-created databases too, so a direct API merge can refresh the
-    # same statistics atomically instead of waiting for a GUI migration.
-    for column, sql_type in {
-        "min_msg_id": "INTEGER",
-        "max_msg_id": "INTEGER",
-        "msg_count": "INTEGER",
-        "min_timestamp": "TEXT",
-        "max_timestamp": "TEXT",
-        "min_timestamp_unix": "INTEGER",
-        "max_timestamp_unix": "INTEGER",
-        "last_backup_source": "TEXT",
-        "last_backup_confidence": "TEXT",
-        "last_backup_evidence": "TEXT",
-        "last_backup_run_unix": "INTEGER",
-        "last_backup_run_status": "TEXT",
-    }.items():
-        try:
-            conn.execute(f"ALTER TABLE chats ADD COLUMN {column} {sql_type}")
-        except sqlite3.OperationalError:
-            pass
-    if {
-        TARGETS_TABLE, EXPORTS_TABLE, RUNS_TABLE, RUN_MESSAGES_TABLE,
-        TARGET_CHAT_LINKS_TABLE, DIALOGS_TABLE, PURGES_TABLE, BLACKLIST_TABLE,
-    }.issubset(existing_tables):
-        conn.commit()
-        return
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {TARGETS_TABLE} (
-            target_key TEXT PRIMARY KEY,
-            source_name TEXT NOT NULL,
-            chat_id TEXT NOT NULL UNIQUE,
-            peer_kind TEXT NOT NULL,
-            peer_id INTEGER NOT NULL,
-            access_hash INTEGER,
-            title TEXT NOT NULL,
-            username TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            output_dir TEXT,
-            last_message_id INTEGER,
-            last_message_unix INTEGER,
-            last_export_unix INTEGER,
-            created_unix INTEGER NOT NULL,
-            updated_unix INTEGER NOT NULL,
-            UNIQUE(peer_kind, peer_id)
-        )
-        """
-    )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {TARGET_CHAT_LINKS_TABLE} (
-            target_key TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            match_method TEXT NOT NULL,
-            linked_unix INTEGER NOT NULL,
-            PRIMARY KEY(target_key, chat_id),
-            UNIQUE(chat_id)
-        )
-        """
-    )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {DIALOGS_TABLE} (
-            peer_kind TEXT NOT NULL,
-            peer_id INTEGER NOT NULL,
-            access_hash INTEGER,
-            title TEXT NOT NULL,
-            username TEXT,
-            entity_type TEXT NOT NULL,
-            last_seen_unix INTEGER NOT NULL,
-            PRIMARY KEY(peer_kind, peer_id)
-        )
-        """
-    )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {RUNS_TABLE} (
-            run_key TEXT PRIMARY KEY,
-            target_key TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            baseline_message_id INTEGER,
-            baseline_unix INTEGER,
-            full_rescan INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL,
-            started_unix INTEGER NOT NULL,
-            completed_unix INTEGER,
-            error TEXT
-        )
-        """
-    )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {RUN_MESSAGES_TABLE} (
-            run_key TEXT NOT NULL,
-            message_id INTEGER NOT NULL,
-            record_json TEXT NOT NULL,
-            media_error TEXT,
-            PRIMARY KEY(run_key, message_id),
-            FOREIGN KEY(run_key) REFERENCES {RUNS_TABLE}(run_key) ON DELETE CASCADE
-        )
-        """
-    )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {EXPORTS_TABLE} (
-            export_key TEXT PRIMARY KEY,
-            target_key TEXT NOT NULL,
-            source_name TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            output_path TEXT NOT NULL UNIQUE,
-            message_count INTEGER NOT NULL DEFAULT 0,
-            first_message_id INTEGER,
-            last_message_id INTEGER,
-            first_message_unix INTEGER,
-            last_message_unix INTEGER,
-            created_unix INTEGER NOT NULL,
-            indexed_unix INTEGER,
-            applied_unix INTEGER
-        )
-        """
-    )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {PURGES_TABLE} (
-            purge_key TEXT PRIMARY KEY,
-            target_key TEXT NOT NULL,
-            title TEXT NOT NULL,
-            chat_ids_json TEXT NOT NULL,
-            manifest_json TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_unix INTEGER NOT NULL,
-            completed_unix INTEGER,
-            error TEXT
-        )
-        """
-    )
-    conn.execute(
-        f"CREATE INDEX IF NOT EXISTS idx_{PURGES_TABLE}_target ON {PURGES_TABLE}(target_key, created_unix)"
-    )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {BLACKLIST_TABLE} (
-            target_key TEXT PRIMARY KEY,
-            peer_kind TEXT NOT NULL,
-            peer_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            reason TEXT,
-            created_unix INTEGER NOT NULL,
-            UNIQUE(peer_kind, peer_id)
-        )
-        """
-    )
-    conn.execute(
-        f"""
-        INSERT OR IGNORE INTO {TARGET_CHAT_LINKS_TABLE} (
-            target_key, chat_id, match_method, linked_unix
-        )
-        SELECT target_key, chat_id, 'canonical', ?
-        FROM {TARGETS_TABLE}
-        WHERE EXISTS (SELECT 1 FROM chats WHERE chats.chat_id = {TARGETS_TABLE}.chat_id)
-        """,
-        (unix_now(),),
-    )
-    conn.commit()
-
-
-def refresh_chat_statistics(conn: sqlite3.Connection, chat_id: str) -> None:
-    """Refresh the GUI's cached chat range/count after a message merge."""
-    row = conn.execute(
-        """
-        SELECT MIN(message_id), MAX(message_id), COUNT(*),
-               MIN(timestamp), MAX(timestamp),
-               MIN(timestamp_unix), MAX(timestamp_unix)
-        FROM messages WHERE chat_id = ?
-        """,
-        (chat_id,),
-    ).fetchone()
-    conn.execute(
-        """
-        UPDATE chats
-        SET min_msg_id = ?, max_msg_id = ?, msg_count = ?,
-            min_timestamp = ?, max_timestamp = ?,
-            min_timestamp_unix = ?, max_timestamp_unix = ?
-        WHERE chat_id = ?
-        """,
-        (*row, chat_id),
-    )
+def auto_map_database_chats(*args: Any, **kwargs: Any) -> tuple[int, int, int, list[tuple[DatabaseChat, str]]]:
+    target_mapping_service.entity_description = entity_description
+    target_mapping_service.target_key = target_key
+    return _auto_map_database_chats(*args, **kwargs)
 
 
 def open_db(path: Path) -> sqlite3.Connection:
-    return open_database(path, ensure_schema=ensure_targets_schema)
+    # Schema/migration ownership belongs to tgbackup.db; this keeps the
+    # exporter independent from the legacy importer and makes direct API
+    # writes use the same migration path as the GUI/indexer.
+    return open_database(path, ensure_schema=canonical_ensure_targets_schema)
 
 
 def export_key(path: Path) -> str:
@@ -426,14 +207,6 @@ def record_export(
         ),
     )
     conn.commit()
-
-
-def path_is_under(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
 
 
 def pending_exports(conn: sqlite3.Connection, output_root: Optional[Path] = None) -> list[sqlite3.Row]:
@@ -519,455 +292,6 @@ def mark_exports_indexed(conn: sqlite3.Connection, output_root: Optional[Path] =
     conn.commit()
 
 
-def target_key(source_name: str, peer_kind: str, peer_id: int) -> str:
-    digest = hashlib.sha1(f"{source_name.strip().casefold()}\0{peer_kind}\0{peer_id}".encode()).hexdigest()[:12]
-    return f"{safe_component(source_name).lower().replace(' ', '_')}-{digest}"
-
-
-def legacy_chat_id(conn: sqlite3.Connection, source_name: str, peer_kind: str, peer_id: int) -> str:
-    """Reuse an existing tgbackman ID where it clearly matches this peer."""
-    try:
-        rows = conn.execute(
-            """
-            SELECT chat_id FROM chats
-            WHERE lower(trim(chat_name)) = lower(trim(?))
-            ORDER BY COALESCE(max_timestamp_unix, 0) DESC
-            """,
-            (source_name,),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        rows = conn.execute(
-            "SELECT chat_id FROM chats WHERE lower(trim(chat_name)) = lower(trim(?))",
-            (source_name,),
-        ).fetchall()
-    suffix = str(peer_id)
-    for row in rows:
-        value = str(row["chat_id"])
-        if value == suffix or value.endswith(f"_{suffix}"):
-            return value
-    if len(rows) == 1:
-        return str(rows[0]["chat_id"])
-    prefix = "dialog" if peer_kind == "user" else "group" if peer_kind == "group" else "channel"
-    return f"{prefix}_{peer_id}"
-
-
-def entity_description(entity: Any) -> tuple[str, str, Optional[str], int, Optional[int], str]:
-    from telethon.tl.types import Channel, Chat, User
-
-    if isinstance(entity, User):
-        kind = "user"
-        title = " ".join(x for x in (entity.first_name, entity.last_name) if x).strip()
-        title = title or entity.username or str(entity.id)
-        access_hash = int(entity.access_hash) if entity.access_hash is not None else None
-    elif isinstance(entity, Channel):
-        kind = "channel"
-        title = entity.title or str(entity.id)
-        access_hash = int(entity.access_hash) if entity.access_hash is not None else None
-    elif isinstance(entity, Chat):
-        kind = "group"
-        title = entity.title or str(entity.id)
-        access_hash = None
-    else:
-        raise ExportError(f"Unsupported Telegram entity type: {type(entity).__name__}")
-    username = getattr(entity, "username", None)
-    return kind, title, username, int(entity.id), access_hash, entity.__class__.__name__
-
-
-def normalized_chat_name(value: str) -> str:
-    return " ".join(value.strip().casefold().split())
-
-
-def database_peer_hint(chat_id: str) -> Optional[tuple[frozenset[str], int]]:
-    """Extract reliable Telegram peer hints emitted by older importers."""
-    match = re.fullmatch(r"(dialog|user|group|channel)_(-?\d+)", chat_id.strip(), re.IGNORECASE)
-    if not match:
-        return None
-    prefix, raw_id = match.groups()
-    kinds = {
-        "dialog": frozenset({"user"}),
-        "user": frozenset({"user"}),
-        # Telegram basic groups and supergroups may have been labelled with
-        # the same legacy prefix, while Telethon exposes the latter as Channel.
-        "group": frozenset({"group", "channel"}),
-        "channel": frozenset({"channel"}),
-    }[prefix.casefold()]
-    return kinds, abs(int(raw_id))
-
-
-def generated_chat_id(peer_kind: str, peer_id: int) -> str:
-    prefix = "dialog" if peer_kind == "user" else "group" if peer_kind == "group" else "channel"
-    return f"{prefix}_{peer_id}"
-
-
-def cache_dialog(
-    conn: sqlite3.Connection,
-    description: tuple[str, str, Optional[str], int, Optional[int], str],
-) -> None:
-    kind, title, username, peer_id, access_hash, entity_type = description
-    conn.execute(
-        f"""
-        INSERT INTO {DIALOGS_TABLE} (
-            peer_kind, peer_id, access_hash, title, username, entity_type, last_seen_unix
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(peer_kind, peer_id) DO UPDATE SET
-            access_hash = excluded.access_hash,
-            title = excluded.title,
-            username = excluded.username,
-            entity_type = excluded.entity_type,
-            last_seen_unix = excluded.last_seen_unix
-        """,
-        (kind, peer_id, access_hash, title, username, entity_type, unix_now()),
-    )
-
-
-def migrated_peer_destination(entity: Any) -> Optional[tuple[str, int]]:
-    """Return Telegram's authoritative destination for a migrated basic group."""
-    migrated_to = getattr(entity, "migrated_to", None)
-    channel_id = getattr(migrated_to, "channel_id", None)
-    if channel_id is None:
-        return None
-    return "channel", abs(int(channel_id))
-
-
-def consolidate_migrated_targets(
-    conn: sqlite3.Connection,
-    candidates: list[tuple[Any, tuple[str, str, Optional[str], int, Optional[int], str]]],
-) -> list[tuple[str, str]]:
-    """Move archive links to the current supergroup target and disable its predecessor.
-
-    Telegram's ``Chat.migrated_to`` field is a stable peer relationship, so it
-    is safe to use where title/name matching would not be.  Watermarks are not
-    copied because basic-group and supergroup message-ID spaces are unrelated.
-    """
-    known_peers = {(description[0], description[3]) for _, description in candidates}
-    consolidated: list[tuple[str, str]] = []
-    for entity, description in candidates:
-        old_peer = (description[0], description[3])
-        new_peer = migrated_peer_destination(entity)
-        if new_peer is None or new_peer not in known_peers:
-            continue
-        old_target = conn.execute(
-            f"SELECT target_key FROM {TARGETS_TABLE} WHERE peer_kind=? AND peer_id=?",
-            old_peer,
-        ).fetchone()
-        new_target = conn.execute(
-            f"SELECT target_key FROM {TARGETS_TABLE} WHERE peer_kind=? AND peer_id=?",
-            new_peer,
-        ).fetchone()
-        if old_target is None or new_target is None:
-            continue
-        old_key = str(old_target["target_key"])
-        new_key = str(new_target["target_key"])
-        if old_key == new_key:
-            continue
-        conn.execute(
-            f"""UPDATE {TARGET_CHAT_LINKS_TABLE}
-                SET target_key=?, match_method='telegram-migrated-from', linked_unix=?
-                WHERE target_key=?""",
-            (new_key, unix_now(), old_key),
-        )
-        conn.execute(
-            f"UPDATE {TARGETS_TABLE} SET enabled=0, updated_unix=? WHERE target_key=?",
-            (unix_now(), old_key),
-        )
-        consolidated.append((old_key, new_key))
-    return consolidated
-
-
-def link_target_chat(
-    conn: sqlite3.Connection,
-    target_key_value: str,
-    chat_id: str,
-    match_method: str,
-) -> None:
-    conflict = conn.execute(
-        f"SELECT target_key FROM {TARGET_CHAT_LINKS_TABLE} WHERE chat_id = ? AND target_key <> ?",
-        (chat_id, target_key_value),
-    ).fetchone()
-    if conflict:
-        raise ExportError(
-            f"Database chat {chat_id!r} is already linked to target {conflict['target_key']!r}"
-        )
-    conn.execute(
-        f"""
-        INSERT INTO {TARGET_CHAT_LINKS_TABLE} (target_key, chat_id, match_method, linked_unix)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(target_key, chat_id) DO UPDATE SET
-            match_method = excluded.match_method,
-            linked_unix = excluded.linked_unix
-        """,
-        (target_key_value, chat_id, match_method, unix_now()),
-    )
-
-
-def materialize_unbacked_target_chats(conn: sqlite3.Connection) -> tuple[int, int]:
-    """Expose runnable or blacklisted Telegram-only targets as zero-message chats.
-
-    ``map --all`` used to cache unmatched Telegram dialogs only in the target
-    tables.  The GUI inventories ``chats``, so those valid targets remained
-    invisible and could not be selected for backup.  Create one stable
-    placeholder for each enabled target that has no archive link yet. Blacklisted
-    disabled tombstones are also retained so the viewer can display and unlist
-    them. Once a user activates a normal placeholder, the ordinary active-target
-    query schedules it; the first successful export updates the same row in place.
-    """
-    rows = conn.execute(
-        f"""
-        SELECT target_key, chat_id, title, peer_kind, output_dir
-        FROM {TARGETS_TABLE} AS targets
-        WHERE (
-                COALESCE(enabled, 1) = 1
-                OR EXISTS (
-                    SELECT 1 FROM {BLACKLIST_TABLE} AS blacklist
-                    WHERE blacklist.target_key = targets.target_key
-                       OR (blacklist.peer_kind = targets.peer_kind AND blacklist.peer_id = targets.peer_id)
-                )
-              )
-          AND NOT EXISTS (
-              SELECT 1 FROM {TARGET_CHAT_LINKS_TABLE} AS links
-              WHERE links.target_key = targets.target_key
-          )
-        ORDER BY lower(title), target_key
-        """
-    ).fetchall()
-    inserted = 0
-    linked = 0
-    for row in rows:
-        chat_type = "personal_chat" if row["peer_kind"] == "user" else str(row["peer_kind"])
-        cursor = conn.execute(
-            """
-            INSERT OR IGNORE INTO chats (
-                chat_id, chat_name, chat_type, backup_path, is_active,
-                last_backup_unix, last_backup_run_unix, last_backup_run_status, msg_count
-            ) VALUES (?, ?, ?, ?, 0, NULL, NULL, NULL, 0)
-            """,
-            (
-                str(row["chat_id"]),
-                str(row["title"]),
-                chat_type,
-                str(row["output_dir"]) if row["output_dir"] else None,
-            ),
-        )
-        inserted += max(cursor.rowcount, 0)
-        link_target_chat(
-            conn,
-            str(row["target_key"]),
-            str(row["chat_id"]),
-            "telegram-discovered",
-        )
-        linked += 1
-    return inserted, linked
-
-
-def upsert_target(
-    conn: sqlite3.Connection,
-    source_name: str,
-    entity: Any,
-    output_root: Path,
-    explicit_chat_id: Optional[str] = None,
-    *,
-    commit: bool = True,
-) -> Target:
-    kind, title, username, peer_id, access_hash, _ = entity_description(entity)
-    key = target_key(source_name, kind, peer_id)
-    existing = conn.execute(
-        f"SELECT * FROM {TARGETS_TABLE} WHERE target_key = ?", (key,)
-    ).fetchone()
-    if existing is None:
-        existing = conn.execute(
-            f"SELECT * FROM {TARGETS_TABLE} WHERE peer_kind = ? AND peer_id = ?",
-            (kind, peer_id),
-        ).fetchone()
-        if existing is not None:
-            key = str(existing["target_key"])
-    if existing:
-        chat_id = str(existing["chat_id"])
-        if explicit_chat_id and explicit_chat_id != chat_id:
-            conflict = conn.execute(
-                f"SELECT target_key FROM {TARGETS_TABLE} WHERE chat_id = ? AND target_key <> ?",
-                (explicit_chat_id, key),
-            ).fetchone()
-            if conflict:
-                raise ExportError(f"Chat ID {explicit_chat_id!r} is already mapped to {conflict['target_key']!r}")
-            chat_id = explicit_chat_id
-        output_dir = existing["output_dir"] or str(output_root / safe_component(title))
-        conn.execute(
-            f"""
-            UPDATE {TARGETS_TABLE}
-            SET source_name = ?, chat_id = ?, title = ?, username = ?, access_hash = ?,
-                output_dir = ?, updated_unix = ?
-            WHERE target_key = ?
-            """,
-            (source_name, chat_id, title, username, access_hash, output_dir, unix_now(), key),
-        )
-    else:
-        chat_id = explicit_chat_id or legacy_chat_id(conn, source_name, kind, peer_id)
-        conflict = conn.execute(
-            f"SELECT target_key FROM {TARGETS_TABLE} WHERE chat_id = ? AND target_key <> ?",
-            (chat_id, key),
-        ).fetchone()
-        if conflict:
-            raise ExportError(
-                f"Chat ID {chat_id!r} is already mapped to target {conflict['target_key']!r}; "
-                "use --chat-id to choose a stable unique ID."
-            )
-        output_dir = str(output_root / safe_component(title))
-        conn.execute(
-            f"""
-            INSERT INTO {TARGETS_TABLE} (
-                target_key, source_name, chat_id, peer_kind, peer_id, access_hash,
-                title, username, enabled, output_dir, created_unix, updated_unix
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-            """,
-            (key, source_name, chat_id, kind, peer_id, access_hash, title, username,
-             output_dir, unix_now(), unix_now()),
-        )
-    if commit:
-        conn.commit()
-    row = conn.execute(f"SELECT * FROM {TARGETS_TABLE} WHERE target_key = ?", (key,)).fetchone()
-    assert row is not None
-    return row_to_target(row)
-
-
-def match_dialogs_to_database_chats(
-    chats: list[DatabaseChat],
-    candidates: list[tuple[Any, tuple[str, str, Optional[str], int, Optional[int], str]]],
-) -> tuple[
-    dict[tuple[str, int], list[tuple[DatabaseChat, str]]],
-    list[tuple[DatabaseChat, str]],
-]:
-    """Match stable peer hints first, then unique normalized Telegram titles."""
-    by_peer: dict[tuple[str, int], list[tuple[Any, tuple[str, str, Optional[str], int, Optional[int], str]]]] = {}
-    by_name: dict[str, list[tuple[Any, tuple[str, str, Optional[str], int, Optional[int], str]]]] = {}
-    for candidate in candidates:
-        description = candidate[1]
-        by_peer.setdefault((description[0], description[3]), []).append(candidate)
-        by_name.setdefault(normalized_chat_name(description[1]), []).append(candidate)
-
-    assignments: dict[tuple[str, int], list[tuple[DatabaseChat, str]]] = {}
-    unresolved: list[tuple[DatabaseChat, str]] = []
-    assigned_chat_ids: set[str] = set()
-
-    for chat in chats:
-        hint = database_peer_hint(chat.chat_id)
-        if hint is None:
-            continue
-        allowed_kinds, peer_id = hint
-        matches = [
-            candidate
-            for kind in allowed_kinds
-            for candidate in by_peer.get((kind, peer_id), [])
-        ]
-        if len(matches) == 1:
-            description = matches[0][1]
-            assignments.setdefault((description[0], description[3]), []).append((chat, "peer-id"))
-            assigned_chat_ids.add(chat.chat_id)
-        elif len(matches) > 1:
-            unresolved.append((chat, "peer ID matched more than one Telegram dialog"))
-            assigned_chat_ids.add(chat.chat_id)
-
-    for chat in chats:
-        if chat.chat_id in assigned_chat_ids:
-            continue
-        matches = by_name.get(normalized_chat_name(chat.name), [])
-        if len(matches) == 1:
-            description = matches[0][1]
-            assignments.setdefault((description[0], description[3]), []).append((chat, "exact-title"))
-        elif len(matches) > 1:
-            unresolved.append((chat, "title matches more than one Telegram dialog"))
-        else:
-            unresolved.append((chat, "no exact Telegram dialog match"))
-    return assignments, unresolved
-
-
-def auto_map_database_chats(
-    conn: sqlite3.Connection,
-    chats: list[DatabaseChat],
-    candidates: list[tuple[Any, tuple[str, str, Optional[str], int, Optional[int], str]]],
-    output_root: Path,
-    *,
-    include_unmatched_dialogs: bool,
-) -> tuple[int, int, int, list[tuple[DatabaseChat, str]]]:
-    """Cache every dialog and create/link safe target mappings in one transaction."""
-    unique_candidates: dict[
-        tuple[str, int],
-        tuple[Any, tuple[str, str, Optional[str], int, Optional[int], str]],
-    ] = {}
-    for candidate in candidates:
-        description = candidate[1]
-        unique_candidates[(description[0], description[3])] = candidate
-        cache_dialog(conn, description)
-
-    # Existing explicit and previously verified links are authoritative.  A
-    # later title change must not silently remap the same archive row.
-    linked_chat_ids = {
-        str(row[0])
-        for row in conn.execute(f"SELECT chat_id FROM {TARGET_CHAT_LINKS_TABLE}")
-    }
-    assignments, unresolved = match_dialogs_to_database_chats(
-        [chat for chat in chats if chat.chat_id not in linked_chat_ids],
-        list(unique_candidates.values()),
-    )
-    target_count = 0
-    linked_count = 0
-    try:
-        for peer_key, (entity, description) in unique_candidates.items():
-            linked_chats = assignments.get(peer_key, [])
-            existing = conn.execute(
-                f"SELECT * FROM {TARGETS_TABLE} WHERE peer_kind = ? AND peer_id = ?",
-                peer_key,
-            ).fetchone()
-            if existing is not None:
-                source_name = str(existing["source_name"])
-                explicit_chat_id = None
-            elif linked_chats:
-                def canonical_score(item: tuple[DatabaseChat, str]) -> tuple[int, int, int, str]:
-                    chat, method = item
-                    return (
-                        1 if method == "peer-id" else 0,
-                        1 if chat.is_active else 0,
-                        chat.max_timestamp_unix or 0,
-                        chat.chat_id,
-                    )
-
-                canonical, _ = max(linked_chats, key=canonical_score)
-                source_name = canonical.name
-                explicit_chat_id = canonical.chat_id
-            elif include_unmatched_dialogs:
-                source_name = description[1]
-                explicit_chat_id = generated_chat_id(description[0], description[3])
-            else:
-                continue
-
-            target = upsert_target(
-                conn,
-                source_name,
-                entity,
-                output_root,
-                explicit_chat_id,
-                commit=False,
-            )
-            target_count += 1
-            for chat, method in linked_chats:
-                link_target_chat(conn, target.target_key, chat.chat_id, method)
-                linked_count += 1
-        migrated_targets = consolidate_migrated_targets(
-            conn, list(unique_candidates.values())
-        )
-        for old_key, new_key in migrated_targets:
-            print(
-                f"Consolidated migrated Telegram target {old_key} into {new_key}; "
-                "the old basic-group target is disabled."
-            )
-        discovered_count, discovered_links = materialize_unbacked_target_chats(conn)
-        linked_count += discovered_links
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    return target_count, linked_count, discovered_count, unresolved
-
-
 def baseline_for_target(conn: sqlite3.Connection, target: Target) -> tuple[Optional[int], Optional[int]]:
     if target.last_message_id is not None or target.last_message_unix is not None:
         return target.last_message_id, target.last_message_unix
@@ -1017,36 +341,6 @@ def baseline_for_target(conn: sqlite3.Connection, target: Target) -> tuple[Optio
                     # retain the user's detected backup boundary in that case.
                     message_unix = int(row[3])
     return message_id, message_unix
-
-
-def sender_label(sender: Any, sender_id: Optional[int], outgoing: bool) -> str:
-    if outgoing:
-        return "Me"
-    if sender is None:
-        return str(sender_id) if sender_id is not None else "Unknown"
-    title = getattr(sender, "title", None)
-    if title:
-        return str(title)
-    name = " ".join(
-        str(value) for value in (getattr(sender, "first_name", None), getattr(sender, "last_name", None))
-        if value
-    ).strip()
-    return name or getattr(sender, "username", None) or str(sender_id or "Unknown")
-
-
-def json_safe(value: Any) -> Any:
-    """Convert Telethon TL objects into JSON-safe structured metadata."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, bytes):
-        return {"__bytes_hex__": value.hex()}
-    if hasattr(value, "to_dict"):
-        return json_safe(value.to_dict())
-    if isinstance(value, dict):
-        return {str(key): json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [json_safe(item) for item in value]
-    return str(value)
 
 
 async def message_record(
@@ -1364,29 +658,6 @@ async def collect_messages(
     return records, errors
 
 
-def range_dir_name(records: list[dict[str, Any]], now: datetime) -> str:
-    dates = [
-        int(record["date_unixtime"])
-        for record in records
-        if record.get("date_unixtime") is not None and str(record["date_unixtime"]).isdigit()
-    ]
-    if dates:
-        start = datetime.fromtimestamp(min(dates), timezone.utc)
-        end = datetime.fromtimestamp(max(dates), timezone.utc)
-    else:
-        start = end = now
-    return f"{start.strftime('%Y-%m-%dT%H-%M-%SZ')}__{end.strftime('%Y-%m-%dT%H-%M-%SZ')}"
-
-
-def range_dir_name_from_stats(stats: ExportStats, now: datetime) -> str:
-    if stats.first_message_unix is None or stats.last_message_unix is None:
-        start = end = now
-    else:
-        start = datetime.fromtimestamp(stats.first_message_unix, timezone.utc)
-        end = datetime.fromtimestamp(stats.last_message_unix, timezone.utc)
-    return f"{start.strftime('%Y-%m-%dT%H-%M-%SZ')}__{end.strftime('%Y-%m-%dT%H-%M-%SZ')}"
-
-
 async def write_export_stream(
     target: Target,
     records: AsyncIterator[tuple[dict[str, Any], Optional[str]]],
@@ -1460,29 +731,6 @@ async def write_export_stream(
     return final_dir, stats
 
 
-def database_run_key(
-    target: Target,
-    baseline_id: Optional[int],
-    baseline_unix: Optional[int],
-    args: argparse.Namespace,
-) -> str:
-    identity = {
-        "target_key": target.target_key,
-        "chat_id": target.chat_id,
-        "baseline_id": baseline_id,
-        "baseline_unix": baseline_unix,
-        "full_rescan": bool(args.full_rescan),
-        "overlap_ids": args.overlap_ids,
-        "overlap_days": args.overlap_days,
-        "discard_overlap": bool(args.discard_overlap),
-        "media": args.media,
-        "max_file_size": args.max_file_size,
-    }
-    return hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
 async def write_database_stream(
     conn: sqlite3.Connection,
     target: Target,
@@ -1496,8 +744,6 @@ async def write_database_stream(
     activate_chat: bool = True,
 ) -> ExportStats:
     """Stage a resumable fetch, then atomically merge messages and watermark."""
-    from .database.importer import upsert_archival_message
-
     target_dir.mkdir(parents=True, exist_ok=True)
     conn.execute(
         f"""INSERT INTO {RUNS_TABLE}(
@@ -1647,7 +893,7 @@ async def write_database_stream(
                     )""",
                 (now, target.chat_id, run_key),
             )
-        refresh_chat_statistics(conn, target.chat_id)
+        canonical_refresh_chat_statistics(conn, target.chat_id)
         conn.execute(
             f"""INSERT INTO {EXPORTS_TABLE}(
                    export_key, target_key, source_name, chat_id, output_path,

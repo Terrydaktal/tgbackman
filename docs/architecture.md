@@ -11,7 +11,10 @@ src/tgbackup/
   errors.py              public exporter exception types
   progress.py            journal-friendly progress and process locking
   db/
-    connection.py        SQLite validation and archival-index migration adapter
+    connection.py        SQLite validation and connection policy
+    schema.py             canonical tables, migrations, FTS, and statistics refresh
+    archive.py            rich message conversion/upsert and provenance writes
+    sources.py            immutable source registration and media integrity
     repository.py        target, active-chat, and blacklist queries
   legacy_tree/           filesystem-only legacy HTML/JSON/media operations
     split_html.py
@@ -30,7 +33,10 @@ src/tgbackup/
   backup/
     media.py             primary-media selection, download, size/hash checks
     staging.py           durable failed-run staging and resume verification
-  exporter.py            orchestration and the remaining transactional workflow
+    targets.py           stable peer identity and output-directory policy
+    target_mapping.py    Telegram dialog mapping and migrated-peer links
+    records.py           pure message-record/range helpers
+  exporter.py            compatibility facade and transactional orchestration
 ```
 
 `telegram_incremental_backup.py` is deliberately retained as a compatibility
@@ -38,11 +44,13 @@ launcher for existing systemd units and shell scripts. New code should import
 `tgbackup` or use `tgbackman-backup`; both execute the same implementation.
 
 The Rust applications are split into crate-local modules. `tgbackman` keeps
-GUI state and orchestration in `main.rs`, with `model.rs` for application data,
-`cache.rs` for database/cache path resolution, and `inventory.rs` for alias
-union-find logic. `tgsearch` keeps its CLI/query loop in `main.rs`, with
-`models.rs` for result rows and `render.rs` for formatting, highlighting, and
-sanitisation.
+only the egui frame loop and process entry point in `main.rs`; `app.rs` owns
+GUI state/background workers, `database.rs` owns inventory/statistics/target
+mapping, `matching.rs` owns overlap normalisation/comparison, `ui.rs` owns
+rendering primitives, `model.rs` owns value objects, `cache.rs` owns cache
+freshness/path policy, and `inventory.rs` owns union-find. `tgsearch` keeps its
+CLI/query loop in `main.rs`, with `models.rs` for result rows and `render.rs`
+for formatting, highlighting, and sanitisation.
 
 The GUI does not duplicate exporter logic. It reads the canonical SQLite
 database; a future background-run button should launch the `tgbackman-backup`
