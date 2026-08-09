@@ -6,7 +6,7 @@ Type=oneshot
 TimeoutStartSec=infinity
 WorkingDirectory=%h/Dev/tgbackman
 # Generate a user-specific unit with:
-#   .venv/bin/python telegram_incremental_backup.py install-systemd \
+#   uv run tgbackman-backup install-systemd \
 #       --db /path/to/telegram_backup.db \
 #       --output "/path/to/Telegram Backup/Telegram API Incremental" \
 #       --mount-point /path/to/mount

@@ -10,7 +10,7 @@ A premium, high-performance command-line toolbox designed to manage, repair, spl
 tgbackman/
 ├── .gitignore                         # Git exclusion rules
 ├── README.md                          # Comprehensive project documentation (this file)
-├── pyproject.toml                     # Python package metadata and CLI entry point
+├── pyproject.toml                     # Python package metadata and CLI entry points
 ├── uv.lock                            # Reproducible Python dependency lock
 ├── requirements.txt                   # Minimal compatibility install list
 ├── docs/architecture.md               # Module boundaries and development workflow
@@ -30,6 +30,7 @@ tgbackman/
 │   │   └── range_repair.py
 │   ├── cli.py                         # `tgbackman-backup` entry point
 │   ├── config.py                      # Credentials, paths, parsers, permissions
+│   ├── media_reorganize.py            # Database-aware legacy/current media migration
 │   ├── db/                            # Canonical schema, archive, provenance, repositories
 │   │   ├── schema.py                  # Tables, migrations, FTS, statistics
 │   │   ├── archive.py                 # Rich message conversion/upserts
@@ -42,10 +43,6 @@ tgbackman/
 │       ├── records.py                 # Pure record/range helpers
 │       ├── media.py                   # Download/type/size/hash handling
 │       └── staging.py                 # Durable failed-run staging/resume
-├── scripts/                           # Future optional convenience launchers
-├── telegram_incremental_backup.py    # Compatibility launcher
-├── db_indexer.py                      # Compatibility launcher; database-facing
-├── fix_split_subfolder_ranges.py      # Compatibility launcher; database-aware
 ├── systemd/                           # Example/generated user service and timer units
 ├── tests/                              # Offline regression tests for exporter/indexer invariants
 ├── tgbackman/                         # Rust GUI overlap and coverage visualizer
@@ -62,10 +59,10 @@ tgbackman/
 
 ## 🛠️ Detailed Scripts & Tooling Reference
 
-The canonical Python entry point is now the installed `tgbackman-backup`
-command (or `uv run python -m tgbackup`). The root
-`telegram_incremental_backup.py` launcher remains supported for existing
-systemd units and scripts. Python modules under `src/tgbackup` are importable
+The canonical Python entry point is the installed `tgbackman-backup` command
+(or `uv run python -m tgbackup`). The database, migration, and legacy-tree
+utilities are exposed through the explicitly prefixed `tgbackman-*` commands
+listed in `pyproject.toml`. Python modules under `src/tgbackup` are importable
 individually; they do not require the GUI to run. The GUI and search binaries
 remain separate Rust applications and read the same SQLite database.
 
@@ -86,13 +83,14 @@ Use the explicit `tgbackman-legacy-*` commands for legacy-tree work and
 `tgbackman-db-*` commands for canonical-database work. The overlap report is
 available as `tgbackman-db-overlap-report --db /path/to/telegram_backup.db`.
 
-The root `.py` files with the old names are compatibility launchers only. New
-automation should call the package modules or the explicitly prefixed command
-names rather than treating those root files as the implementation.
+All maintained commands are package entry points. Legacy-tree commands operate
+on old HTML/JSON exports; database commands operate on the canonical SQLite
+archive. They are intentionally named with `tgbackman-legacy-*` or
+`tgbackman-db-*` prefixes so their scope is clear.
 
 This section outlines what each script does, its inputs, and its outputs.
 
-### 1. Legacy tree — [backup_inspect.py](backup_inspect.py)
+### 1. Legacy tree — `tgbackman-legacy-inspect`
 * **Purpose**: Filesystem-only analyzer for legacy Telegram exports. It discovers JSON/HTML exports and embedded unofficial SQLite snapshots; it never opens or changes the canonical `telegram_backup.db`.
 * **Inputs**:
   - `path`: A directory path containing Telegram backup exports.
@@ -100,10 +98,10 @@ This section outlines what each script does, its inputs, and its outputs.
   - Prints a structured tree report with backup formats, message counts, ranges, and sizes.
 * **CLI Invocation Example**:
   ```bash
-  python3 backup_inspect.py "/media/user/1b/Telegram Backup"
+  uv run tgbackman-legacy-inspect "/media/example/backup-volume/Telegram Backup"
   ```
 
-### 2. Legacy tree — [split_multi_html.py](split_multi_html.py)
+### 2. Legacy tree — `tgbackman-legacy-split`
 * **Purpose**: Converts a multi-chat official HTML export folder into discrete, self-contained single-chat exports.
 * **Inputs**:
   - `path`: Official multi-chat HTML export directory.
@@ -112,19 +110,19 @@ This section outlines what each script does, its inputs, and its outputs.
   - Reorganized per-chat export directories containing localized assets.
 * **CLI Invocation Example**:
   ```bash
-  python3 split_multi_html.py "/media/user/1b/Telegram Backup/RawMultiExport"
+  uv run tgbackman-legacy-split "/media/example/backup-volume/Telegram Backup/RawMultiExport"
   ```
 
-### 3. Legacy tree — [repair_html_links.py](repair_html_links.py)
+### 3. Legacy tree — `tgbackman-legacy-repair-links`
 * **Purpose**: Rewrites broken local HTML href/src/srcset links that contain unescaped hashes (`#`) in their filenames to URL-encoded paths (`%23`) in-place.
 * **Inputs**:
   - `path`: Directory containing Telegram HTML backups.
 * **CLI Invocation Example**:
   ```bash
-  python3 repair_html_links.py "/media/user/1b/Telegram Backup/ChatName"
+  uv run tgbackman-legacy-repair-links "/media/example/backup-volume/Telegram Backup/ChatName"
   ```
 
-### 4. Database — [db_indexer.py](db_indexer.py)
+### 4. Database — `tgbackman-db-import`
 * **Purpose**: Database ingestion and verification engine. It imports JSON, HTML, and unofficial SQLite backups, uses stable path/marker identities, upserts overlaps, preserves rich metadata, records per-source coverage/provenance, and can embed the exact compressed source bytes.
 * **Inputs**:
   - `path`: Directory containing backup folders to scan recursively.
@@ -133,20 +131,20 @@ This section outlines what each script does, its inputs, and its outputs.
   - A consolidated, search-optimized SQLite master database with FTS5 virtual tables and sync triggers.
 * **CLI Invocation Example**:
   ```bash
-  python3 db_indexer.py "/media/user/1b/Telegram Backup/SplitChats" --export-db "/media/user/1b/sqlitedb/telegram_backup.db"
+  uv run tgbackman-db-import "/media/example/backup-volume/Telegram Backup/SplitChats" --export-db "/media/example/backup-volume/sqlitedb/telegram_backup.db"
 
   # Strictly verify a canonical DB and all recorded media
-  python3 db_indexer.py --verify-db /path/to/archive.db \
+  uv run tgbackman-db-import --verify-db /path/to/archive.db \
     --require-archived-sources --check-media
   ```
   For a lossless migration, do not point the importer at the live database. Build a new one beside it:
   ```bash
-  python3 rebuild_archive_database.py "/media/user/1b/Telegram Backup" \
+  uv run tgbackman-db-rebuild "/media/example/backup-volume/Telegram Backup" \
     --output /path/to/telegram_backup.rebuilt.db
   ```
   The rebuild tool refuses to overwrite an existing DB, embeds source files with SHA-256 verification, checks parser coverage, and leaves the live DB and legacy exports untouched. Keep the HTML/JSON/unofficial SQLite sources until the rebuilt DB passes verification and you have made an independent copy of the new DB.
 
-### 5. Database — [find_backup_overlaps.py](find_backup_overlaps.py)
+### 5. Database — `tgbackman-db-overlap-report`
 * **Purpose**: Analyzes sibling backups representing the same physical chats, calculates chronological overlap containment percentages, and runs indexed range scans to identify gaps or missing messages.
 * **Inputs**:
   - Absolute path to the consolidated master SQLite database (`telegram_backup.db`).
@@ -154,20 +152,20 @@ This section outlines what each script does, its inputs, and its outputs.
   - Detailed console reports detailing sibling overlap alignments, coverage percentages, and gap warnings.
 * **CLI Invocation Example**:
   ```bash
-  python3 find_backup_overlaps.py "/media/user/1b/sqlitedb/telegram_backup.db"
+  uv run tgbackman-db-overlap-report --db "/media/example/backup-volume/sqlitedb/telegram_backup.db"
   ```
 
-### 6. Legacy tree — [check_html_links.py](check_html_links.py)
+### 6. Legacy tree — `tgbackman-legacy-check-links`
 * **Purpose**: Scans all `.html` files in a backup folder and verifies that local on-disk assets (such as images, avatars, or media) referred to by `href`, `src`, `poster`, CSS `url()`, or `srcset` paths actually exist.
 * **Notes**: This tool can be run both **before** the split (to audit raw multi-exports) and **after** the split (to verify that all relative media files resolve correctly within the single-chat folders).
 * **Inputs**:
   - A directory containing Telegram HTML backups.
 * **CLI Invocation Example**:
   ```bash
-  python3 check_html_links.py "/media/user/1b/Telegram Backup/ChatName"
+  uv run tgbackman-legacy-check-links "/media/example/backup-volume/Telegram Backup/ChatName"
   ```
 
-### 7. Legacy tree — [fix_split_in_place.py](fix_split_in_place.py)
+### 7. Legacy tree — `tgbackman-legacy-relocate-media`
 * **Purpose**: Fixes split multi-chat HTML exports in-place by relocalizing leftover `../../chats/chat_XXX/...` media references to keep single chat folders standalone.
 * **Operation**: For each message referencing external media in the source multi-export, it **makes a local copy** of that media and saves it under `<split_chat>/media/`, then updates the HTML href/src/srcset links in-place to point to the local media folder. This renders the single chat folder completely standalone, self-contained, and portable.
 * **Inputs**:
@@ -175,38 +173,38 @@ This section outlines what each script does, its inputs, and its outputs.
   - `--multi-root`: Original multi-chat HTML export root.
 * **CLI Invocation Example**:
   ```bash
-  python3 fix_split_in_place.py "/media/user/1b/Telegram Backup/SplitChats" --multi-root "/media/user/1b/Telegram Backup/RawMultiExport"
+  uv run tgbackman-legacy-relocate-media "/media/example/backup-volume/Telegram Backup/SplitChats" --multi-root "/media/example/backup-volume/Telegram Backup/RawMultiExport"
   ```
 
-### 8. Database-aware — [fix_split_subfolder_ranges.py](fix_split_subfolder_ranges.py)
-* **Purpose**: Renames nested per-chat range directories to standard UTC date-span format (`YYYY-MM-DDTHH-MM-SSZ__YYYY-MM-DDTHH-MM-SSZ`). With `--wrap-flat`, it also repairs a flat chat archive such as `Telegram Backup/alex2/messages.html` into `Telegram Backup/alex2/<date-range>/messages.html`. Supports HTML, JSON, and SQLite backups.
+### 8. Database-aware — `tgbackman-db-range-repair`
+* **Purpose**: Renames nested per-chat range directories to standard UTC date-span format (`YYYY-MM-DDTHH-MM-SSZ__YYYY-MM-DDTHH-MM-SSZ`). With `--wrap-flat`, it also repairs a flat chat archive such as `Telegram Backup/example-chat/messages.html` into `Telegram Backup/example-chat/<date-range>/messages.html`. Supports HTML, JSON, and SQLite backups.
 * **Inputs**:
   - Parent root directory containing chat subfolders.
   - The master SQLite index via `--db` when applying a flat wrap. Relative media paths are converted to absolute paths and matching `chats.backup_path` rows are updated in the same operation.
 * **CLI Invocation Example**:
   ```bash
-  python3 fix_split_subfolder_ranges.py "/media/user/1b/Telegram Backup/SplitChats" --apply
+  uv run tgbackman-db-range-repair "/media/example/backup-volume/Telegram Backup/SplitChats" --apply
 
   # Preview one flat chat without changing files or the database
-  python3 fix_split_subfolder_ranges.py "/media/user/1b/Telegram Backup" \
-    --wrap-flat --chat alex2 --db sqlitedb/telegram_backup.db
+  uv run tgbackman-db-range-repair "/media/example/backup-volume/Telegram Backup" \
+    --wrap-flat --chat example-chat --db sqlitedb/telegram_backup.db
 
   # Apply that preview; --db is mandatory for an applied flat wrap
-  python3 fix_split_subfolder_ranges.py "/media/user/1b/Telegram Backup" \
-    --wrap-flat --chat alex2 --db sqlitedb/telegram_backup.db --apply
+  uv run tgbackman-db-range-repair "/media/example/backup-volume/Telegram Backup" \
+    --wrap-flat --chat example-chat --db sqlitedb/telegram_backup.db --apply
   ```
   Dry-run is the default. Existing date-range directories, `.tgbackman_target.json`, resumable `.partial-*` directories, and `.dry-run-*` directories are left at the chat level. A filesystem failure is rolled back; a database failure also rolls the filesystem move back.
 
-### 9. Legacy tree — [backfill_split_export_meta.py](backfill_split_export_meta.py)
-* **Purpose**: Backfills `.backman_export_meta.json` files into split output folders to register them within `backup_inspect.py` as `html_single_chat_export_converted`.
+### 9. Legacy tree — `tgbackman-legacy-backfill-metadata`
+* **Purpose**: Backfills `.backman_export_meta.json` files into split output folders to register them within the legacy inspector as `html_single_chat_export_converted`.
 * **Inputs**:
   - Root split directory.
 * **CLI Invocation Example**:
   ```bash
-  python3 backfill_split_export_meta.py "/media/user/1b/Telegram Backup/SplitChats" --apply
+  uv run tgbackman-legacy-backfill-metadata "/media/example/backup-volume/Telegram Backup/SplitChats" --apply
   ```
 
-### 10. Canonical database — [telegram_incremental_backup.py](telegram_incremental_backup.py)
+### 10. Canonical database — `tgbackman-backup`
 
 * **Purpose**: Authenticates one Telegram user account through Telethon, maps active database chats to stable Telegram peer IDs, downloads only the required messages/media, and commits them directly into the canonical SQLite database. No HTML or JSON export is written in normal operation.
 * **Security**: The API hash and Telethon session are stored outside the repository. The first login is interactive; later scheduled runs reuse the local session. Never commit or share either credential.
@@ -216,55 +214,55 @@ This section outlines what each script does, its inputs, and its outputs.
   - A Telegram user session (`--session`, default `~/.local/share/tgbackman/telegram`).
 * **Outputs**:
   - Canonical message rows, compressed raw Telegram records, rich metadata, source provenance, run coverage, and watermarks in `--db`.
-  - Media under each stable chat directory as `<chat>/media/<type>/...`; database rows store absolute paths.
+  - Media under each stable chat directory as `<chat>/media/<type>/...`; database rows store paths relative to that chat root.
   - Resumable staging rows in `telegram_backup_run_messages`. A watermark advances only in the same transaction that merges and verifies those rows. Failed and running staging is retained for recovery; completed staging rows are deleted inside the successful merge transaction, and each later run prunes completed rows left by older versions while retaining the compact run/ledger metadata.
   - `--legacy-json-export` is an opt-in compatibility mode for dated `result.json` folders; it is not used by default.
 * **Initial setup**:
   ```bash
-  uv pip install --python .venv -r requirements.txt
-  .venv/bin/python telegram_incremental_backup.py configure
-  .venv/bin/python telegram_incremental_backup.py auth
+  uv sync --dev
+  uv run tgbackman-backup configure
+  uv run tgbackman-backup auth
   ```
   `configure` prompts for the API ID and API hash without putting them in shell history. `auth` prompts for the phone number, Telegram verification code, and 2FA password when required.
-  The CLI and `tgbackman` GUI use the same database resolver. Set `TGBACKMAN_DB=/absolute/path/telegram_backup.db` in the service environment (or pass `--db`) for a deterministic choice. If both the removable-disk and repository-local copies exist and no override is set, the newest database file is selected; reconcile duplicate copies deliberately before deleting either one.
+  The CLI and `tgbackman` GUI use the same database resolver. Set `TGBACKMAN_DB=/absolute/path/telegram_backup.db` in the service environment (or pass `--db`) for a deterministic choice. If a removable volume has a nonstandard layout or several candidate databases, set `TGBACKMAN_REMOVABLE_VOLUME` privately in the service environment; do not commit that local value. Reconcile duplicate database copies deliberately before deleting either one.
 * **Target mapping**:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py dialogs
-  .venv/bin/python telegram_incremental_backup.py map --all \
-    --output "/media/lewis/1b/Telegram Backup"
-  .venv/bin/python telegram_incremental_backup.py map
-  .venv/bin/python telegram_incremental_backup.py map --name "Chat name" --peer @username
-  .venv/bin/python telegram_incremental_backup.py targets
+  uv run tgbackman-backup dialogs
+  uv run tgbackman-backup map --all \
+    --output "/media/example/backup-volume/Telegram Backup"
+  uv run tgbackman-backup map
+  uv run tgbackman-backup map --name "Chat name" --peer @username
+  uv run tgbackman-backup targets
   ```
   `map --all` caches every Telegram dialog in SQLite and creates target records for inactive as well as active chats. A dialog with no existing archive becomes an inactive, zero-message `chats` placeholder linked to its stable Telegram peer. `tgbackman` shows these unbacked conversations in grey at the bottom of the list; click the selected conversation's status to make it active, and the next all-chat run will populate that same row rather than create a separate subsection. Loading an older database in `tgbackman` also materializes placeholders for targets cached by earlier `map --all` runs. Mapping links old database rows by embedded stable peer IDs first and by a unique exact title second; it reports ambiguous rows instead of guessing. When Telegram marks a basic group with an authoritative `migrated_to` supergroup/channel peer, mapping transfers the historical archive links to the current target and disables the old peer target without copying its incompatible message-ID watermark. Disabled migrated predecessors are not materialized as placeholders; any leftover migrated predecessor with zero messages is hidden and cannot schedule a backup, while predecessors containing historical messages are grouped under the current target and current Telegram title. The plain `map` command limits the same automatic matching to active database rows. Use the explicit form for renamed, private, or otherwise ambiguous dialogs; duplicate active database names require a stable `--chat-id`, and `run` accepts the unique target key shown by `targets` when selecting one. Target-to-database links are stored separately, so changing `chats.is_active` controls backup selection without discarding any cached Telegram mapping.
 * **Check before downloading**:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py doctor \
-    --db "/media/user/1b/sqlitedb/telegram_backup.db" \
-    --output "/media/user/1b/Telegram Backup/Telegram API Incremental"
-  .venv/bin/python telegram_incremental_backup.py doctor --network
+  uv run tgbackman-backup doctor \
+    --db "/media/example/backup-volume/sqlitedb/telegram_backup.db" \
+    --output "/media/example/backup-volume/Telegram Backup/Telegram API Incremental"
+  uv run tgbackman-backup doctor --network
   ```
   The offline check validates credentials, database schema, active-to-target mappings, output writability, and session presence. `--network` additionally authenticates and resolves every active Telegram peer but does not download messages or media.
 * **Run an incremental export**:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py run \
-    --output "/media/user/1b/Telegram Backup/Telegram API Incremental"
+  uv run tgbackman-backup run \
+    --output "/media/example/backup-volume/Telegram Backup/Telegram API Incremental"
   ```
   This runs every enabled target linked to at least one database row currently marked active, one after another. Cached targets linked only to inactive rows, including newly discovered zero-message placeholders, are not downloaded until selected in `tgbackman`. Duplicate display names are safe in bulk mode because the mapped Telegram peer/target key and exact database links are authoritative; only an explicit `--target "Display Name"` selection remains rejected when that name is ambiguous. Progress lines include `chat N/T`, and the run ends with a per-chat committed/no-new/failed summary. A target's configured `output_dir` is honored only when it is inside the command's `--output` root; stale paths from another disk are ignored safely.
 
   To ignore the GUI/database active selection and back up every enabled mapped Telegram target, first refresh the complete dialog map and then run with `--all`:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py \
+  uv run tgbackman-backup \
     --db sqlitedb/telegram_backup.db \
     --config ~/.config/tgbackman/credentials.env \
     --session ~/.local/share/tgbackman/telegram \
-    map --all --output "/media/lewis/1b/Telegram Backup"
+    map --all --output "/media/example/backup-volume/Telegram Backup"
 
-  .venv/bin/python telegram_incremental_backup.py \
+  uv run tgbackman-backup \
     --db sqlitedb/telegram_backup.db \
     --config ~/.config/tgbackman/credentials.env \
     --session ~/.local/share/tgbackman/telegram \
-    run --all --output "/media/lewis/1b/Telegram Backup"
+    run --all --output "/media/example/backup-volume/Telegram Backup"
   ```
   `run --all` includes inactive zero-message placeholders but still excludes disabled targets such as migrated group predecessors and every peer in `telegram_backup_blacklist`. It does not alter existing `chats.is_active` values. `--all` cannot be combined with `--target` or `--chat-output-dir`.
 
@@ -273,11 +271,11 @@ This section outlines what each script does, its inputs, and its outputs.
 
   The same operation is available without the GUI:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py \
+  uv run tgbackman-backup \
     --db sqlitedb/telegram_backup.db \
     blacklist-chat --target TARGET_KEY
 
-  .venv/bin/python telegram_incremental_backup.py \
+  uv run tgbackman-backup \
     --db sqlitedb/telegram_backup.db \
     blacklist-chat --target TARGET_KEY --remove
   ```
@@ -285,43 +283,43 @@ This section outlines what each script does, its inputs, and its outputs.
 
   To run one chat only:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py \
+  uv run tgbackman-backup \
     --db sqlitedb/telegram_backup.db \
     --config ~/.config/tgbackman/credentials.env \
     --session ~/.local/share/tgbackman/telegram \
     run --target TARGET_KEY \
-    --chat-output-dir "/media/lewis/1b/Telegram Backup/alex2"
+    --chat-output-dir "/media/example/backup-volume/Telegram Backup/example-chat"
   ```
   `--chat-output-dir` is restricted to one explicit target and now controls only that chat's stable media location; messages go directly into `--db`. By default the exporter requests IDs strictly greater than the stored watermark, so no redundant overlap is stored as a second message row. `UNIQUE(chat_id,message_id)` and upserts also prevent duplicate rows.
 
   For edit/media repair, use `--overlap-ids 1000` (and optionally a date window). Existing rows are updated in place and recovered files replace missing media metadata. `--full-rescan` walks the entire current server history, repairs all returned messages, and tombstones previously archived IDs no longer returned; it never deletes their archived row. Exact mode cannot notice older edits/deletions that it does not re-read.
 * **Repair historical backup dates**:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py \
+  uv run tgbackman-backup \
     --db sqlitedb/telegram_backup.db \
     repair-backup-dates \
-    --backup-root "/media/lewis/1b/Telegram Backup" \
+    --backup-root "/media/example/backup-volume/Telegram Backup" \
     --dry-run
   ```
   Review the evidence summary, then omit `--dry-run` to update the cache atomically. The repair distinguishes committed non-empty Telegram API runs, unofficial snapshot database modification times, unsplit legacy HTML timestamps, converted Telegram Desktop export batches, and mapped chats that have never committed any content. For converted exports it ignores Backman's rewritten `messages*.html` and `.backman_export_meta.json` dates and derives the original export completion from preserved source assets across every split chat from the same export root. `tgbackman` displays the resulting source and confidence beside **Last Content-Modifying Backup** and no longer replaces it with a newer conversion, directory, newest-message, or GUI-refresh timestamp. The side list shows `chat (messages) - final message age - last backup run age`; the second age includes successful no-new-message `--all` checks.
 * **Delete a backed-up chat and its unshared media**:
   First copy the exact `target_key` from `targets`, then produce and retain a complete dry-run manifest:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py \
+  uv run tgbackman-backup \
     --db sqlitedb/telegram_backup.db \
     purge-chat --target TARGET_KEY \
     --delete-media \
-    --backup-root "/media/lewis/1b/Telegram Backup" \
+    --backup-root "/media/example/backup-volume/Telegram Backup" \
     --dry-run \
     --manifest ~/tgbackman-purge-TARGET_KEY.json
   ```
   After reviewing the linked aliases, counts, paths, shared files, missing files, and retained raw sources, execute with an exact confirmation:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py \
+  uv run tgbackman-backup \
     --db sqlitedb/telegram_backup.db \
     purge-chat --target TARGET_KEY \
     --delete-media \
-    --backup-root "/media/lewis/1b/Telegram Backup" \
+    --backup-root "/media/example/backup-volume/Telegram Backup" \
     --confirm TARGET_KEY
   ```
   `purge-chat` takes the exporter process lock, disables rather than removes the Telegram target (so a later `map --all`/`run --all` cannot silently recreate it), clears its watermarks, and transactionally removes every authoritatively linked current/renamed chat row, message, FTS entry, staging run, export ledger row, mapping, and exclusive archived source. If the target is blacklisted, an inactive zero-message placeholder and mapping are recreated after the deletion so the permanent exclusion remains visible. Exact media paths referenced by a retained chat are preserved. A whole chat directory is removed only when its `.tgbackman_target.json` marker matches the target, it is strictly inside the bounded backup root, no retained chat points inside it, and the tree contains no symbolic links or special files. Otherwise only individually verified unshared files are removed. Every executed purge is recorded in `telegram_backup_purges`, including the full recovery/audit manifest; a filesystem failure stops immediately and leaves the ledger in `media-incomplete` state.
@@ -331,21 +329,70 @@ This section outlines what each script does, its inputs, and its outputs.
   - The default is `--media all` with no size limit, covering photos, videos, voice messages, audio, files/documents, stickers, and animations.
   - Set a limit with `--max-file-size 4G`; use `--max-file-size 0` for unlimited. Files over the limit are recorded as intentionally skipped and do not cause a retry loop.
   - Select categories with `--media photos,videos,voice,files`, or configure `TG_MEDIA=all` and `TG_MAX_FILE_SIZE=0` in `~/.config/tgbackman/credentials.env`.
-  - A normal `--dry-run` reads message metadata only and does not write the DB or download media. Add `--download-media` to test downloads in temporary files: `.venv/bin/python telegram_incremental_backup.py run --target TARGET_KEY --dry-run --download-media --max-messages 25`. `--max-messages` is restricted to dry runs so a probe cannot advance a real watermark.
+  - A normal `--dry-run` reads message metadata only and does not write the DB or download media. Add `--download-media` to test downloads in temporary files: `uv run tgbackman-backup run --target TARGET_KEY --dry-run --download-media --max-messages 25`. `--max-messages` is restricted to dry runs so a probe cannot advance a real watermark.
   - Media failures are retried three times by default, Telegram `FloodWait` durations are respected, history requests are paced by `--request-delay 1.0`, expected byte sizes and SHA-256 are checked, and already-valid files are reused. Web previews are resolved using the same document-before-photo rule as Telethon; photo downloads pin the exact cached, stripped, progressive, or video representation so type, extension, and expected size all describe the bytes actually downloaded. Increase the delay instead of repeatedly restarting a rate-limited job. Without `--allow-media-errors`, any failed attachment leaves the chat watermark unchanged and the staged DB rows/media available for retry; a retry reuses the staged prefix and resumes fetching after it, revisiting only an invalid staged-media boundary when necessary.
   - Progress is enabled by default. It reports processed and resumed-staging counts, latest message ID/date, messages per second, ready/reused/skipped/failed media, downloaded bytes, elapsed time, individual media transfer percentage/speed, verification, atomic commit, and the new watermark. The defaults are `--progress-interval 5` and `--progress-every 100`; either can be changed, and `--no-progress` suppresses periodic lines while retaining errors and final summaries. A process that was already running before this feature was installed must finish or be restarted before it can display the new output.
-  - Verify the canonical store with `.venv/bin/python db_indexer.py --verify-db sqlitedb/telegram_backup.db --check-media`. Add `--require-archived-sources` after a lossless legacy rebuild. The old `telegram_incremental_backup.py verify` command remains for `--legacy-json-export` folders.
+  - Verify the canonical store with `uv run tgbackman-db-import --verify-db sqlitedb/telegram_backup.db --check-media`. Add `--require-archived-sources` after a lossless legacy rebuild. The `uv run tgbackman-backup verify` command remains for `--legacy-json-export` folders.
 * **Scheduled runs**:
   ```bash
-  .venv/bin/python telegram_incremental_backup.py install-systemd \
-    --db "/media/user/1b/sqlitedb/telegram_backup.db" \
-    --output "/media/user/1b/Telegram Backup/Telegram API Incremental"
+  uv run tgbackman-backup install-systemd \
+    --db "/media/example/backup-volume/sqlitedb/telegram_backup.db" \
+    --output "/media/example/backup-volume/Telegram Backup/Telegram API Incremental"
   systemctl --user daemon-reload
   systemctl --user enable --now tgbackman-telegram-backup.timer
   ```
-  The generated user timer runs daily at 03:30 with a randomized 15-minute delay. For removable storage, pass `--mount-point /media/lewis/1b` (or another exact mountpoint); the generated service then refuses to run unless that mount is present. The service also carries custom `--config` and `--session` paths and uses a non-blocking single-run lock.
+  The generated user timer runs daily at 03:30 with a randomized 15-minute delay. For removable storage, pass an exact mountpoint such as `/media/example/backup-volume`; the generated service then refuses to run unless that mount is present. The service also carries custom `--config` and `--session` paths and uses a non-blocking single-run lock.
 
-  The exporter covers message attachments (photos, videos/video notes, voice, audio, documents, stickers, and animations) plus structured Telegram metadata. Telegram-deleted/inaccessible media, profile photos, stories, and non-message account data are outside the message-history API scope and are recorded as limitations rather than silently claimed as complete.
+  The exporter covers message attachments (photos, videos/video notes, voice, audio, documents, stickers, and animations) plus structured Telegram metadata. This is a message-history archive, not a byte-for-byte Telegram Desktop account export: only the primary downloadable media object per message is materialized, while profile photos, stories, account settings, contacts, and other non-message data are outside the API scope. Telegram-deleted/inaccessible media is recorded as unavailable rather than silently claimed as complete.
+
+  To report duplicate media without changing anything, run `tgbackman-media-dedupe /path/to/media`. On a Btrfs media volume, add `--apply` only after reviewing the report; it replaces duplicates with verified `cp --reflink=always` copies and never falls back to ordinary copies or hardlinks.
+
+* **Reorganise legacy media into the canonical per-chat layout**:
+
+  The repository may contain two older shapes: API runs already stored in a
+  stable chat directory, and legacy JSON/HTML exports nested below dated
+  range directories. Both can coexist, and an old `chats.backup_path` may no
+  longer point at every historical range. The database remains authoritative;
+  this command only relocates verified local media and rewrites the canonical
+  `messages.media_path` values.
+
+  ```bash
+  # No backup/database writes. This also prints the current and target layouts
+  # and saves a reviewable plan manifest.
+  .venv/bin/tgbackman-media-reorganize --describe
+  .venv/bin/tgbackman-media-reorganize \
+    --db sqlitedb/telegram_backup.db \
+    --source-root "/media/example/backup-volume/Telegram Backup" \
+    --destination-root "/media/example/backup-volume/Telegram Backup Canonical" \
+    --manifest "/media/example/backup-volume/Telegram Backup Canonical/reorganize.json"
+
+  # After mounting the disk and reviewing the clean dry-run report:
+  .venv/bin/tgbackman-media-reorganize \
+    --db sqlitedb/telegram_backup.db \
+    --source-root "/media/example/backup-volume/Telegram Backup" \
+    --destination-root "/media/example/backup-volume/Telegram Backup Canonical" \
+    --manifest "/media/example/backup-volume/Telegram Backup Canonical/reorganize.json" \
+    --mount-point /media/example/backup-volume --apply --resume
+  ```
+
+  The destination is deliberately separate from the source and must be on
+  Btrfs for `--apply`. Each chat is named with its Telegram peer identity, for
+  example `Example Group__channel_1001`, so renamed chats and duplicate display
+  names cannot collide. Every chat gets identity markers and every media record
+  gets a visible `media/<type>/<filename>` path. The target mapping's
+  `output_dir` is updated too, so future API runs reuse these same directories.
+  Identical bytes in different chats
+  remain visible in both paths but are copied with Btrfs reflinks, sharing
+  physical extents without symlinks or hardlinks. The source is never deleted.
+
+  If the process is interrupted, leave the destination and manifest in place
+  and rerun with the exact same arguments plus `--resume --manifest ...`.
+  Existing destination files are re-hashed before being reused. The database
+  transaction starts only after every destination has passed strict
+  size/SHA-256 verification; a failed copy therefore cannot advance paths or
+  leave a partially updated index. Verify afterwards with
+  `tgbackman-db-import --verify-db ... --check-media` before considering any old
+  legacy files for separate, deliberate cleanup.
 
 ---
 
@@ -355,13 +402,13 @@ To ingest your raw Telegram backups, analyze overlaps, and search them cleanly, 
 
 ```mermaid
 graph TD
-    A[Raw Backups] --> B[check_html_links.py]
-    B --> C[split_multi_html.py]
-    C --> D[fix_split_in_place.py]
-    D --> E[fix_split_subfolder_ranges.py]
-    E --> F[backfill_split_export_meta.py]
-    F --> H[db_indexer.py --export-db]
-    H --> I[find_backup_overlaps.py]
+    A[Raw Backups] --> B[tgbackman-legacy-check-links]
+    B --> C[tgbackman-legacy-split]
+    C --> D[tgbackman-legacy-relocate-media]
+    D --> E[tgbackman-db-range-repair]
+    E --> F[tgbackman-legacy-backfill-metadata]
+    F --> H[tgbackman-db-import --export-db]
+    H --> I[tgbackman-db-overlap-report]
     I --> J[tgsearch Rust Search Companion]
     K[Telegram API incremental exporter] --> H
 ```
@@ -369,55 +416,55 @@ graph TD
 ### 1️⃣ Step 1: Health Check (Optional but Recommended)
 Scan your raw HTML files to check if there are missing attachments or assets:
 ```bash
-python3 check_html_links.py "/media/user/1b/Telegram Backup/RawExport"
+uv run tgbackman-legacy-check-links "/media/example/backup-volume/Telegram Backup/RawExport"
 ```
 
 ### 2️⃣ Step 2: Split Official Multi-Chat HTML Exports
 If you have an official multi-chat HTML export containing multiple chats, split it into discrete folders:
 ```bash
-python3 split_multi_html.py "/media/user/1b/Telegram Backup/RawMultiExport"
+uv run tgbackman-legacy-split "/media/example/backup-volume/Telegram Backup/RawMultiExport"
 ```
 
 ### 3️⃣ Step 3: Relocalize Split Assets in Place
   Relocalize media file paths in split chats to make them fully standalone. This copies referenced media from other chats into the local `media/` folder and rewrites links in-place:
   ```bash
-  python3 fix_split_in_place.py "/media/user/1b/Telegram Backup/SplitChats" --multi-root "/media/user/1b/Telegram Backup/RawMultiExport"
+  uv run tgbackman-legacy-relocate-media "/media/example/backup-volume/Telegram Backup/SplitChats" --multi-root "/media/example/backup-volume/Telegram Backup/RawMultiExport"
   ```
   
   > [!TIP]
-  > **Post-Split Link Check**: You can run [check_html_links.py](check_html_links.py) on your split directories at this point to verify that all relative paths and copied media files resolve successfully:
+  > **Post-Split Link Check**: You can run `tgbackman-legacy-check-links` on your split directories at this point to verify that all relative paths and copied media files resolve successfully:
   > ```bash
-  > python3 check_html_links.py "/media/user/1b/Telegram Backup/SplitChats"
+  > uv run tgbackman-legacy-check-links "/media/example/backup-volume/Telegram Backup/SplitChats"
   > ```
 
 ### 4️⃣ Step 4: Chronological Subfolder Naming and Metadata Backfill
 Standardize subfolder names based on actual minimum/maximum UTC timestamps (supports HTML, JSON, and SQLite formats), then backfill `.backman_export_meta.json` so they are fully discovered by the main scanner:
 ```bash
 # Check planned folder renames (dry-run)
-python3 fix_split_subfolder_ranges.py "/media/user/1b/Telegram Backup/SplitChats"
+uv run tgbackman-db-range-repair "/media/example/backup-volume/Telegram Backup/SplitChats"
 
 # Apply renames and backfill metadata
-python3 fix_split_subfolder_ranges.py "/media/user/1b/Telegram Backup/SplitChats" --apply
-python3 backfill_split_export_meta.py "/media/user/1b/Telegram Backup/SplitChats" --apply
+uv run tgbackman-db-range-repair "/media/example/backup-volume/Telegram Backup/SplitChats" --apply
+uv run tgbackman-legacy-backfill-metadata "/media/example/backup-volume/Telegram Backup/SplitChats" --apply
 ```
 
 ### 5️⃣ Step 5: Master Database Ingestion
 Index all standardized backups recursively into a single, high-performance search-optimized master SQLite database file:
 ```bash
-python3 db_indexer.py "/media/user/1b/Telegram Backup/SplitChats" --export-db "/media/user/1b/sqlitedb/telegram_backup.db"
+uv run tgbackman-db-import "/media/example/backup-volume/Telegram Backup/SplitChats" --export-db "/media/example/backup-volume/sqlitedb/telegram_backup.db"
 ```
 
 ### 6️⃣ Step 6: Overlap and Gap Analysis
 Analyze the integrity of your backup database, verifying alignment coverages and identifying any missing messages:
 ```bash
-python3 find_backup_overlaps.py "/media/user/1b/sqlitedb/telegram_backup.db"
+uv run tgbackman-db-overlap-report --db "/media/example/backup-volume/sqlitedb/telegram_backup.db"
 ```
 
 ### 7️⃣ Step 7: GUI Overlap Visualization
 Run the Rust-based visualizer `tgbackman` to see coverage ranges, duplicates, and stats interactively:
 ```bash
 cd tgbackman
-cargo run -- "/media/user/1b/sqlitedb/telegram_backup.db"
+cargo run -- "/media/example/backup-volume/sqlitedb/telegram_backup.db"
 ```
 
 ### 8️⃣ Step 8: Search Companion Ingestion
@@ -428,7 +475,7 @@ cd tgsearch
 cargo build --release
 
 # Execute query searches
-./target/release/tgsearch "/media/user/1b/sqlitedb/telegram_backup.db" "makeup OR alcohol" --no-time -l 80 --dedupe --no-header --sanitise "rules/bad_language_rules.txt"
+./target/release/tgsearch "/media/example/backup-volume/sqlitedb/telegram_backup.db" "example-term OR another-term" --no-time -l 80 --dedupe --no-header --sanitise "rules/sanitise_rules.txt"
 ```
 
 ---
@@ -436,7 +483,7 @@ cargo build --release
 ## 🔒 Security, Privacy & Performance Designs
 
 > [!IMPORTANT]
-> **Performance Optimization**: `db_indexer.py` leverages bulk transaction batches (50,000+ operations per transaction) coupled with SQLite write-ahead-logging (`PRAGMA journal_mode=WAL`), asynchronous synchronization (`PRAGMA synchronous=NORMAL`), and large cache allocations to achieve lightning-fast throughput exceeding **200,000 messages/sec**.
+> **Performance Optimization**: `tgbackman-db-import` leverages bulk transaction batches (50,000+ operations per transaction) coupled with SQLite write-ahead-logging (`PRAGMA journal_mode=WAL`), asynchronous synchronization (`PRAGMA synchronous=NORMAL`), and large cache allocations to achieve lightning-fast throughput exceeding **200,000 messages/sec**.
 
 > [!NOTE]
 > **Leak-Proof Sanitization**: When querying the master database through `tgsearch` with `--sanitise`, the engine employs automatic name-aliasing. A user's target variations (e.g. system username and its reverse spelling) are linked together dynamically so that substituting one automatically substitutes both in a case-insensitive fashion. This preserves total sender privacy.

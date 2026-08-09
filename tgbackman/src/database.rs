@@ -3,7 +3,7 @@
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 
-use crate::cache::{cache_is_fresh, get_clusters_cache_path};
+use crate::cache::{cache_is_fresh, get_clusters_cache_path, secure_cache_file};
 use crate::inventory::UnionFind;
 use crate::model::{BackupInfo, ChatGroup};
 
@@ -413,47 +413,124 @@ pub(crate) fn incompatible_peer_identities(
     matches!((identities.get(first), identities.get(second)), (Some(a), Some(b)) if a != b)
 }
 
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    let present: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM pragma_table_info('{}') WHERE name = ?1",
+            table.replace('\'', "''")
+        ),
+        [column],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        conn.execute(definition, [])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_inventory(
     conn: &rusqlite::Connection,
     db_path: &str,
 ) -> Result<Vec<ChatGroup>, rusqlite::Error> {
     let start_total = std::time::Instant::now();
 
+    for (table, column, definition) in [
+        (
+            "chats",
+            "is_active",
+            "ALTER TABLE chats ADD COLUMN is_active INTEGER DEFAULT 0",
+        ),
+        (
+            "chats",
+            "last_backup_unix",
+            "ALTER TABLE chats ADD COLUMN last_backup_unix INTEGER",
+        ),
+        (
+            "chats",
+            "last_backup_run_unix",
+            "ALTER TABLE chats ADD COLUMN last_backup_run_unix INTEGER",
+        ),
+        (
+            "chats",
+            "last_backup_run_status",
+            "ALTER TABLE chats ADD COLUMN last_backup_run_status TEXT",
+        ),
+        (
+            "chats",
+            "last_backup_source",
+            "ALTER TABLE chats ADD COLUMN last_backup_source TEXT",
+        ),
+        (
+            "chats",
+            "last_backup_confidence",
+            "ALTER TABLE chats ADD COLUMN last_backup_confidence TEXT",
+        ),
+        (
+            "chats",
+            "last_backup_evidence",
+            "ALTER TABLE chats ADD COLUMN last_backup_evidence TEXT",
+        ),
+        (
+            "chats",
+            "min_msg_id",
+            "ALTER TABLE chats ADD COLUMN min_msg_id INTEGER",
+        ),
+        (
+            "chats",
+            "max_msg_id",
+            "ALTER TABLE chats ADD COLUMN max_msg_id INTEGER",
+        ),
+        (
+            "chats",
+            "msg_count",
+            "ALTER TABLE chats ADD COLUMN msg_count INTEGER",
+        ),
+        (
+            "chats",
+            "min_timestamp",
+            "ALTER TABLE chats ADD COLUMN min_timestamp TEXT",
+        ),
+        (
+            "chats",
+            "max_timestamp",
+            "ALTER TABLE chats ADD COLUMN max_timestamp TEXT",
+        ),
+        (
+            "chats",
+            "min_timestamp_unix",
+            "ALTER TABLE chats ADD COLUMN min_timestamp_unix INTEGER",
+        ),
+        (
+            "chats",
+            "max_timestamp_unix",
+            "ALTER TABLE chats ADD COLUMN max_timestamp_unix INTEGER",
+        ),
+        (
+            "messages",
+            "is_deleted",
+            "ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "messages",
+            "deleted_unix",
+            "ALTER TABLE messages ADD COLUMN deleted_unix INTEGER",
+        ),
+    ] {
+        ensure_column(conn, table, column, definition)?;
+    }
+    // Message tombstones were added after the original archive schema.  Keep
+    // inventory usable on older databases while the GUI performs its full
+    // checked migration on load.
     let _ = conn.execute(
-        "ALTER TABLE chats ADD COLUMN is_active INTEGER DEFAULT 0;",
+        "ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0;",
         [],
     );
-    let _ = conn.execute("ALTER TABLE chats ADD COLUMN last_backup_unix INTEGER;", []);
-    let _ = conn.execute(
-        "ALTER TABLE chats ADD COLUMN last_backup_run_unix INTEGER;",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE chats ADD COLUMN last_backup_run_status TEXT;",
-        [],
-    );
-    let _ = conn.execute("ALTER TABLE chats ADD COLUMN last_backup_source TEXT;", []);
-    let _ = conn.execute(
-        "ALTER TABLE chats ADD COLUMN last_backup_confidence TEXT;",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE chats ADD COLUMN last_backup_evidence TEXT;",
-        [],
-    );
-    let _ = conn.execute("ALTER TABLE chats ADD COLUMN min_msg_id INTEGER;", []);
-    let _ = conn.execute("ALTER TABLE chats ADD COLUMN max_msg_id INTEGER;", []);
-    let _ = conn.execute("ALTER TABLE chats ADD COLUMN msg_count INTEGER;", []);
-    let _ = conn.execute("ALTER TABLE chats ADD COLUMN min_timestamp TEXT;", []);
-    let _ = conn.execute("ALTER TABLE chats ADD COLUMN max_timestamp TEXT;", []);
-    let _ = conn.execute(
-        "ALTER TABLE chats ADD COLUMN min_timestamp_unix INTEGER;",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE chats ADD COLUMN max_timestamp_unix INTEGER;",
-        [],
-    );
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN deleted_unix INTEGER;", []);
 
     ensure_blacklist_schema(conn)?;
     let discovered = materialize_discovered_chats(conn)?;
@@ -571,7 +648,7 @@ pub(crate) fn run_inventory(
         // 1. FUZZY ALIAS LINKING via oldest signatures
         let mut exact_signatures: HashMap<(i64, String), Vec<String>> = HashMap::new();
         let mut stmt_msgs = conn.prepare(
-            "SELECT timestamp_unix, text FROM messages WHERE chat_id = ? AND text != '' AND timestamp_unix IS NOT NULL ORDER BY timestamp_unix ASC LIMIT 50"
+            "SELECT timestamp_unix, text FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0 AND text != '' AND timestamp_unix IS NOT NULL ORDER BY timestamp_unix ASC LIMIT 50"
         )?;
         for c in &chats {
             let mut rows_msgs = stmt_msgs.query(rusqlite::params![c.chat_id])?;
@@ -637,7 +714,7 @@ pub(crate) fn run_inventory(
         }
 
         let mut stmt_join = conn.prepare(
-            "SELECT COUNT(*) FROM messages a JOIN messages b ON a.timestamp_unix = b.timestamp_unix WHERE a.chat_id = ? AND b.chat_id = ? AND a.text = b.text AND a.text != '' AND length(a.text) >= 6"
+            "SELECT COUNT(*) FROM messages a JOIN messages b ON a.timestamp_unix = b.timestamp_unix WHERE COALESCE(a.is_deleted, 0)=0 AND COALESCE(b.is_deleted, 0)=0 AND a.chat_id = ? AND b.chat_id = ? AND a.text = b.text AND a.text != '' AND length(a.text) >= 6"
         )?;
 
         for (_, cids) in chats_by_norm_name {
@@ -686,7 +763,7 @@ pub(crate) fn run_inventory(
         "UPDATE chats SET min_msg_id = ?, max_msg_id = ?, msg_count = ?, min_timestamp = ?, max_timestamp = ?, min_timestamp_unix = ?, max_timestamp_unix = ? WHERE chat_id = ?"
     )?;
     let mut stmt_calc_stats = conn.prepare(
-        "SELECT MIN(message_id), MAX(message_id), COUNT(*), MIN(timestamp), MAX(timestamp), MIN(timestamp_unix), MAX(timestamp_unix) FROM messages WHERE chat_id = ?"
+        "SELECT MIN(message_id), MAX(message_id), COUNT(*), MIN(timestamp), MAX(timestamp), MIN(timestamp_unix), MAX(timestamp_unix) FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0"
     )?;
 
     for c in &chats {
@@ -798,8 +875,14 @@ pub(crate) fn run_inventory(
 
     // Keep the cluster cache newer than the database writes above. This also
     // refreshes a previously loaded cache so the next load can safely reuse it.
-    if let Ok(file) = std::fs::File::create(&clusters_cache_path) {
-        let _ = serde_json::to_writer_pretty(file, &uf.parent);
+    let temporary = format!("{}.tmp-{}", clusters_cache_path, std::process::id());
+    if let Ok(file) = std::fs::File::create(&temporary) {
+        if serde_json::to_writer_pretty(file, &uf.parent).is_ok() {
+            let _ = std::fs::rename(&temporary, &clusters_cache_path);
+            secure_cache_file(&clusters_cache_path);
+        } else {
+            let _ = std::fs::remove_file(&temporary);
+        }
     }
 
     let start_groups = std::time::Instant::now();

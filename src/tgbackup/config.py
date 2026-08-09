@@ -31,14 +31,21 @@ def database_mtime_ns(path: Path) -> int:
 
 
 def default_database_path() -> Path:
-    """Choose the newest shared database copy, unless explicitly overridden."""
-    removable = Path(f"/media/{getpass.getuser()}/1b/sqlitedb/telegram_backup.db")
+    """Choose one deterministic database path; never infer authority from mtime."""
+    configured = os.environ.get("TGBACKMAN_DB", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
     local = SCRIPT_DIR / "sqlitedb" / "telegram_backup.db"
-    candidates = [path for path in (removable, local) if path.is_file()]
-    if candidates:
-        return max(candidates, key=database_mtime_ns)
-    if removable.parent.is_dir():
-        return removable
+    if local.is_file():
+        return local
+    media_root = Path("/media") / getpass.getuser()
+    configured_volume = os.environ.get("TGBACKMAN_REMOVABLE_VOLUME", "").strip("/")
+    if configured_volume:
+        removable_candidates = [media_root / configured_volume / "sqlitedb" / "telegram_backup.db"]
+    else:
+        removable_candidates = sorted(media_root.glob("*/sqlitedb/telegram_backup.db"))
+    if removable_candidates:
+        return removable_candidates[0]
     return local
 
 
@@ -50,6 +57,8 @@ TARGETS_TABLE = "telegram_backup_targets"
 EXPORTS_TABLE = "telegram_backup_exports"
 RUNS_TABLE = "telegram_backup_runs"
 RUN_MESSAGES_TABLE = "telegram_backup_run_messages"
+RUN_ARCHIVE_TABLE = "telegram_backup_run_records"
+RUN_ATTEMPTS_TABLE = "telegram_backup_run_attempts"
 TARGET_CHAT_LINKS_TABLE = "telegram_backup_target_chats"
 DIALOGS_TABLE = "telegram_dialogs"
 PURGES_TABLE = "telegram_backup_purges"
@@ -199,7 +208,7 @@ def write_credentials(config_path: Path, api_id: str, api_hash: str) -> None:
 
 __all__ = [
     "PROJECT_ROOT", "SCRIPT_DIR", "DEFAULT_DB", "DEFAULT_CONFIG", "DEFAULT_SESSION", "DEFAULT_OUTPUT",
-    "TARGETS_TABLE", "EXPORTS_TABLE", "RUNS_TABLE", "RUN_MESSAGES_TABLE", "TARGET_CHAT_LINKS_TABLE",
+    "TARGETS_TABLE", "EXPORTS_TABLE", "RUNS_TABLE", "RUN_MESSAGES_TABLE", "RUN_ARCHIVE_TABLE", "RUN_ATTEMPTS_TABLE", "TARGET_CHAT_LINKS_TABLE",
     "DIALOGS_TABLE", "PURGES_TABLE", "BLACKLIST_TABLE", "MEDIA_TYPES", "MEDIA_ALIASES",
     "database_mtime_ns", "default_database_path", "parse_size", "parse_media_selection", "safe_component",
     "parse_env_file", "credentials", "ensure_private_dir", "telethon_session_file", "secure_session_file",

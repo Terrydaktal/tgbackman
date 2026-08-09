@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-backfill_split_export_meta.py
+tgbackman-legacy-backfill-metadata
 
 Backfill `.backman_export_meta.json` into split output folders so backman can label them as:
   html_single_chat_export_converted

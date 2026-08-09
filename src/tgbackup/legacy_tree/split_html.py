@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-split_multi_html.py
+tgbackman-legacy-split
 
 Convert a multi-chat Telegram HTML export into per-chat self-contained exports.
 Outputs single-chat HTML exports that can be moved or indexed independently.
 
 Usage:
-  python3 split_multi_html.py /path/to/raw_multi_export [--out /path/to/output_dir] [--chat chat_001] [--dry-run]
+  tgbackman-legacy-split /path/to/raw_multi_export [--out /path/to/output_dir] [--chat chat_001] [--dry-run]
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -191,12 +192,11 @@ def _resolve_local_url_to_export_file(
     return None
 
 def _write_json(path: str, obj: Any) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-    except Exception:
-        return
+    temporary = f"{path}.tmp-{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(temporary, path)
 
 def _upd_range(first_dt: Optional[datetime], last_dt: Optional[datetime], d: Optional[datetime]) -> Tuple[Optional[datetime], Optional[datetime]]:
     if not d:
@@ -278,7 +278,7 @@ def _scan_html_message_files(
                             last_msg_dt = d2
                             last_msg_src = p
         except Exception:
-            continue
+            raise
 
     if first_msg_dt or last_msg_dt:
         return msg_count, first_msg_dt, last_msg_dt, first_msg_src, last_msg_src, "message_timestamps"
@@ -319,7 +319,35 @@ def _fmt_dt_for_dir(d: Optional[datetime]) -> str:
     return du.strftime("%Y-%m-%dT%H-%M-%SZ")
 
 def _copy_tree(src: str, dst: str) -> None:
-    shutil.copytree(src, dst, dirs_exist_ok=True, copy_function=shutil.copy2)
+    for dirpath, dirnames, filenames in os.walk(src):
+        relative = os.path.relpath(dirpath, src)
+        target_dir = dst if relative == "." else os.path.join(dst, relative)
+        os.makedirs(target_dir, exist_ok=True)
+        for filename in filenames:
+            _copy_file_atomic(os.path.join(dirpath, filename), os.path.join(target_dir, filename))
+
+def _copy_file_atomic(src: str, dst: str) -> None:
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    def digest(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    source_digest = digest(src)
+    if os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(src):
+        if digest(dst) == source_digest:
+            return
+    temporary = f"{dst}.tmp-{os.getpid()}"
+    try:
+        shutil.copy2(src, temporary)
+        if digest(temporary) != source_digest:
+            raise IOError(f"verification failed after copying {src}")
+        os.replace(temporary, dst)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 def _rewrite_chat_html_for_standalone(chat_root: str, chat_id: Optional[str] = None) -> None:
     for fn in os.listdir(chat_root):
@@ -402,7 +430,7 @@ def _copy_and_localize_shared_media_for_chat(
                         if not _is_ancestor_dir(src_chat, abs_p):
                             abs_to_media_relposix[abs_p] = rel_posix
         except Exception:
-            continue
+            raise
 
     def _quote_url_path(rel_posix: str) -> str:
         return urllib.parse.quote(rel_posix, safe="/")
@@ -411,10 +439,7 @@ def _copy_and_localize_shared_media_for_chat(
     for abs_p, rel_posix in abs_to_media_relposix.items():
         dp = os.path.join(media_root, rel_posix.replace("/", os.sep))
         os.makedirs(os.path.dirname(dp), exist_ok=True)
-        try:
-            shutil.copy2(abs_p, dp)
-        except Exception:
-            continue
+        _copy_file_atomic(abs_p, dp)
 
     for src_html in src_msg_files:
         src_html_dir = os.path.dirname(src_html)
@@ -473,6 +498,7 @@ def _copy_and_localize_shared_media_for_chat(
                     os.remove(tmp)
             except Exception:
                 pass
+            raise
 
 def split_multi_html_export_to_single_chat_exports(
     export_root: str,
@@ -494,8 +520,8 @@ def split_multi_html_export_to_single_chat_exports(
     if not os.path.isdir(chats_dir):
         raise ValueError(f"Not a multi-chat HTML export root (missing chats/): {export_root}")
 
-    if os.path.exists(out_root):
-        raise FileExistsError(f"Output directory already exists: {out_root}")
+    if os.path.exists(out_root) and not os.path.isdir(out_root):
+        raise FileExistsError(f"Output path is not a directory: {out_root}")
 
     shared_dirs = ["css", "js", "images", "profile_pictures"]
 
@@ -522,7 +548,7 @@ def split_multi_html_export_to_single_chat_exports(
     if dry_run:
         return out_root
 
-    os.makedirs(out_root, exist_ok=False)
+    os.makedirs(out_root, exist_ok=True)
 
     for i, chat_id in enumerate(chat_names, start=1):
         src_chat = os.path.join(chats_dir, chat_id)
@@ -545,7 +571,7 @@ def split_multi_html_export_to_single_chat_exports(
             if os.path.isdir(sp):
                 _copy_tree(sp, dp)
             else:
-                shutil.copy2(sp, dp)
+                _copy_file_atomic(sp, dp)
 
         for d in shared_dirs:
             sp = os.path.join(export_root, d)

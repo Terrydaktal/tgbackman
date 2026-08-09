@@ -27,7 +27,7 @@ class PackageBoundaryTests(unittest.TestCase):
         self.assertTrue(ProgressReporter("test", enabled=False))
 
     def test_database_and_target_services_have_stable_narrow_interfaces(self):
-        self.assertIn("alexandra-", target_key("Alexandra", "user", 42))
+        self.assertIn("example_chat-", target_key("Example Chat", "user", 42))
         self.assertTrue(range_dir_name_from_stats(ExportStats(), datetime.now()))
         self.assertEqual(len(archival_message_values("chat", {"id": 1}, ".", "source", "json")), 27)
         self.assertTrue(callable(ensure_targets_schema))

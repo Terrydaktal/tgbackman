@@ -1,10 +1,13 @@
 //! GUI controller state and background-task orchestration.
 
 use eframe::egui;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::cache::{cache_is_fresh, default_database_path, get_cache_path, get_media_cache_path};
+use crate::cache::{
+    cache_is_fresh, default_database_path, get_cache_path, get_media_cache_path, secure_cache_file,
+};
 use crate::database::run_inventory;
 use crate::matching::{clean_text_for_match, count_missing_messages, format_unix_to_ts};
 use crate::model::{
@@ -12,8 +15,44 @@ use crate::model::{
     CompareMessage, LoadMessage, MediaCalcMessage, MediaStats, SingleChatMessage,
 };
 
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    sql: &str,
+) -> rusqlite::Result<()> {
+    let present: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM pragma_table_info('{}') WHERE name = ?1",
+            table.replace('\'', "''")
+        ),
+        [column],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        conn.execute(sql, [])?;
+    }
+    Ok(())
+}
+
+fn atomic_write_json<T: Serialize>(path: &str, value: &T) -> std::io::Result<()> {
+    let temporary = format!("{}.tmp-{}", path, std::process::id());
+    let result = (|| {
+        let file = std::fs::File::create(&temporary)?;
+        serde_json::to_writer_pretty(file, value).map_err(std::io::Error::other)?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 pub(crate) struct OverlapApp {
     pub(crate) db_path: String,
+    pub(crate) loaded_db_path: Option<String>,
+    pub(crate) loading_db_path: Option<String>,
+    pub(crate) db_generation: u64,
     pub(crate) groups: Vec<ChatGroup>,
     pub(crate) filtered_groups: Vec<usize>,
     pub(crate) selected_group_idx: Option<usize>,
@@ -39,6 +78,9 @@ impl Default for OverlapApp {
     fn default() -> Self {
         OverlapApp {
             db_path: default_database_path(),
+            loaded_db_path: None,
+            loading_db_path: None,
+            db_generation: 0,
             groups: Vec::new(),
             filtered_groups: Vec::new(),
             selected_group_idx: None,
@@ -62,10 +104,27 @@ impl Default for OverlapApp {
     }
 }
 impl OverlapApp {
+    fn group_cache_key(group: &crate::model::ChatGroup) -> String {
+        let mut ids: Vec<&str> = group
+            .backups
+            .iter()
+            .map(|backup| backup.chat_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.join("\0")
+    }
+
+    pub(crate) fn active_db_path(&self) -> String {
+        self.loaded_db_path
+            .clone()
+            .unwrap_or_else(|| self.db_path.clone())
+    }
+
     pub(crate) fn load_cache(&mut self) {
         self.cached_results.clear();
-        let cache_path = get_cache_path(&self.db_path);
-        if cache_is_fresh(&cache_path, &self.db_path) {
+        let db_path = self.active_db_path();
+        let cache_path = get_cache_path(&db_path);
+        if cache_is_fresh(&cache_path, &db_path) {
             if let Ok(file) = std::fs::File::open(&cache_path) {
                 if let Ok(cache) = serde_json::from_reader(file) {
                     self.cached_results = cache;
@@ -88,8 +147,9 @@ impl OverlapApp {
                 backup.media_stats = None;
             }
         }
-        let cache_path = get_media_cache_path(&self.db_path);
-        if cache_is_fresh(&cache_path, &self.db_path) {
+        let db_path = self.active_db_path();
+        let cache_path = get_media_cache_path(&db_path);
+        if cache_is_fresh(&cache_path, &db_path) {
             if let Ok(file) = std::fs::File::open(&cache_path) {
                 if let Ok(cache) = serde_json::from_reader::<_, HashMap<String, MediaStats>>(file) {
                     for group in &mut self.groups {
@@ -109,7 +169,7 @@ impl OverlapApp {
         self.calculating_media = true;
         self.status_msg = "Starting media stats calculation...".to_string();
 
-        let db_path = self.db_path.clone();
+        let db_path = self.active_db_path();
         let groups = self.groups.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.media_rx = Some(rx);
@@ -143,26 +203,15 @@ impl OverlapApp {
 
             // Write cache to file
             let cache_path = get_media_cache_path(&db_path);
-            match std::fs::File::create(&cache_path) {
-                Ok(file) => {
-                    if let Err(e) = serde_json::to_writer_pretty(file, &all_stats) {
-                        let _ = tx.send(MediaCalcMessage::Error(format!(
-                            "Failed to write cache: {}",
-                            e
-                        )));
-                        ctx.request_repaint();
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(MediaCalcMessage::Error(format!(
-                        "Failed to create cache file: {}",
-                        e
-                    )));
-                    ctx.request_repaint();
-                    return;
-                }
+            if let Err(e) = atomic_write_json(&cache_path, &all_stats) {
+                let _ = tx.send(MediaCalcMessage::Error(format!(
+                    "Failed to write cache: {}",
+                    e
+                )));
+                ctx.request_repaint();
+                return;
             }
+            secure_cache_file(&cache_path);
 
             let _ = tx.send(MediaCalcMessage::Finished(all_stats));
             ctx.request_repaint();
@@ -176,7 +225,7 @@ impl OverlapApp {
             self.comparison_results = vec![
                 "Only 1 backup available in this group. No overlap analysis needed.".to_string(),
             ];
-        } else if let Some(results) = self.cached_results.get(&group.name) {
+        } else if let Some(results) = self.cached_results.get(&Self::group_cache_key(group)) {
             self.comparison_results = results.clone();
         } else {
             self.comparison_results = vec![
@@ -190,7 +239,7 @@ impl OverlapApp {
         self.calculating_overlaps = true;
         self.status_msg = "Starting overlaps calculation...".to_string();
 
-        let db_path = self.db_path.clone();
+        let db_path = self.active_db_path();
         let groups = self.groups.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
@@ -302,13 +351,13 @@ impl OverlapApp {
                         results.push("".to_string()); // Divider
                     }
                 }
-                all_results.insert(group.name.clone(), results);
+                all_results.insert(Self::group_cache_key(group), results);
             }
 
             // Write cache to file
             let cache_path = get_cache_path(&db_path);
-            if let Ok(file) = std::fs::File::create(&cache_path) {
-                let _ = serde_json::to_writer_pretty(file, &all_results);
+            if atomic_write_json(&cache_path, &all_results).is_ok() {
+                secure_cache_file(&cache_path);
             }
 
             let _ = tx.send(CalcMessage::Finished(all_results));
@@ -338,8 +387,20 @@ impl OverlapApp {
         self.filtered_groups.clear();
         self.selected_group_idx = None;
         self.comparison_results.clear();
+        self.rx = None;
+        self.media_rx = None;
+        self.compare_rx = None;
+        self.chat_view_rx = None;
+        self.calculating_overlaps = false;
+        self.calculating_media = false;
+        self.loading_comparison = false;
+        self.loading_chat_view = false;
+        self.active_comparison = Arc::new(Mutex::new(None));
+        self.active_chat_view = Arc::new(Mutex::new(None));
 
         let db_path = self.db_path.clone();
+        self.loading_db_path = Some(db_path.clone());
+        self.db_generation = self.db_generation.wrapping_add(1);
         let (tx, rx) = std::sync::mpsc::channel();
         self.load_rx = Some(rx);
 
@@ -351,32 +412,81 @@ impl OverlapApp {
                 Ok(c) => {
                     let _ = c.execute("PRAGMA cache_size = -1048576;", []);
                     let _ = c.execute("PRAGMA temp_store = MEMORY;", []);
-                    let _ = c.execute(
-                        "ALTER TABLE chats ADD COLUMN is_active INTEGER DEFAULT 0;",
-                        [],
-                    );
-                    let _ = c.execute("ALTER TABLE chats ADD COLUMN last_backup_unix INTEGER;", []);
-                    let _ = c.execute(
-                        "ALTER TABLE chats ADD COLUMN last_backup_run_unix INTEGER;",
-                        [],
-                    );
-                    let _ = c.execute(
-                        "ALTER TABLE chats ADD COLUMN last_backup_run_status TEXT;",
-                        [],
-                    );
-                    let _ = c.execute("ALTER TABLE chats ADD COLUMN min_msg_id INTEGER;", []);
-                    let _ = c.execute("ALTER TABLE chats ADD COLUMN max_msg_id INTEGER;", []);
-                    let _ = c.execute("ALTER TABLE chats ADD COLUMN msg_count INTEGER;", []);
-                    let _ = c.execute("ALTER TABLE chats ADD COLUMN min_timestamp TEXT;", []);
-                    let _ = c.execute("ALTER TABLE chats ADD COLUMN max_timestamp TEXT;", []);
-                    let _ = c.execute(
-                        "ALTER TABLE chats ADD COLUMN min_timestamp_unix INTEGER;",
-                        [],
-                    );
-                    let _ = c.execute(
-                        "ALTER TABLE chats ADD COLUMN max_timestamp_unix INTEGER;",
-                        [],
-                    );
+                    for (table, column, sql) in [
+                        (
+                            "chats",
+                            "is_active",
+                            "ALTER TABLE chats ADD COLUMN is_active INTEGER DEFAULT 0",
+                        ),
+                        (
+                            "chats",
+                            "last_backup_unix",
+                            "ALTER TABLE chats ADD COLUMN last_backup_unix INTEGER",
+                        ),
+                        (
+                            "chats",
+                            "last_backup_run_unix",
+                            "ALTER TABLE chats ADD COLUMN last_backup_run_unix INTEGER",
+                        ),
+                        (
+                            "chats",
+                            "last_backup_run_status",
+                            "ALTER TABLE chats ADD COLUMN last_backup_run_status TEXT",
+                        ),
+                        (
+                            "chats",
+                            "min_msg_id",
+                            "ALTER TABLE chats ADD COLUMN min_msg_id INTEGER",
+                        ),
+                        (
+                            "chats",
+                            "max_msg_id",
+                            "ALTER TABLE chats ADD COLUMN max_msg_id INTEGER",
+                        ),
+                        (
+                            "chats",
+                            "msg_count",
+                            "ALTER TABLE chats ADD COLUMN msg_count INTEGER",
+                        ),
+                        (
+                            "chats",
+                            "min_timestamp",
+                            "ALTER TABLE chats ADD COLUMN min_timestamp TEXT",
+                        ),
+                        (
+                            "chats",
+                            "max_timestamp",
+                            "ALTER TABLE chats ADD COLUMN max_timestamp TEXT",
+                        ),
+                        (
+                            "chats",
+                            "min_timestamp_unix",
+                            "ALTER TABLE chats ADD COLUMN min_timestamp_unix INTEGER",
+                        ),
+                        (
+                            "chats",
+                            "max_timestamp_unix",
+                            "ALTER TABLE chats ADD COLUMN max_timestamp_unix INTEGER",
+                        ),
+                        (
+                            "messages",
+                            "is_deleted",
+                            "ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+                        ),
+                        (
+                            "messages",
+                            "deleted_unix",
+                            "ALTER TABLE messages ADD COLUMN deleted_unix INTEGER",
+                        ),
+                    ] {
+                        if let Err(error) = ensure_column(&c, table, column, sql) {
+                            let _ = tx.send(LoadMessage::Error(format!(
+                                "Database migration failed for {table}.{column}: {error}"
+                            )));
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
                     c
                 }
                 Err(e) => {
@@ -421,7 +531,7 @@ impl OverlapApp {
                 letter_a, letter_b
             );
 
-            let db_path = self.db_path.clone();
+            let db_path = self.active_db_path();
 
             let chat_a_id = backup_a.chat_id.clone();
             let chat_b_id = backup_b.chat_id.clone();
@@ -461,7 +571,7 @@ impl OverlapApp {
                 ctx.request_repaint();
 
                 let mut stmt_a = match conn.prepare(
-                    "SELECT message_id, sender, timestamp_unix, timestamp, text, media_type, media_path FROM messages WHERE chat_id = ? AND timestamp_unix BETWEEN ? AND ? ORDER BY timestamp_unix ASC, message_id ASC"
+                    "SELECT message_id, sender, timestamp_unix, timestamp, text, media_type, media_path FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0 AND timestamp_unix BETWEEN ? AND ? ORDER BY timestamp_unix ASC, message_id ASC"
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -491,8 +601,15 @@ impl OverlapApp {
                     Ok(mapped) => {
                         let mut msgs = Vec::new();
                         for item in mapped {
-                            if let Ok(m) = item {
-                                msgs.push(m);
+                            match item {
+                                Ok(m) => msgs.push(m),
+                                Err(error) => {
+                                    let _ = tx.send(CompareMessage::Error(format!(
+                                        "Row decode A failed: {error}"
+                                    )));
+                                    ctx.request_repaint();
+                                    return;
+                                }
                             }
                         }
                         msgs
@@ -510,7 +627,7 @@ impl OverlapApp {
                 ctx.request_repaint();
 
                 let mut stmt_b = match conn.prepare(
-                    "SELECT message_id, sender, timestamp_unix, timestamp, text, media_type, media_path FROM messages WHERE chat_id = ? AND timestamp_unix BETWEEN ? AND ? ORDER BY timestamp_unix ASC, message_id ASC"
+                    "SELECT message_id, sender, timestamp_unix, timestamp, text, media_type, media_path FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0 AND timestamp_unix BETWEEN ? AND ? ORDER BY timestamp_unix ASC, message_id ASC"
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -540,8 +657,15 @@ impl OverlapApp {
                     Ok(mapped) => {
                         let mut msgs = Vec::new();
                         for item in mapped {
-                            if let Ok(m) = item {
-                                msgs.push(m);
+                            match item {
+                                Ok(m) => msgs.push(m),
+                                Err(error) => {
+                                    let _ = tx.send(CompareMessage::Error(format!(
+                                        "Row decode B failed: {error}"
+                                    )));
+                                    ctx.request_repaint();
+                                    return;
+                                }
                             }
                         }
                         msgs
@@ -671,7 +795,7 @@ impl OverlapApp {
             self.loading_chat_view = true;
             self.status_msg = format!("Loading chat history for Backup {}...", letter);
 
-            let db_path = self.db_path.clone();
+            let db_path = self.active_db_path();
             let chat_id = backup.chat_id.clone();
             let backup_name = format!("Backup {} ({})", letter, backup.name);
 
@@ -701,8 +825,32 @@ impl OverlapApp {
                 ));
                 ctx.request_repaint();
 
+                const CHAT_VIEW_PAGE_SIZE: i64 = 100_000;
+                let total_messages: i64 = match conn.query_row(
+                    "SELECT count(*) FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0",
+                    rusqlite::params![chat_id],
+                    |row| row.get(0),
+                ) {
+                    Ok(total) => total,
+                    Err(error) => {
+                        let _ = tx.send(SingleChatMessage::Error(format!(
+                            "Message count query failed: {error}"
+                        )));
+                        ctx.request_repaint();
+                        return;
+                    }
+                };
                 let mut stmt = match conn.prepare(
-                    "SELECT message_id, sender, timestamp_unix, timestamp, text, media_type, media_path FROM messages WHERE chat_id = ? ORDER BY timestamp_unix ASC, message_id ASC"
+                    "SELECT message_id, sender, timestamp_unix, timestamp, text, media_type, media_path
+                     FROM messages
+                     WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0
+                       AND id IN (
+                           SELECT id FROM messages
+                           WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0
+                           ORDER BY timestamp_unix DESC, message_id DESC
+                           LIMIT ?
+                       )
+                     ORDER BY timestamp_unix ASC, message_id ASC"
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -712,25 +860,35 @@ impl OverlapApp {
                     }
                 };
 
-                let messages = match stmt.query_map(rusqlite::params![chat_id], |r| {
-                    let text: String = r.get(4)?;
-                    let clean_text = clean_text_for_match(&text);
-                    Ok(BackupMessage {
-                        message_id: r.get(0)?,
-                        sender: r.get(1)?,
-                        timestamp_unix: r.get(2)?,
-                        timestamp_str: r.get(3)?,
-                        text,
-                        clean_text,
-                        media_type: r.get(5)?,
-                        media_path: r.get(6)?,
-                    })
-                }) {
+                let messages = match stmt.query_map(
+                    rusqlite::params![chat_id, chat_id, CHAT_VIEW_PAGE_SIZE],
+                    |r| {
+                        let text: String = r.get(4)?;
+                        let clean_text = clean_text_for_match(&text);
+                        Ok(BackupMessage {
+                            message_id: r.get(0)?,
+                            sender: r.get(1)?,
+                            timestamp_unix: r.get(2)?,
+                            timestamp_str: r.get(3)?,
+                            text,
+                            clean_text,
+                            media_type: r.get(5)?,
+                            media_path: r.get(6)?,
+                        })
+                    },
+                ) {
                     Ok(mapped) => {
                         let mut msgs = Vec::new();
                         for item in mapped {
-                            if let Ok(m) = item {
-                                msgs.push(m);
+                            match item {
+                                Ok(m) => msgs.push(m),
+                                Err(error) => {
+                                    let _ = tx.send(SingleChatMessage::Error(format!(
+                                        "Row decode failed: {error}"
+                                    )));
+                                    ctx.request_repaint();
+                                    return;
+                                }
                             }
                         }
                         msgs
@@ -746,6 +904,8 @@ impl OverlapApp {
                     backup_name,
                     chat_id,
                     messages,
+                    total_messages,
+                    truncated: total_messages > CHAT_VIEW_PAGE_SIZE,
                     scroll_to_bottom: true,
                     search_query: String::new(),
                     filtered_indices: Vec::new(),

@@ -14,12 +14,18 @@ jobs:
           enable-cache: true
       - run: uv sync --dev
       - run: uv run python -m unittest discover -s tests -p 'test_*.py'
-      - run: uv run python -m py_compile telegram_incremental_backup.py src/tgbackup/*.py src/tgbackup/db/*.py src/tgbackup/backup/*.py src/tgbackup/telegram/*.py
+      - run: uv run ruff check src tests --select E9,F63,F7,F82
+      - run: uv run python -m compileall -q src tests
+      - run: uv run python -c "import tgbackup.database.overlap_report"
 
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --manifest-path tgsearch/Cargo.toml
-      - run: cargo test --manifest-path tgbackman/Cargo.toml -- --skip test_run_inventory_performance --skip test_compute_media_stats_split_and_unofficial
+      - run: cargo fmt --manifest-path tgsearch/Cargo.toml -- --check
+      - run: cargo fmt --manifest-path tgbackman/Cargo.toml -- --check
+      - run: cargo test --locked --manifest-path tgsearch/Cargo.toml
+      - run: cargo test --locked --manifest-path tgbackman/Cargo.toml -- --skip test_run_inventory_performance --skip test_compute_media_stats_split_and_unofficial
+      - run: cargo clippy --locked --manifest-path tgsearch/Cargo.toml --all-targets
+      - run: cargo clippy --locked --manifest-path tgbackman/Cargo.toml --all-targets

@@ -119,7 +119,7 @@ pub(crate) fn count_missing_messages(
 ) -> Result<i64, rusqlite::Error> {
     // 1. Fetch A messages in range
     let mut stmt_a = conn.prepare(
-        "SELECT timestamp_unix, text FROM messages WHERE chat_id = ? AND timestamp_unix BETWEEN ? AND ?"
+        "SELECT timestamp_unix, text FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0 AND timestamp_unix BETWEEN ? AND ?"
     )?;
     let mut rows_a = stmt_a.query(rusqlite::params![chat_a_id, start_unix, end_unix])?;
     let mut messages_a = Vec::new();
@@ -133,7 +133,7 @@ pub(crate) fn count_missing_messages(
 
     // 2. Fetch B messages in expanded range (accounting for 1-hour BST shifts)
     let mut stmt_b = conn.prepare(
-        "SELECT timestamp_unix, text FROM messages WHERE chat_id = ? AND timestamp_unix BETWEEN ? AND ?"
+        "SELECT timestamp_unix, text FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0 AND timestamp_unix BETWEEN ? AND ?"
     )?;
     let mut rows_b = stmt_b.query(rusqlite::params![
         chat_b_id,
@@ -159,20 +159,20 @@ pub(crate) fn count_missing_messages(
         'offset_search: for offset in &[0, 3600, -3600] {
             let target_ts = ts + offset;
             for candidate_ts in target_ts - 5..=target_ts + 5 {
-                if let Some(candidates) = b_by_ts.get(&candidate_ts) {
-                    for b_txt_clean in candidates {
+                if let Some(candidates) = b_by_ts.get_mut(&candidate_ts) {
+                    let is_a_empty = txt_clean.is_empty();
+                    let is_a_media = txt_clean.starts_with('[') && txt_clean.ends_with(']');
+                    if let Some(index) = candidates.iter().position(|b_txt_clean| {
                         if txt_clean == *b_txt_clean {
-                            found = true;
-                            break 'offset_search;
+                            return true;
                         }
-                        let is_a_empty = txt_clean.is_empty();
                         let is_b_media = b_txt_clean.starts_with('[') && b_txt_clean.ends_with(']');
                         let is_b_empty = b_txt_clean.is_empty();
-                        let is_a_media = txt_clean.starts_with('[') && txt_clean.ends_with(']');
-                        if (is_a_empty && is_b_media) || (is_b_empty && is_a_media) {
-                            found = true;
-                            break 'offset_search;
-                        }
+                        (is_a_empty && is_b_media) || (is_b_empty && is_a_media)
+                    }) {
+                        candidates.swap_remove(index);
+                        found = true;
+                        break 'offset_search;
                     }
                 }
             }
@@ -190,5 +190,49 @@ pub(crate) fn format_unix_to_ts(unix_ts: i64) -> String {
         dt.format("%Y-%m-%d %H:%M:%S").to_string()
     } else {
         "Unknown".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_candidates_are_consumed_one_to_one() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                 message_id INTEGER,
+                 chat_id TEXT,
+                 timestamp_unix INTEGER,
+                 text TEXT,
+                 is_deleted INTEGER DEFAULT 0
+             );
+             INSERT INTO messages VALUES
+                 (1, 'a', 100, 'same', 0),
+                 (2, 'a', 100, 'same', 0),
+                 (3, 'b', 100, 'same', 0);",
+        )
+        .unwrap();
+
+        assert_eq!(count_missing_messages(&conn, "a", "b", 0, 200).unwrap(), 1);
+    }
+
+    #[test]
+    fn deleted_messages_do_not_count_as_missing() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                 message_id INTEGER,
+                 chat_id TEXT,
+                 timestamp_unix INTEGER,
+                 text TEXT,
+                 is_deleted INTEGER DEFAULT 0
+             );
+             INSERT INTO messages VALUES (1, 'a', 100, 'gone', 1);",
+        )
+        .unwrap();
+
+        assert_eq!(count_missing_messages(&conn, "a", "b", 0, 200).unwrap(), 0);
     }
 }

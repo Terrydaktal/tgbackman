@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sqlite3
 from pathlib import Path
 from typing import Callable, Optional
@@ -27,6 +29,8 @@ def open_database(
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA synchronous = NORMAL")
     required = {str(row[0]) for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'"
     ).fetchall()}
@@ -45,4 +49,12 @@ def open_database(
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 30000")
     ensure_schema(conn)
+    # Migration DDL must not leave an implicit transaction around the caller's
+    # first explicit BEGIN IMMEDIATE.
+    conn.commit()
+    for candidate in (str(path), f"{path}-wal", f"{path}-shm"):
+        with contextlib.suppress(OSError):
+            os.chmod(candidate, 0o600)
+    with contextlib.suppress(OSError):
+        os.chmod(path.parent, 0o700)
     return conn

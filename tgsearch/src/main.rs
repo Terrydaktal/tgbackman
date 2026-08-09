@@ -1,17 +1,19 @@
 use clap::Parser;
 use colored::*;
-use rusqlite::{params, Connection, Result};
-use std::collections::HashMap;
+use rusqlite::{Connection, Result};
+use std::collections::{HashMap, HashSet};
 
-use db_search::query::SearchQuery;
-use db_search::sqlite_fts::{prepare_fts_query, rowid_match_subquery, SearchMode};
-use fuzzy_rank::message::{sort_matches, MessageCandidate, MessageField, MessageQuery};
-
+mod fuzzy_rank;
 mod models;
 mod render;
+mod search_support;
+
+use fuzzy_rank::{sort_matches, MessageCandidate, MessageField, MessageQuery};
 
 use models::{ContextRow, MatchRow, MergedGroup};
 use render::{apply_sanitisation, format_ts, highlight_term, normalize_sender};
+use search_support::query::SearchQuery;
+use search_support::sqlite_fts::{prepare_fts_query, rowid_match_subquery, SearchMode};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -135,6 +137,14 @@ fn rerank_matches(query: &str, matches: &mut Vec<MatchRow>) {
 
 fn main() -> Result<()> {
     let args = Cli::parse();
+    if args.context < 0 {
+        eprintln!("context must be non-negative");
+        std::process::exit(2);
+    }
+    if args.limit < -1 {
+        eprintln!("limit must be -1 or non-negative");
+        std::process::exit(2);
+    }
 
     let mut sanitise_pairs = Vec::new();
     if let Some(file_path) = &args.sanitise {
@@ -157,13 +167,7 @@ fn main() -> Result<()> {
                         let target = subparts[0].trim();
                         let replacement = subparts[1].trim();
                         if !target.is_empty() {
-                            let target_lower = target.to_lowercase();
-                            if target_lower == "lewis" || target_lower == "siwel" {
-                                sanitise_pairs.push(("lewis".to_string(), replacement.to_string()));
-                                sanitise_pairs.push(("siwel".to_string(), replacement.to_string()));
-                            } else {
-                                sanitise_pairs.push((target.to_string(), replacement.to_string()));
-                            }
+                            sanitise_pairs.push((target.to_string(), replacement.to_string()));
                         }
                     }
                 }
@@ -193,12 +197,19 @@ fn main() -> Result<()> {
     }
 
     // Connect to database in read-only mode using query parameters
-    let conn = match Connection::open_with_flags(
+    let conn = Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    ) {
-        Ok(c) => c,
-        Err(_) => Connection::open(db_path)?,
+    )?;
+    let has_deleted_column: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('messages') WHERE name='is_deleted'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    let deleted_filter = if has_deleted_column {
+        "COALESCE(m.is_deleted, 0)=0"
+    } else {
+        "1=1"
     };
 
     // 1. Resolve matching message entry points
@@ -241,6 +252,7 @@ fn main() -> Result<()> {
          FROM messages m
          JOIN chats c ON m.chat_id = c.chat_id
          WHERE m.id IN ({})
+         AND {deleted_filter}
          {}
          ORDER BY m.timestamp_unix DESC
          LIMIT ?{}",
@@ -263,62 +275,31 @@ fn main() -> Result<()> {
     })?;
 
     let mut matches: Vec<MatchRow> = Vec::new();
+    let mut dedupe_keys: HashSet<String> = HashSet::new();
     for r in match_rows {
         let row = r?;
         if args.dedupe {
+            let sender = row
+                .sender
+                .as_deref()
+                .map(normalize_sender)
+                .unwrap_or_default();
+            let text = row.text.clone().unwrap_or_default();
+            let media = row.media_path.clone().unwrap_or_default();
             let mut is_dup = false;
-            for accepted in &matches {
-                let same_sender = match (&row.sender, &accepted.sender) {
-                    (Some(s1), Some(s2)) => {
-                        let n1 = normalize_sender(s1);
-                        let n2 = normalize_sender(s2);
-                        n1 == n2 || n1 == "deleted" || n2 == "deleted"
+            if let Some(timestamp) = row.timestamp_unix {
+                for offset in [0, 3600, -3600] {
+                    let key = format!("{}\0{}\0{}\0{}", sender, text, media, timestamp + offset);
+                    if dedupe_keys.contains(&key) {
+                        is_dup = true;
+                        break;
                     }
-                    (None, None) => true,
-                    _ => false,
-                };
-                let same_content = match (&row.text, &accepted.text) {
-                    (Some(t1), Some(t2)) => {
-                        if t1.is_empty() && t2.is_empty() {
-                            row.media_path == accepted.media_path
-                        } else if t1 == t2 {
-                            true
-                        } else if !t1.is_empty() && !t2.is_empty() {
-                            let is_media_marker1 = t1 == "[file]" || t1 == "[photo]";
-                            let is_media_marker2 = t2 == "[file]" || t2 == "[photo]";
-                            if (is_media_marker1 || is_media_marker2)
-                                && row.media_path == accepted.media_path
-                            {
-                                true
-                            } else if t1.len() >= 10
-                                && t2.len() >= 10
-                                && (t1.contains(t2) || t2.contains(t1))
-                            {
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                };
-                let same_time = match (row.timestamp_unix, accepted.timestamp_unix) {
-                    (Some(ts1), Some(ts2)) => {
-                        let diff = (ts1 - ts2).abs();
-                        diff <= 15
-                            || (diff >= 3585 && diff <= 3615)
-                            || (diff >= 7185 && diff <= 7215)
-                    }
-                    _ => false,
-                };
-                if same_sender && same_content && same_time {
-                    is_dup = true;
-                    break;
                 }
             }
             if !is_dup {
+                if let Some(timestamp) = row.timestamp_unix {
+                    dedupe_keys.insert(format!("{}\0{}\0{}\0{}", sender, text, media, timestamp));
+                }
                 matches.push(row);
             }
         } else {
@@ -438,31 +419,49 @@ fn main() -> Result<()> {
     }
 
     // 3. Query context window for each merged group
-    let mut context_stmt = conn.prepare(
-        "SELECT m.message_id, m.timestamp, m.sender, m.text, m.media_type, m.media_path
-         FROM messages m
-         WHERE m.chat_id = ?1 
-           AND m.message_id BETWEEN ?2 AND ?3
-         ORDER BY m.message_id ASC",
-    )?;
-
     for g in merged_groups {
-        let low_bound = g.min_id - args.context;
-        let high_bound = g.max_id + args.context;
-
-        let rows = context_stmt.query_map(params![g.chat_id, low_bound, high_bound], |row| {
-            let msg_id: i64 = row.get(0)?;
-            let is_m = g.match_ids.contains(&msg_id);
-            Ok(ContextRow {
-                _message_id: msg_id,
-                timestamp: row.get(1)?,
-                sender: row.get(2)?,
-                text: row.get(3)?,
-                media_type: row.get(4)?,
-                media_path: row.get(5)?,
-                is_match: is_m,
-            })
-        })?;
+        let placeholders = (0..g.match_ids.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let context_sql = format!(
+            "WITH ordered AS (
+                 SELECT m.message_id, m.timestamp, m.sender, m.text, m.media_type, m.media_path,
+                        ROW_NUMBER() OVER (PARTITION BY m.chat_id ORDER BY m.timestamp_unix, m.message_id) AS rn
+                 FROM messages m
+                 WHERE m.chat_id = ? AND {deleted_filter}
+             ), bounds AS (
+                 SELECT MAX(0, MIN(rn)-?) AS low_rn, MAX(rn)+? AS high_rn
+                 FROM ordered WHERE message_id IN ({placeholders})
+             )
+             SELECT message_id, timestamp, sender, text, media_type, media_path
+             FROM ordered, bounds WHERE rn BETWEEN low_rn AND high_rn ORDER BY rn ASC",
+        );
+        let mut context_params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Text(g.chat_id.clone()),
+            rusqlite::types::Value::Integer(args.context.max(0)),
+            rusqlite::types::Value::Integer(args.context.max(0)),
+        ];
+        context_params.extend(
+            g.match_ids
+                .iter()
+                .map(|id| rusqlite::types::Value::Integer(*id)),
+        );
+        let mut context_stmt = conn.prepare(&context_sql)?;
+        let rows =
+            context_stmt.query_map(rusqlite::params_from_iter(context_params.iter()), |row| {
+                let msg_id: i64 = row.get(0)?;
+                let is_m = g.match_ids.contains(&msg_id);
+                Ok(ContextRow {
+                    _message_id: msg_id,
+                    timestamp: row.get(1)?,
+                    sender: row.get(2)?,
+                    text: row.get(3)?,
+                    media_type: row.get(4)?,
+                    media_path: row.get(5)?,
+                    is_match: is_m,
+                })
+            })?;
 
         println!();
         let backup_p = g.backup_path.as_deref().unwrap_or("Unknown path");
@@ -499,12 +498,10 @@ fn main() -> Result<()> {
 
             let time_prefix = if args.no_time {
                 "".to_string()
+            } else if r.is_match {
+                format!("[{}] ", formatted_date).green().to_string()
             } else {
-                if r.is_match {
-                    format!("[{}] ", formatted_date).green().to_string()
-                } else {
-                    format!("[{}] ", formatted_date).dimmed().to_string()
-                }
+                format!("[{}] ", formatted_date).dimmed().to_string()
             };
 
             let mut display_text = r.text.clone();

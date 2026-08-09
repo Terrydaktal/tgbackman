@@ -65,21 +65,23 @@ def archive_source_file(
             spool.close()
             raise RuntimeError(f"failed to register source {path}")
         rowid, old_compression, old_size = int(existing[0]), str(existing[1]), int(existing[2])
-        if old_compression != "zlib" or old_size != compressed_size:
+        # Re-write the payload on every archived import.  Size/compression
+        # metadata alone cannot detect same-size bit rot in an existing BLOB.
+        del old_compression, old_size
+        conn.execute(
+            "UPDATE backup_sources SET compression=?, compressed_size=?, payload=zeroblob(?) WHERE source_key=?",
+            (compression, compressed_size, compressed_size, source_key),
+        )
+        spool.seek(0)
+        if hasattr(conn, "blobopen"):
+            with conn.blobopen("backup_sources", "payload", rowid, readonly=False) as blob:
+                for chunk in iter(lambda: spool.read(1024 * 1024), b""):
+                    blob.write(chunk)
+        else:  # pragma: no cover - Python 3.11+ provides incremental blobs.
             conn.execute(
-                "UPDATE backup_sources SET compression=?, compressed_size=?, payload=zeroblob(?) WHERE source_key=?",
-                (compression, compressed_size, compressed_size, source_key),
+                "UPDATE backup_sources SET payload=? WHERE source_key=?",
+                (sqlite3.Binary(spool.read()), source_key),
             )
-            spool.seek(0)
-            if hasattr(conn, "blobopen"):
-                with conn.blobopen("backup_sources", "payload", rowid, readonly=False) as blob:
-                    for chunk in iter(lambda: spool.read(1024 * 1024), b""):
-                        blob.write(chunk)
-            else:  # pragma: no cover - Python 3.11+ provides incremental blobs.
-                conn.execute(
-                    "UPDATE backup_sources SET payload=? WHERE source_key=?",
-                    (sqlite3.Binary(spool.read()), source_key),
-                )
     spool.close()
     return source_key
 
@@ -139,32 +141,38 @@ def record_import(
 def backfill_source_media_integrity(conn: sqlite3.Connection, source_key: str) -> None:
     """Hash every locally available attachment referenced by one imported source."""
     rows = conn.execute(
-        """SELECT m.chat_id, m.message_id, m.media_path
+        """SELECT m.chat_id, m.message_id, m.media_path, m.media_size, m.media_sha256
            FROM messages AS m JOIN message_sources AS s
              ON s.chat_id=m.chat_id AND s.message_id=m.message_id
            WHERE s.source_key=? AND m.media_type IS NOT NULL""",
         (source_key,),
     ).fetchall()
-    for chat_id, message_id, media_path in rows:
-        if not media_path or urllib.parse.urlparse(str(media_path)).scheme:
-            conn.execute(
-                "UPDATE messages SET media_status=COALESCE(media_status, 'missing') WHERE chat_id=? AND message_id=?",
-                (chat_id, message_id),
-            )
-            continue
-        local_path = os.path.abspath(str(media_path))
-        if not os.path.isfile(local_path):
-            conn.execute(
-                "UPDATE messages SET media_status='missing' WHERE chat_id=? AND message_id=?",
-                (chat_id, message_id),
-            )
-            continue
-        digest = hashlib.sha256()
-        with open(local_path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+    for chat_id, message_id, media_path, existing_size, existing_sha256 in rows:
+        media_size: int | None = int(existing_size) if existing_size is not None else None
+        media_sha256: str | None = str(existing_sha256) if existing_sha256 else None
+        media_status = "missing"
+        if media_path and not urllib.parse.urlparse(str(media_path)).scheme:
+            local_path = os.path.abspath(str(media_path))
+            if os.path.isfile(local_path):
+                media_size = os.path.getsize(local_path)
+                digest = hashlib.sha256()
+                with open(local_path, "rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                media_sha256 = digest.hexdigest()
+                media_status = "downloaded"
         conn.execute(
-            """UPDATE messages SET media_size=?, media_sha256=?, media_status='downloaded'
-               WHERE chat_id=? AND message_id=?""",
-            (os.path.getsize(local_path), digest.hexdigest(), chat_id, message_id),
+            """INSERT INTO message_source_media(
+                   source_key, chat_id, message_id, media_path, media_size,
+                   media_sha256, media_status, checked_unix
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(source_key, chat_id, message_id) DO UPDATE SET
+                   media_path=excluded.media_path, media_size=excluded.media_size,
+                   media_sha256=excluded.media_sha256, media_status=excluded.media_status,
+                   checked_unix=excluded.checked_unix""",
+            (source_key, chat_id, message_id, media_path, media_size, media_sha256, media_status, int(time.time())),
+        )
+        conn.execute(
+            "UPDATE messages SET media_size=?, media_sha256=?, media_status=? WHERE chat_id=? AND message_id=?",
+            (media_size, media_sha256, media_status, chat_id, message_id),
         )

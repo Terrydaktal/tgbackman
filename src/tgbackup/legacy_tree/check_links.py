@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-check_html_links.py
+tgbackman-legacy-check-links
 
 Scan all .html files under a backup folder and verify that local (on-disk) links resolve.
 
@@ -594,8 +594,8 @@ def scan_html_file_for_bad_refs(
                 if end_style_after:
                     in_style_block = False
     except Exception:
-        # Treat unreadable files as having no refs; the caller can decide whether to care.
-        return 0, 0, 0, 0, [], 0, [], 0, [], 0, [], 0, 0
+        # An unreadable file is a verification failure, never an empty file.
+        return 0, -1, 0, 0, [], 0, [], 0, [], 0, [], 0, 0
 
     return (
         total,
@@ -677,6 +677,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     missing_total = 0
     outside_total = 0
     split_leftover_total = 0
+    unreadable_files = 0
     scheme_total = 0
     media_shared_refs_total = 0
     media_chat_local_refs_total = 0
@@ -719,7 +720,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_keep_schemes=args.max_schemes,
         )
         total_refs += t
-        skipped_refs += s
+        if s < 0:
+            unreadable_files += 1
+            skipped_refs += 1
+        else:
+            skipped_refs += s
         ok_refs += ok
         missing_total += m_total
         outside_total += o_total
@@ -828,14 +833,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "missing_refs_total": missing_total,
         }
         print(json.dumps(out, indent=2, ensure_ascii=False))
-        return 1 if (missing_total or outside_total or split_leftover_total) else 0
+        return 1 if (missing_total or outside_total or split_leftover_total or unreadable_files) else 0
 
     print(_c(f"Root: {root}", _Ansi.BOLD))
     print(f"HTML files scanned: {len(html_files)}")
     scope_note = f"scope={args.scope}"
     print(
         f"Refs: total={total_refs} ok={ok_refs} skipped={skipped_refs} "
-        f"split_leftover={split_leftover_total} outside_root={outside_total} missing={missing_total} ({scope_note})"
+        f"split_leftover={split_leftover_total} outside_root={outside_total} missing={missing_total} unreadable={unreadable_files} ({scope_note})"
     )
     print(
         "Media refs (links): "
@@ -851,7 +856,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if scheme_prefixes:
         print(f"Scheme refs (in HTML attrs): total={scheme_total} ({', '.join(scheme_names)})")
 
-    if not missing_total and not outside_total and not split_leftover_total:
+    if not missing_total and not outside_total and not split_leftover_total and not unreadable_files:
         print()
         print(_c("All local references resolved.", _Ansi.GREEN))
         return 0

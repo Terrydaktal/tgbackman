@@ -10,7 +10,9 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -55,13 +57,27 @@ def target_output_dir(output_root: Path, target: Target) -> Path:
         if not matches:
             base = output_root / f"{safe_component(target.title)}__{safe_component(target.chat_id)}"
     ensure_private_dir(base)
+    # The directory may have changed above after the configured/title-based
+    # directory was found to be occupied.  Recompute the marker path only
+    # after the final directory has been selected; otherwise a marker can be
+    # written into an unrelated directory and later authorize its purge.
+    marker = base / ".tgbackman_target.json"
     if not marker.exists():
-        marker.write_text(
-            json.dumps({"chat_id": target.chat_id, "target_key": target.target_key, "title": target.title}, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        with contextlib.suppress(OSError):
-            marker.chmod(0o600)
+        payload = json.dumps(
+            {"chat_id": target.chat_id, "target_key": target.target_key, "title": target.title},
+            indent=2,
+        ) + "\n"
+        fd, temporary = tempfile.mkstemp(prefix=".tgbackman_target.", dir=base)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, marker)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
     return base
 
 
@@ -77,9 +93,21 @@ def direct_target_output_dir(path: Path, target: Target, *, write_marker: bool) 
         if str(existing.get("chat_id")) != target.chat_id:
             raise ExportError(f"{path} is already marked for chat_id={existing.get('chat_id')!r}, not {target.chat_id!r}")
     elif write_marker:
-        marker.write_text(json.dumps({"chat_id": target.chat_id, "target_key": target.target_key, "title": target.title}, indent=2) + "\n", encoding="utf-8")
-        with contextlib.suppress(OSError):
-            marker.chmod(0o600)
+        payload = json.dumps(
+            {"chat_id": target.chat_id, "target_key": target.target_key, "title": target.title},
+            indent=2,
+        ) + "\n"
+        fd, temporary = tempfile.mkstemp(prefix=".tgbackman_target.", dir=path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, marker)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
     return path
 
 

@@ -43,8 +43,9 @@ from .config import (
     EXPORTS_TABLE,
     MEDIA_ALIASES,
     MEDIA_TYPES,
-    PROJECT_ROOT,
     PURGES_TABLE,
+    RUN_ARCHIVE_TABLE,
+    RUN_ATTEMPTS_TABLE,
     RUN_MESSAGES_TABLE,
     RUNS_TABLE,
     SCRIPT_DIR,
@@ -297,49 +298,12 @@ def baseline_for_target(conn: sqlite3.Connection, target: Target) -> tuple[Optio
         return target.last_message_id, target.last_message_unix
 
     row = conn.execute(
-        "SELECT MAX(message_id), MAX(timestamp_unix) FROM messages WHERE chat_id = ?",
+        "SELECT MAX(message_id), MAX(timestamp_unix) FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0",
         (target.chat_id,),
     ).fetchone()
     message_id = int(row[0]) if row and row[0] is not None else None
     message_unix = int(row[1]) if row and row[1] is not None else None
 
-    # Historical exports may use a different ID scheme.  The mapping is an
-    # explicit user choice, so use the active rows with the same display name
-    # as a safe first-run baseline.
-    try:
-        row = conn.execute(
-            """
-            SELECT COUNT(*), MAX(max_msg_id), MAX(max_timestamp_unix), MAX(last_backup_unix)
-            FROM chats
-            WHERE COALESCE(is_active, 0) = 1
-              AND lower(trim(chat_name)) = lower(trim(?))
-            """,
-            (target.source_name,),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        row = conn.execute(
-            """
-            SELECT COUNT(*), NULL, NULL, MAX(last_backup_unix)
-            FROM chats
-            WHERE COALESCE(is_active, 0) = 1
-              AND lower(trim(chat_name)) = lower(trim(?))
-            """,
-            (target.source_name,),
-        ).fetchone()
-    if row:
-        # Never borrow a watermark from an arbitrary same-name chat.  A
-        # single legacy row is safe; multiple rows require an explicit stable
-        # --chat-id mapping or a clean first scan.
-        if int(row[0] or 0) == 1:
-            if message_id is None and row[1] is not None:
-                message_id = int(row[1])
-            if message_unix is None:
-                if row[2] is not None:
-                    message_unix = int(row[2])
-                elif row[3] is not None:
-                    # Old indexes may not have message timestamp statistics yet;
-                    # retain the user's detected backup boundary in that case.
-                    message_unix = int(row[3])
     return message_id, message_unix
 
 
@@ -406,6 +370,7 @@ async def message_record(
                     int(media_size) if media_size is not None else None,
                     progress,
                     media_plan,
+                    max_file_size=max_file_size,
                 )
                 if media_path is None:
                     error = f"Telegram returned no downloadable file for message {message.id}"
@@ -564,8 +529,15 @@ async def iter_message_records(
         # No trustworthy message ID exists.  Walk chronologically and discard
         # records up to the date boundary as they arrive so a large first-run
         # history is still bounded in memory.
-        iterator = client.iter_messages(entity, reverse=True, wait_time=request_delay)
+        iterator = client.iter_messages(
+            entity,
+            min_id=int(resume_after_id or 0),
+            reverse=True,
+            wait_time=request_delay,
+        )
         async for message in iterator:
+            if resume_after_id is not None and int(message.id) <= int(resume_after_id):
+                continue
             date = getattr(message, "date", None)
             date_unix = int(date.replace(tzinfo=date.tzinfo or timezone.utc).timestamp()) if date else 0
             if date:
@@ -594,8 +566,15 @@ async def iter_message_records(
             if max_messages and selected >= max_messages:
                 break
     else:
-        iterator = client.iter_messages(entity, reverse=True, wait_time=request_delay)
+        iterator = client.iter_messages(
+            entity,
+            min_id=int(resume_after_id or 0),
+            reverse=True,
+            wait_time=request_delay,
+        )
         async for message in iterator:
+            if resume_after_id is not None and int(message.id) <= int(resume_after_id):
+                continue
             record, error = await message_record(
                 message,
                 media_root,
@@ -745,6 +724,11 @@ async def write_database_stream(
 ) -> ExportStats:
     """Stage a resumable fetch, then atomically merge messages and watermark."""
     target_dir.mkdir(parents=True, exist_ok=True)
+    attempt_key = hashlib.sha256(f"{run_key}\0{time.time_ns()}".encode("utf-8")).hexdigest()
+    conn.execute(
+        f"INSERT INTO {RUN_ATTEMPTS_TABLE}(attempt_key, run_key, started_unix, status) VALUES (?, ?, ?, 'running')",
+        (attempt_key, run_key, unix_now()),
+    )
     conn.execute(
         f"""INSERT INTO {RUNS_TABLE}(
                 run_key, target_key, chat_id, baseline_message_id, baseline_unix,
@@ -793,11 +777,15 @@ async def write_database_stream(
             verify_record_media(record, target_dir)
             stats.observe(record, str(row["media_error"]) if row["media_error"] else None)
 
-        if stats.message_count == 0:
+        if stats.message_count == 0 and not full_rescan:
             record_chat_backup_run(conn, target, "completed_no_new_messages")
             conn.execute(
                 f"UPDATE {RUNS_TABLE} SET status='completed', completed_unix=? WHERE run_key=?",
                 (unix_now(), run_key),
+            )
+            conn.execute(
+                f"UPDATE {RUN_ATTEMPTS_TABLE} SET status='completed', completed_unix=? WHERE attempt_key=?",
+                (unix_now(), attempt_key),
             )
             prune_completed_staging(conn, run_key=run_key, commit=False)
             conn.commit()
@@ -875,9 +863,16 @@ async def write_database_stream(
             activate_chat=activate_chat,
         )
         for row in conn.execute(
-            f"SELECT record_json FROM {RUN_MESSAGES_TABLE} WHERE run_key=? ORDER BY message_id",
+            f"SELECT message_id, record_json, media_error FROM {RUN_MESSAGES_TABLE} WHERE run_key=? ORDER BY message_id",
             (run_key,),
         ):
+            conn.execute(
+                f"""INSERT INTO {RUN_ARCHIVE_TABLE}(run_key, message_id, record_json, media_error)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(run_key, message_id) DO UPDATE SET
+                      record_json=excluded.record_json, media_error=excluded.media_error""",
+                (run_key, int(row["message_id"]), str(row["record_json"]), row["media_error"]),
+            )
             upsert_archival_message(
                 conn, target.chat_id, json.loads(str(row["record_json"])),
                 str(target_dir), source_key, "telegram_api",
@@ -912,19 +907,31 @@ async def write_database_stream(
                 now, now, now,
             ),
         )
+        new_watermark_id = (
+            (stats.last_message_id if full_rescan else max(target.last_message_id or 0, stats.last_message_id or 0))
+            or None
+        )
+        new_watermark_unix = (
+            (stats.last_message_unix if full_rescan else max(target.last_message_unix or 0, stats.last_message_unix or 0))
+            or None
+        )
         conn.execute(
             f"""UPDATE {TARGETS_TABLE} SET
                    last_message_id=?, last_message_unix=?, last_export_unix=?, updated_unix=?
                WHERE target_key=?""",
             (
-                max(target.last_message_id or 0, stats.last_message_id or 0) or None,
-                max(target.last_message_unix or 0, stats.last_message_unix or 0) or None,
+                new_watermark_id,
+                new_watermark_unix,
                 now, now, target.target_key,
             ),
         )
         conn.execute(
             f"UPDATE {RUNS_TABLE} SET status='completed', completed_unix=?, error=NULL WHERE run_key=?",
             (now, run_key),
+        )
+        conn.execute(
+            f"UPDATE {RUN_ATTEMPTS_TABLE} SET status='completed', completed_unix=?, error=NULL WHERE attempt_key=?",
+            (now, attempt_key),
         )
         prune_completed_staging(conn, run_key=run_key, commit=False)
         conn.commit()
@@ -939,6 +946,10 @@ async def write_database_stream(
         conn.execute(
             f"UPDATE {RUNS_TABLE} SET status='failed', error=? WHERE run_key=?",
             (str(exc), run_key),
+        )
+        conn.execute(
+            f"UPDATE {RUN_ATTEMPTS_TABLE} SET status='failed', completed_unix=?, error=? WHERE attempt_key=?",
+            (unix_now(), str(exc), attempt_key),
         )
         record_chat_backup_run(conn, target, "failed")
         conn.commit()
@@ -1493,7 +1504,15 @@ def symlink_component(path: Path, root: Path) -> Optional[Path]:
 
 
 def validate_backup_root(path: Path) -> Path:
-    expanded = Path(os.path.abspath(path.expanduser()))
+    raw = Path(os.path.abspath(path.expanduser()))
+    current = raw
+    while True:
+        if current.is_symlink():
+            raise ExportError(f"Backup root ancestry must not contain symbolic links: {current}")
+        if current == current.parent:
+            break
+        current = current.parent
+    expanded = raw.resolve(strict=True)
     if expanded == Path(expanded.anchor) or expanded == Path.home():
         raise ExportError(f"Refusing unsafe backup root: {expanded}")
     if not expanded.is_dir():
@@ -1624,7 +1643,7 @@ def plan_chat_purge(
     bases = {str(row["chat_id"]): str(row["backup_path"]) if row["backup_path"] else None for row in chat_rows}
     message_count = int(
         conn.execute(
-            f"SELECT count(*) FROM messages WHERE chat_id IN ({placeholders})", chat_ids
+            f"SELECT count(*) FROM messages WHERE chat_id IN ({placeholders}) AND COALESCE(is_deleted, 0)=0", chat_ids
         ).fetchone()[0]
     )
     exclusive_sources, retained_sources, raw_source_paths = archival_source_scope(conn, chat_ids)
@@ -1650,7 +1669,7 @@ def plan_chat_purge(
     for row in conn.execute(
         f"""SELECT m.media_path, c.backup_path
             FROM messages AS m LEFT JOIN chats AS c ON c.chat_id=m.chat_id
-            WHERE m.chat_id NOT IN ({placeholders}) AND m.media_path IS NOT NULL""",
+            WHERE m.chat_id NOT IN ({placeholders}) AND COALESCE(m.is_deleted, 0)=0 AND m.media_path IS NOT NULL""",
         chat_ids,
     ):
         path = local_backup_path(row["backup_path"], row["media_path"])
@@ -1694,7 +1713,7 @@ def plan_chat_purge(
     for row in conn.execute(
         f"""SELECT m.chat_id, m.message_id, m.media_path, c.backup_path
             FROM messages AS m LEFT JOIN chats AS c ON c.chat_id=m.chat_id
-            WHERE m.chat_id IN ({placeholders}) AND m.media_path IS NOT NULL""",
+            WHERE m.chat_id IN ({placeholders}) AND COALESCE(m.is_deleted, 0)=0 AND m.media_path IS NOT NULL""",
         chat_ids,
     ):
         path = local_backup_path(row["backup_path"], row["media_path"])
@@ -1820,6 +1839,27 @@ def delete_planned_media(plan: PurgePlan) -> None:
             parent = parent.parent
 
 
+def delete_manifest_media(manifest: dict[str, Any], backup_root: Path) -> None:
+    """Finish a previously committed purge without touching database rows."""
+    files = [Path(os.path.abspath(Path(str(value)).expanduser())) for value in manifest.get("media_files", [])]
+    directories = [Path(os.path.abspath(Path(str(value)).expanduser())) for value in manifest.get("media_directories", [])]
+    for path in [*files, *directories]:
+        if not path_within(path, backup_root) or path == backup_root:
+            raise ExportError(f"purge recovery path is outside backup root: {path}")
+        linked = symlink_component(path, backup_root)
+        if linked is not None:
+            raise ExportError(f"purge recovery path contains symbolic link: {linked}")
+    for path in files:
+        if not path.exists():
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise ExportError(f"purge recovery target changed: {path}")
+        path.unlink()
+    for path in directories:
+        if path.exists():
+            delete_directory_tree(path, backup_root)
+
+
 def delete_purge_database_rows(
     conn: sqlite3.Connection,
     plan: PurgePlan,
@@ -1863,6 +1903,14 @@ def delete_purge_database_rows(
                 run_keys,
             )
             conn.execute(
+                f"DELETE FROM {RUN_ARCHIVE_TABLE} WHERE run_key IN ({run_placeholders})",
+                run_keys,
+            )
+            conn.execute(
+                f"DELETE FROM {RUN_ATTEMPTS_TABLE} WHERE run_key IN ({run_placeholders})",
+                run_keys,
+            )
+            conn.execute(
                 f"DELETE FROM {RUNS_TABLE} WHERE run_key IN ({run_placeholders})",
                 run_keys,
             )
@@ -1871,12 +1919,16 @@ def delete_purge_database_rows(
             plan.chat_ids,
         )
         conn.execute(
+            f"DELETE FROM message_source_media WHERE chat_id IN ({chat_placeholders})",
+            plan.chat_ids,
+        )
+        conn.execute(
             f"DELETE FROM messages WHERE chat_id IN ({chat_placeholders})",
             plan.chat_ids,
         )
         if plan.exclusive_source_keys:
             source_placeholders = sqlite_placeholders(plan.exclusive_source_keys)
-            for table in ("message_sources", "backup_imports", "backup_import_files"):
+            for table in ("message_sources", "message_source_media", "backup_imports", "backup_import_files"):
                 conn.execute(
                     f"DELETE FROM {table} WHERE source_key IN ({source_placeholders})",
                     plan.exclusive_source_keys,
@@ -1994,6 +2046,43 @@ def purge_chat_command(args: argparse.Namespace) -> int:
                 "Warning: shared, missing, unsafe, or raw archive items listed above were retained; "
                 "this was not a forensic privacy erasure."
             )
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
+        lock.release()
+
+
+def purge_resume_command(args: argparse.Namespace) -> int:
+    if args.confirm != args.purge_key:
+        raise ExportError("purge recovery requires --confirm PURGE_KEY")
+    db_path = Path(args.db).expanduser().resolve()
+    lock = ExportLock(db_path.parent / f".{db_path.name}.tgbackman.lock")
+    lock.acquire()
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = open_db(db_path)
+        row = conn.execute(
+            f"SELECT manifest_json, status FROM {PURGES_TABLE} WHERE purge_key=?",
+            (args.purge_key,),
+        ).fetchone()
+        if row is None:
+            raise ExportError(f"Unknown purge ledger key: {args.purge_key}")
+        if str(row["status"]) == "completed":
+            print(f"Purge {args.purge_key} is already complete.")
+            return 0
+        manifest = json.loads(str(row["manifest_json"]))
+        root_value = args.backup_root or manifest.get("backup_root")
+        if not root_value:
+            raise ExportError("Purge manifest has no backup root; supply --backup-root")
+        root = validate_backup_root(Path(root_value))
+        delete_manifest_media(manifest, root)
+        conn.execute(
+            f"UPDATE {PURGES_TABLE} SET status='completed', completed_unix=?, error=NULL WHERE purge_key=?",
+            (unix_now(), args.purge_key),
+        )
+        conn.commit()
+        print(f"Completed media recovery for purge {args.purge_key}.")
         return 0
     finally:
         if conn is not None:
@@ -2296,7 +2385,7 @@ def verify_exports(args: argparse.Namespace) -> int:
                             db_ids = {
                                 int(item[0])
                                 for item in conn.execute(
-                                    f"SELECT message_id FROM messages WHERE chat_id = ? AND message_id IN ({placeholders})",
+                                    f"SELECT message_id FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0 AND message_id IN ({placeholders})",
                                     (chat_id, *sorted(message_ids)),
                                 )
                             }
@@ -2591,6 +2680,8 @@ async def run_exports(args: argparse.Namespace) -> int:
             raise ExportError("--progress-interval must be greater than zero")
         if args.progress_every <= 0:
             raise ExportError("--progress-every must be a positive integer")
+        if args.full_rescan and args.max_messages:
+            raise ExportError("--full-rescan cannot be combined with --max-messages; a partial walk cannot reconcile deletions")
         if args.overlap_ids < 0 or args.overlap_days < 0:
             raise ExportError("--overlap-ids and --overlap-days cannot be negative")
         download_media_enabled = not args.dry_run or args.download_media
@@ -2631,7 +2722,14 @@ async def run_exports(args: argparse.Namespace) -> int:
                 )
                 if not args.legacy_json_export and not args.dry_run:
                     ensure_private_dir(target_dir)
-                    run_key = database_run_key(target, baseline_id, baseline_unix, args)
+                    run_key = database_run_key(
+                        target,
+                        baseline_id,
+                        baseline_unix,
+                        args,
+                        effective_media=",".join(sorted(selected_media)),
+                        effective_max_file_size=max_file_size,
+                    )
                     resumed_messages = int(
                         conn.execute(
                             f"SELECT count(*) FROM {RUN_MESSAGES_TABLE} WHERE run_key=?",
@@ -2937,7 +3035,9 @@ def infer_mount_point(output: Path) -> Optional[Path]:
 def install_systemd_example(args: argparse.Namespace) -> None:
     unit_dir = Path(args.unit_dir).expanduser()
     ensure_private_dir(unit_dir)
-    script = Path(__file__).resolve()
+    # Invoke the installed package through the same interpreter that ran the
+    # generator.  This keeps generated units independent of repository-root
+    # compatibility launchers and of the user's PATH.
     db = Path(args.db).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     config = Path(args.config).expanduser().resolve()
@@ -2947,7 +3047,8 @@ def install_systemd_example(args: argparse.Namespace) -> None:
     command = shlex.join(
         [
             str(python),
-            str(script),
+            "-m",
+            "tgbackup",
             "--db",
             str(db),
             "--config",
@@ -2996,7 +3097,7 @@ WantedBy=timers.target
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="telegram_incremental_backup.py",
+        prog="tgbackman-backup",
         description="Incremental Telegram user-account backup and current-db index integration.",
     )
     parser.add_argument("--db", default=os.environ.get("TGBACKMAN_DB", str(DEFAULT_DB)), help="Master SQLite database")
@@ -3188,6 +3289,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print every planned, shared, missing, and unsafe media path",
     )
 
+    purge_resume = sub.add_parser(
+        "purge-resume",
+        help="Resume media deletion for a purge whose database phase already committed",
+    )
+    add_common_after_command(purge_resume)
+    purge_resume.add_argument("--purge-key", required=True, help="Purge ledger key printed by purge-chat")
+    purge_resume.add_argument("--confirm", required=True, help="Must exactly match --purge-key")
+    purge_resume.add_argument("--backup-root", help="Override the root recorded in the purge manifest")
+
     blacklist = sub.add_parser(
         "blacklist-chat",
         help="Prevent one mapped Telegram peer from ever being backed up",
@@ -3277,6 +3387,8 @@ def main() -> int:
             return verify_exports(args)
         if args.command == "purge-chat":
             return purge_chat_command(args)
+        if args.command == "purge-resume":
+            return purge_resume_command(args)
         if args.command == "blacklist-chat":
             return blacklist_chat_command(args)
         if args.command == "repair-backup-dates":

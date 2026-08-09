@@ -39,6 +39,7 @@ impl eframe::App for OverlapApp {
                 }
                 Ok(LoadMessage::Finished(groups)) => {
                     self.groups = groups;
+                    self.loaded_db_path = self.loading_db_path.take();
                     self.loading_data = false;
                     self.filtered_groups.clear();
                     self.load_cache();
@@ -48,6 +49,7 @@ impl eframe::App for OverlapApp {
                 }
                 Ok(LoadMessage::Error(err)) => {
                     self.status_msg = err;
+                    self.loading_db_path = None;
                     self.loading_data = false;
                     self.filtered_groups.clear();
                     self.load_rx = None;
@@ -55,6 +57,7 @@ impl eframe::App for OverlapApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.loading_data = false;
+                    self.loading_db_path = None;
                     self.filtered_groups.clear();
                     self.load_rx = None;
                 }
@@ -540,7 +543,8 @@ impl eframe::App for OverlapApp {
                             .iter()
                             .map(|backup| backup.chat_id.clone())
                             .collect();
-                        match rusqlite::Connection::open(&self.db_path) {
+                        let active_db_path = self.active_db_path();
+                        match rusqlite::Connection::open(&active_db_path) {
                             Ok(mut conn) => match set_chat_ids_blacklisted(
                                 &mut conn,
                                 &chat_ids,
@@ -581,19 +585,33 @@ impl eframe::App for OverlapApp {
                     }
 
                     if let Some((g_idx, active)) = toggle_group_active {
-                        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+                        let chat_ids: Vec<String> = self.groups[g_idx]
+                            .backups
+                            .iter()
+                            .map(|backup| backup.chat_id.clone())
+                            .collect();
+                        let result = (|| -> rusqlite::Result<()> {
+                            let mut conn = rusqlite::Connection::open(self.active_db_path())?;
+                            let tx = conn.transaction()?;
                             let val = if active { 1 } else { 0 };
-                            let group = &self.groups[g_idx];
-                            for b in &group.backups {
-                                let _ = conn.execute(
+                            for chat_id in &chat_ids {
+                                tx.execute(
                                     "UPDATE chats SET is_active = ? WHERE chat_id = ?",
-                                    rusqlite::params![val, b.chat_id],
-                                );
+                                    rusqlite::params![val, chat_id],
+                                )?;
                             }
-                        }
-                        if let Some(g) = self.groups.get_mut(g_idx) {
-                            for b in &mut g.backups {
-                                b.is_active = active;
+                            tx.commit()
+                        })();
+                        match result {
+                            Ok(()) => {
+                                if let Some(g) = self.groups.get_mut(g_idx) {
+                                    for b in &mut g.backups {
+                                        b.is_active = active;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                self.status_msg = format!("Failed to update Active state: {error}");
                             }
                         }
                     }
@@ -664,7 +682,16 @@ impl eframe::App for OverlapApp {
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {
                                             ui.strong(format!("Chat: {}", chat_view.backup_name));
-                                            ui.colored_label(egui::Color32::from_rgb(130, 150, 170), format!("{} messages", chat_view.messages.len()));
+                                            let loaded_label = if chat_view.truncated {
+                                                format!(
+                                                    "{} of {} messages (latest 100,000)",
+                                                    chat_view.messages.len(),
+                                                    chat_view.total_messages
+                                                )
+                                            } else {
+                                                format!("{} messages", chat_view.total_messages)
+                                            };
+                                            ui.colored_label(egui::Color32::from_rgb(130, 150, 170), loaded_label);
                                         });
                                         ui.add_space(20.0);
 
@@ -945,10 +972,6 @@ impl eframe::App for OverlapApp {
                 },
             );
         }
-
-        if let Some((i, j)) = compare_pair {
-            self.trigger_comparison(i, j, ctx.clone());
-        }
     }
 }
 
@@ -1019,23 +1042,23 @@ mod tests {
                  UNIQUE(chat_id)
              );
              INSERT INTO chats(chat_id, chat_name, backup_path) VALUES
-                 ('channel_2346865455', 'Super OTP 🦸‍♂️', '/backup/Super OTP'),
-                 ('dialog_6333492840', 'Super OTP 🦸‍♂️', '/backup/Super OTP');
+                 ('channel_1001', 'Example Chat', '/backup/example-chat'),
+                 ('dialog_1002', 'Example Chat', '/backup/example-chat');
              INSERT INTO messages(message_id, chat_id, timestamp, timestamp_unix, text) VALUES
-                 (1, 'channel_2346865455', '1970-01-01T00:01:40Z', 100, 'same message one'),
-                 (2, 'channel_2346865455', '1970-01-01T00:01:41Z', 101, 'same message two'),
-                 (3, 'channel_2346865455', '1970-01-01T00:01:42Z', 102, 'same message three'),
-                 (1, 'dialog_6333492840', '1970-01-01T00:01:40Z', 100, 'same message one'),
-                 (2, 'dialog_6333492840', '1970-01-01T00:01:41Z', 101, 'same message two'),
-                 (3, 'dialog_6333492840', '1970-01-01T00:01:42Z', 102, 'same message three');
+                 (1, 'channel_1001', '1970-01-01T00:01:40Z', 100, 'same message one'),
+                 (2, 'channel_1001', '1970-01-01T00:01:41Z', 101, 'same message two'),
+                 (3, 'channel_1001', '1970-01-01T00:01:42Z', 102, 'same message three'),
+                 (1, 'dialog_1002', '1970-01-01T00:01:40Z', 100, 'same message one'),
+                 (2, 'dialog_1002', '1970-01-01T00:01:41Z', 101, 'same message two'),
+                 (3, 'dialog_1002', '1970-01-01T00:01:42Z', 102, 'same message three');
              INSERT INTO telegram_backup_targets
                  (target_key, chat_id, peer_kind, peer_id, title, enabled, output_dir) VALUES
-                 ('otp-channel', 'channel_2346865455', 'channel', 2346865455, 'Super OTP 🦸‍♂️', 1, '/backup/Super OTP'),
-                 ('otp-user', 'dialog_6333492840', 'user', 6333492840, 'Super OTP 🦸‍♂️', 1, '/backup/Super OTP');
+                 ('example-channel', 'channel_1001', 'channel', 1001, 'Example Chat', 1, '/backup/example-chat'),
+                 ('example-user', 'dialog_1002', 'user', 1002, 'Example Chat', 1, '/backup/example-chat');
              INSERT INTO telegram_backup_target_chats
                  (target_key, chat_id, match_method, linked_unix) VALUES
-                 ('otp-channel', 'channel_2346865455', 'telegram-discovered', 1),
-                 ('otp-user', 'dialog_6333492840', 'telegram-discovered', 1);",
+                 ('example-channel', 'channel_1001', 'telegram-discovered', 1),
+                 ('example-user', 'dialog_1002', 'telegram-discovered', 1);",
         )
         .unwrap();
 
@@ -1046,8 +1069,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "Super OTP 🦸‍♂️ [channel:2346865455]".to_string(),
-                "Super OTP 🦸‍♂️ [user:6333492840]".to_string()
+                "Example Chat [channel:1001]".to_string(),
+                "Example Chat [user:1002]".to_string()
             ]
         );
 
@@ -1295,31 +1318,31 @@ mod tests {
                  match_method TEXT NOT NULL
              );
              INSERT INTO chats(chat_id) VALUES
-                 ('channel_3929875088'),
-                 ('group_5272174971'),
+                 ('channel_2001'),
+                 ('group_2002'),
                  ('historical_group');
              INSERT INTO messages(message_id, chat_id)
                  VALUES (1, 'historical_group');
              INSERT INTO telegram_backup_targets(target_key, title, enabled)
-                 VALUES ('group-2-target', 'Group 2', 1);
+                 VALUES ('example-migration-target', 'Example Group', 1);
              INSERT INTO telegram_backup_target_chats
                  (target_key, chat_id, match_method)
              VALUES
-                 ('group-2-target', 'channel_3929875088', 'telegram-discovered'),
-                 ('group-2-target', 'group_5272174971', 'telegram-migrated-from'),
-                 ('group-2-target', 'historical_group', 'telegram-migrated-from');",
+                 ('example-migration-target', 'channel_2001', 'telegram-discovered'),
+                 ('example-migration-target', 'group_2002', 'telegram-migrated-from'),
+                 ('example-migration-target', 'historical_group', 'telegram-migrated-from');",
         )
         .unwrap();
 
         let hidden = zero_message_migrated_predecessors(&conn).unwrap();
-        assert_eq!(hidden, HashSet::from(["group_5272174971".to_string()]));
+        assert_eq!(hidden, HashSet::from(["group_2002".to_string()]));
 
         let mut uf = UnionFind::new();
         let preferred_names = apply_authoritative_target_links(&conn, &mut uf).unwrap();
-        let current_root = uf.find("channel_3929875088");
-        assert_eq!(uf.find("group_5272174971"), current_root);
+        let current_root = uf.find("channel_2001");
+        assert_eq!(uf.find("group_2002"), current_root);
         assert_eq!(uf.find("historical_group"), current_root);
-        assert_eq!(preferred_names.get(&current_root).unwrap(), "Group 2");
+        assert_eq!(preferred_names.get(&current_root).unwrap(), "Example Group");
     }
 
     #[test]
@@ -1357,7 +1380,11 @@ mod tests {
     #[test]
     fn test_run_inventory_performance() {
         let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-        let db_path = format!("/media/{}/1b/sqlitedb/telegram_backup.db", user);
+        let volume = std::env::var("TGBACKMAN_REMOVABLE_VOLUME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "backup-volume".to_string());
+        let db_path = format!("/media/{}/{}/sqlitedb/telegram_backup.db", user, volume);
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let start = std::time::Instant::now();
         let result = run_inventory(&conn, &db_path);
@@ -1371,7 +1398,11 @@ mod tests {
     #[test]
     fn test_compute_media_stats_split_and_unofficial() {
         let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-        let db_path = format!("/media/{}/1b/sqlitedb/telegram_backup.db", user);
+        let volume = std::env::var("TGBACKMAN_REMOVABLE_VOLUME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "backup-volume".to_string());
+        let db_path = format!("/media/{}/{}/sqlitedb/telegram_backup.db", user, volume);
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let groups = run_inventory(&conn, &db_path).unwrap();
 
@@ -1406,7 +1437,7 @@ mod tests {
         let mut found_unofficial = false;
         for g in &groups {
             for b in &g.backups {
-                if b.chat_id == "group_293206044" {
+                if b.chat_id == "group_3001" {
                     let stats = b.compute_media_stats(&db_path);
                     println!(
                         "Unofficial stats: photos_resolved={}/{}, videos_resolved={}/{}, voice_resolved={}/{}, files_resolved={}/{}",

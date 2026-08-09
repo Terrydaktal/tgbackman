@@ -51,12 +51,22 @@ def range_dir_name_from_stats(stats: ExportStats, now: datetime) -> str:
     return _range_name(stats.first_message_unix, stats.last_message_unix, now)
 
 
-def database_run_key(target: Target, baseline_id: int | None, baseline_unix: int | None, args: Any) -> str:
+def database_run_key(
+    target: Target,
+    baseline_id: int | None,
+    baseline_unix: int | None,
+    args: Any,
+    *,
+    effective_media: str | None = None,
+    effective_max_file_size: int | None = None,
+) -> str:
     identity = {
         "target_key": target.target_key, "chat_id": target.chat_id,
         "baseline_id": baseline_id, "baseline_unix": baseline_unix,
         "full_rescan": bool(args.full_rescan), "overlap_ids": args.overlap_ids,
         "overlap_days": args.overlap_days, "discard_overlap": bool(args.discard_overlap),
-        "media": args.media, "max_file_size": args.max_file_size,
+        "media": effective_media if effective_media is not None else args.media,
+        "max_file_size": effective_max_file_size if effective_max_file_size is not None else args.max_file_size,
+        "staging_schema": 2,
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

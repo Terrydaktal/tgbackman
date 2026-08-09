@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-backup_inspect.py
+tgbackman-legacy-inspect
 
 Recursively scan a folder for Telegram backups (JSON, HTML, unofficial SQLite)
 and print summary metadata, including message counts, chat summaries, date ranges,
 and space footprint on disk.
 
 Usage:
-  python3 backup_inspect.py /path/to/backup_folder [--json] [--no-inspect] [--no-sizes] [--dedupe-unofficial-sqlite]
+  tgbackman-legacy-inspect /path/to/backup_folder [--json] [--no-inspect] [--no-sizes] [--dedupe-unofficial-sqlite]
 """
 
 from __future__ import annotations

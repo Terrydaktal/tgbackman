@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-fix_split_subfolder_ranges.py
+tgbackman-db-range-repair
 
 Rename per-chat subfolders in a split multi-chat HTML/JSON/SQLite export output.
 
@@ -87,16 +87,23 @@ def scan_html_files(
     for path in sorted(html_files):
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-
-            matches = HTML_TITLE_RE.findall(content)
-            for ts_raw in matches:
-                dt = parse_html_timestamp(ts_raw)
-                if dt:
-                    if min_dt is None or dt < min_dt:
-                        min_dt = dt
-                    if max_dt is None or dt > max_dt:
-                        max_dt = dt
+                carry = ""
+                for chunk in iter(lambda: f.read(1024 * 1024), ""):
+                    data = carry + chunk
+                    if len(data) <= 256:
+                        carry = data
+                        continue
+                    scan, carry = data[:-256], data[-256:]
+                    for ts_raw in HTML_TITLE_RE.findall(scan):
+                        dt = parse_html_timestamp(ts_raw)
+                        if dt:
+                            min_dt = dt if min_dt is None else min(min_dt, dt)
+                            max_dt = dt if max_dt is None else max(max_dt, dt)
+                for ts_raw in HTML_TITLE_RE.findall(carry):
+                    dt = parse_html_timestamp(ts_raw)
+                    if dt:
+                        min_dt = dt if min_dt is None else min(min_dt, dt)
+                        max_dt = dt if max_dt is None else max(max_dt, dt)
         except Exception:
             pass
 
@@ -118,12 +125,18 @@ def scan_json_files(
     max_dt = None
 
     for path in json_files:
+        carry = ""
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 while True:
                     chunk = f.read(16 * 1024 * 1024) # 16MB chunks
                     if not chunk:
                         break
+                    data = carry + chunk
+                    if len(data) <= 256:
+                        carry = data
+                        continue
+                    chunk, carry = data[:-256], data[-256:]
 
                     unix_matches = JSON_DATE_UNIX_RE.findall(chunk)
                     for ts_str in unix_matches:
@@ -139,13 +152,33 @@ def scan_json_files(
                     iso_matches = JSON_DATE_RE.findall(chunk)
                     for iso_str in iso_matches:
                         try:
-                            dt = datetime.fromisoformat(iso_str).replace(tzinfo=timezone.utc)
+                            dt = datetime.fromisoformat(iso_str)
+                            dt = (
+                                dt.replace(tzinfo=timezone.utc)
+                                if dt.tzinfo is None
+                                else dt.astimezone(timezone.utc)
+                            )
                             if min_dt is None or dt < min_dt:
                                 min_dt = dt
                             if max_dt is None or dt > max_dt:
                                 max_dt = dt
                         except Exception:
                             pass
+            for ts_str in JSON_DATE_UNIX_RE.findall(carry):
+                try:
+                    dt = datetime.fromtimestamp(int(ts_str), tz=timezone.utc)
+                    min_dt = dt if min_dt is None else min(min_dt, dt)
+                    max_dt = dt if max_dt is None else max(max_dt, dt)
+                except Exception:
+                    pass
+            for iso_str in JSON_DATE_RE.findall(carry):
+                try:
+                    dt = datetime.fromisoformat(iso_str)
+                    dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+                    min_dt = dt if min_dt is None else min(min_dt, dt)
+                    max_dt = dt if max_dt is None else max(max_dt, dt)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -163,42 +196,36 @@ def scan_sqlite_file(
     if not sqlite_files:
         return None, None
 
-    path = sqlite_files[0]
-    try:
-        conn = sqlite3.connect(path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT MIN(time), MAX(time) FROM messages WHERE time IS NOT NULL AND time > 0;")
-        min_epoch, max_epoch = cursor.fetchone()
-        conn.close()
-
-        if min_epoch and max_epoch:
-            min_dt = datetime.fromtimestamp(int(min_epoch), tz=timezone.utc)
-            max_dt = datetime.fromtimestamp(int(max_epoch), tz=timezone.utc)
-            return min_dt, max_dt
-    except Exception:
-        pass
-
-    return None, None
+    min_dt = None
+    max_dt = None
+    for path in sqlite_files:
+        try:
+            conn = sqlite3.connect(path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT MIN(time), MAX(time) FROM messages WHERE time IS NOT NULL AND time > 0;")
+            min_epoch, max_epoch = cursor.fetchone()
+            conn.close()
+            if min_epoch:
+                value = datetime.fromtimestamp(int(min_epoch), tz=timezone.utc)
+                min_dt = value if min_dt is None else min(min_dt, value)
+            if max_epoch:
+                value = datetime.fromtimestamp(int(max_epoch), tz=timezone.utc)
+                max_dt = value if max_dt is None else max(max_dt, value)
+        except Exception:
+            continue
+    return min_dt, max_dt
 
 def detect_dates(
     dir_path: str, *, recursive: bool = True
 ) -> Tuple[Optional[datetime], Optional[datetime]]:
-    # 1. SQLite
+    # Combine all available formats; mixed legacy folders must not let one
+    # format hide an earlier or later range found in another.
     sq_min, sq_max = scan_sqlite_file(dir_path, recursive=recursive)
-    if sq_min and sq_max:
-        return sq_min, sq_max
-
-    # 2. JSON
     js_min, js_max = scan_json_files(dir_path, recursive=recursive)
-    if js_min and js_max:
-        return js_min, js_max
-
-    # 3. HTML
     ht_min, ht_max = scan_html_files(dir_path, recursive=recursive)
-    if ht_min and ht_max:
-        return ht_min, ht_max
-
-    return None, None
+    values_min = [value for value in (sq_min, js_min, ht_min) if value is not None]
+    values_max = [value for value in (sq_max, js_max, ht_max) if value is not None]
+    return (min(values_min) if values_min else None, max(values_max) if values_max else None)
 
 def is_backup_root(dir_path: str) -> bool:
     try:

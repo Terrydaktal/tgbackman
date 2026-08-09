@@ -11,8 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-import db_indexer
-import telegram_incremental_backup as exporter
+import tgbackup.exporter as exporter
+from tgbackup.database import importer as db_indexer
 
 
 class FakeMessage:
@@ -105,7 +105,7 @@ class IncrementalExporterTests(unittest.TestCase):
     def test_progress_reporter_includes_counts_media_rate_and_outcome(self):
         lines = []
         reporter = exporter.ProgressReporter(
-            "Alexandra", interval=60, every=2, output=lines.append
+            "Example Chat", interval=60, every=2, output=lines.append
         )
         reporter.start("direct-to-database backup", resumed_messages=4500)
         reporter.observe(
@@ -228,10 +228,10 @@ class IncrementalExporterTests(unittest.TestCase):
     def test_direct_chat_output_adds_only_date_range(self):
         async def run():
             with tempfile.TemporaryDirectory() as directory:
-                chat_dir = Path(directory) / "alex2"
+                chat_dir = Path(directory) / "example-chat"
                 chat_dir.mkdir()
                 target = make_target()
-                target.chat_id = "alex2"
+                target.chat_id = "example-chat"
                 staging = chat_dir / ".partial-chat-key-none"
                 staging.mkdir()
 
@@ -403,7 +403,7 @@ class IncrementalExporterTests(unittest.TestCase):
                     "--session", str(session),
                     "--output", str(output),
                     "--unit-dir", str(unit_dir),
-                    "--mount-point", "/media/lewis/1b",
+                    "--mount-point", "/media/example/backup-volume",
                 ]
             )
             exporter.install_systemd_example(args)
@@ -412,7 +412,7 @@ class IncrementalExporterTests(unittest.TestCase):
             self.assertNotIn("--legacy-json-export", service)
             self.assertIn(f"--config {config}", service)
             self.assertIn(str(session), service)
-            self.assertIn("ConditionPathIsMountPoint=/media/lewis/1b", service)
+            self.assertIn("ConditionPathIsMountPoint=/media/example/backup-volume", service)
 
     def test_default_run_indexes_before_watermark(self):
         async def run():
@@ -998,10 +998,10 @@ class IncrementalExporterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = make_target()
-            target.output_dir = str(root / "output" / "Alexandra")
+            target.output_dir = str(root / "output" / "Example Chat")
             selected = exporter.target_output_dir(root / "output", target)
-            self.assertEqual(selected, (root / "output" / "Alexandra").resolve())
-            target.output_dir = str(root / "elsewhere" / "Alexandra")
+            self.assertEqual(selected, (root / "output" / "Example Chat").resolve())
+            target.output_dir = str(root / "elsewhere" / "Example Chat")
             selected = exporter.target_output_dir(root / "output", target)
             self.assertEqual(selected, (root / "output" / "Chat").resolve())
 
@@ -1079,8 +1079,8 @@ class IncrementalExporterTests(unittest.TestCase):
                     [(row[0], row[1]) for row in links],
                     [
                         ("dialog_101", "peer-id"),
+                        ("dialog_202", "telegram-discovered"),
                         ("dialog_303", "telegram-discovered"),
-                        ("inactive-fragment", "exact-title"),
                     ],
                 )
                 placeholder = conn.execute(

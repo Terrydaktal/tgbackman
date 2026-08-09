@@ -45,11 +45,11 @@ ON CONFLICT(chat_id, message_id) DO UPDATE SET
     media_type=CASE WHEN excluded.source_format='telegram_api'
         OR (excluded.source_format='json' AND COALESCE(messages.source_format, '')!='telegram_api')
         OR (excluded.source_format='sqlite' AND COALESCE(messages.source_format, '') NOT IN ('telegram_api','json'))
-        THEN COALESCE(excluded.media_type, messages.media_type) ELSE messages.media_type END,
+        THEN excluded.media_type ELSE messages.media_type END,
     media_path=CASE WHEN excluded.source_format='telegram_api'
         OR (excluded.source_format='json' AND COALESCE(messages.source_format, '')!='telegram_api')
         OR (excluded.source_format='sqlite' AND COALESCE(messages.source_format, '') NOT IN ('telegram_api','json'))
-        THEN COALESCE(excluded.media_path, messages.media_path) ELSE messages.media_path END,
+        THEN excluded.media_path ELSE messages.media_path END,
     reply_to_id=CASE WHEN excluded.source_format='telegram_api'
         OR (excluded.source_format='json' AND COALESCE(messages.source_format, '')!='telegram_api')
         OR (excluded.source_format='sqlite' AND COALESCE(messages.source_format, '') NOT IN ('telegram_api','json'))
@@ -58,20 +58,20 @@ ON CONFLICT(chat_id, message_id) DO UPDATE SET
         OR (excluded.source_format='json' AND COALESCE(messages.source_format, '')!='telegram_api')
         OR (excluded.source_format='sqlite' AND COALESCE(messages.source_format, '') NOT IN ('telegram_api','json'))
         THEN excluded.forwarded_from ELSE messages.forwarded_from END,
-    message_type=COALESCE(excluded.message_type, messages.message_type),
-    edit_timestamp=COALESCE(excluded.edit_timestamp, messages.edit_timestamp),
-    edit_timestamp_unix=COALESCE(excluded.edit_timestamp_unix, messages.edit_timestamp_unix),
-    media_size=COALESCE(excluded.media_size, messages.media_size),
-    media_sha256=COALESCE(excluded.media_sha256, messages.media_sha256),
-    media_status=COALESCE(excluded.media_status, messages.media_status),
-    grouped_id=COALESCE(excluded.grouped_id, messages.grouped_id),
-    entities_json=COALESCE(excluded.entities_json, messages.entities_json),
-    reactions_json=COALESCE(excluded.reactions_json, messages.reactions_json),
-    reply_markup_json=COALESCE(excluded.reply_markup_json, messages.reply_markup_json),
-    action_json=COALESCE(excluded.action_json, messages.action_json),
-    forward_json=COALESCE(excluded.forward_json, messages.forward_json),
-    extra_json=COALESCE(excluded.extra_json, messages.extra_json),
-    raw_payload=COALESCE(excluded.raw_payload, messages.raw_payload),
+    message_type=excluded.message_type,
+    edit_timestamp=excluded.edit_timestamp,
+    edit_timestamp_unix=excluded.edit_timestamp_unix,
+    media_size=excluded.media_size,
+    media_sha256=excluded.media_sha256,
+    media_status=excluded.media_status,
+    grouped_id=excluded.grouped_id,
+    entities_json=excluded.entities_json,
+    reactions_json=excluded.reactions_json,
+    reply_markup_json=excluded.reply_markup_json,
+    action_json=excluded.action_json,
+    forward_json=excluded.forward_json,
+    extra_json=excluded.extra_json,
+    raw_payload=excluded.raw_payload,
     source_key=excluded.source_key,
     source_format=excluded.source_format,
     is_deleted=0,
@@ -122,9 +122,17 @@ def resolve_local_media_path(backup_path: str, media_path: str | None) -> str | 
     value = str(media_path)
     if urllib.parse.urlparse(value).scheme:
         return value
-    if os.path.isabs(value):
-        return os.path.abspath(value)
-    return os.path.abspath(os.path.join(backup_path, value))
+    root = os.path.abspath(backup_path)
+    candidate = os.path.abspath(value) if os.path.isabs(value) else os.path.abspath(os.path.join(root, value))
+    root_real = os.path.realpath(root)
+    candidate_real = os.path.realpath(candidate)
+    try:
+        os.path.commonpath((root, candidate))
+    except ValueError as exc:
+        raise ValueError(f"media path is outside its declared backup root: {value}") from exc
+    if os.path.commonpath((root, candidate)) != root or os.path.commonpath((root_real, candidate_real)) != root_real:
+        raise ValueError(f"media path is outside its declared backup root: {value}")
+    return candidate
 
 
 def archival_message_values(

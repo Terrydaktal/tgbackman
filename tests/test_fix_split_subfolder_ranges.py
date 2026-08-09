@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import fix_split_subfolder_ranges as ranges
+from tgbackup.database import range_repair as ranges
 
 
 HTML = """
@@ -19,7 +19,7 @@ HTML = """
 class FlatRangeWrappingTests(unittest.TestCase):
     def test_flat_wrap_moves_export_but_preserves_chat_marker(self):
         with tempfile.TemporaryDirectory() as directory:
-            chat = Path(directory) / "alex2"
+            chat = Path(directory) / "example-chat"
             photos = chat / "photos"
             photos.mkdir(parents=True)
             (chat / "messages.html").write_text(HTML, encoding="utf-8")
@@ -52,7 +52,7 @@ class FlatRangeWrappingTests(unittest.TestCase):
     def test_wrap_migrates_relative_database_media_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            chat = root / "alex2"
+            chat = root / "example-chat"
             media = chat / "files" / "voice.ogg"
             media.parent.mkdir(parents=True)
             media.write_bytes(b"voice")
@@ -76,18 +76,18 @@ class FlatRangeWrappingTests(unittest.TestCase):
             )
             conn.execute(
                 "INSERT INTO chats VALUES (?, ?, ?)",
-                ("alex2", "Alexandra", str(chat)),
+                ("example-chat", "Example Chat", str(chat)),
             )
             conn.execute(
                 "INSERT INTO messages VALUES (?, ?, ?)",
-                (1, "alex2", "files/voice.ogg"),
+                (1, "example-chat", "files/voice.ogg"),
             )
             conn.commit()
 
             chat_ids, updates, missing = ranges._plan_db_migration(
                 conn, str(chat), str(destination)
             )
-            self.assertEqual(chat_ids, ["alex2"])
+            self.assertEqual(chat_ids, ["example-chat"])
             self.assertEqual(missing, 0)
             self.assertEqual(updates, [(str(destination / "files" / "voice.ogg"), 1)])
 
@@ -102,7 +102,7 @@ class FlatRangeWrappingTests(unittest.TestCase):
             self.assertTrue((destination / "files" / "voice.ogg").is_file())
             self.assertEqual(
                 conn.execute(
-                    "SELECT backup_path FROM chats WHERE chat_id = 'alex2'"
+                    "SELECT backup_path FROM chats WHERE chat_id = 'example-chat'"
                 ).fetchone()[0],
                 str(destination),
             )

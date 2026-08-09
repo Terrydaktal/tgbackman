@@ -173,6 +173,7 @@ class FixStats:
     urls_rewritten: int = 0
     media_files_copied: int = 0
     media_files_skipped_existing: int = 0
+    errors: int = 0
 
 
 def fix_single_chat_export_in_place(
@@ -228,7 +229,9 @@ def fix_single_chat_export_in_place(
                             continue
                         abs_src, rel_posix = resolved
                         _ensure_multi_copied(abs_src, rel_posix)
-        except Exception:
+        except Exception as exc:
+            stats.errors += 1
+            print(f"scan failed: {p}: {exc}", file=sys.stderr)
             continue
 
     # Copy discovered media.
@@ -240,11 +243,18 @@ def fix_single_chat_export_in_place(
             if dry_run:
                 continue
             os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
+            temporary = f"{dst_abs}.tmp-{os.getpid()}"
             try:
-                shutil.copy2(abs_src, dst_abs)
+                shutil.copy2(abs_src, temporary)
+                os.replace(temporary, dst_abs)
                 stats.media_files_copied += 1
-            except Exception:
-                # best-effort
+            except Exception as exc:
+                stats.errors += 1
+                print(f"copy failed: {abs_src} -> {dst_abs}: {exc}", file=sys.stderr)
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
                 continue
 
     # Second pass: rewrite HTML in-place.
@@ -315,7 +325,9 @@ def fix_single_chat_export_in_place(
                         print(f"[fix] modified: {p}", file=sys.stderr)
             else:
                 os.remove(tmp)
-        except Exception:
+        except Exception as exc:
+            stats.errors += 1
+            print(f"rewrite failed: {p}: {exc}", file=sys.stderr)
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
@@ -382,11 +394,12 @@ def main() -> int:
         f"html_modified={stats.html_files_modified} "
         f"urls_rewritten={stats.urls_rewritten} "
         f"media_copied={stats.media_files_copied} "
-        f"media_skipped_existing={stats.media_files_skipped_existing}"
+        f"media_skipped_existing={stats.media_files_skipped_existing} "
+        f"errors={stats.errors}"
     )
     if args.dry_run:
         print("(dry-run: no changes were written)")
-    return 0
+    return 1 if stats.errors else 0
 
 
 if __name__ == "__main__":

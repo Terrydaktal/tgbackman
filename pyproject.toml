@@ -32,6 +32,8 @@ tgbackman-legacy-repair-links = "tgbackup.legacy_tree.link_repair:main"
 tgbackman-legacy-check-links = "tgbackup.legacy_tree.check_links:main"
 tgbackman-legacy-relocate-media = "tgbackup.legacy_tree.media_relocator:main"
 tgbackman-legacy-backfill-metadata = "tgbackup.legacy_tree.backfill_metadata:main"
+tgbackman-media-dedupe = "tgbackup.media_dedupe:main"
+tgbackman-media-reorganize = "tgbackup.media_reorganize:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

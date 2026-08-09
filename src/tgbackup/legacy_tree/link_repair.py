@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-repair_html_links.py
+tgbackman-legacy-repair-links
 
 Scan all .html files under a Telegram backup folder and repair broken local links
 containing unescaped hash ('#') characters in their filenames by URL-encoding them
 in-place.
 
 Usage:
-  python3 repair_html_links.py /path/to/backup_folder [--dry-run]
+  tgbackman-legacy-repair-links /path/to/backup_folder [--dry-run]
 """
 
 from __future__ import annotations
@@ -157,11 +157,17 @@ def repair_local_html_links_in_place(root: str, *, apply_changes: bool) -> Tuple
         if s2 != s:
             changed_files += 1
             if apply_changes:
+                temporary = f"{p}.tmp-{os.getpid()}"
                 try:
-                    with open(p, "w", encoding="utf-8") as f:
+                    with open(temporary, "w", encoding="utf-8") as f:
                         f.write(s2)
+                    os.replace(temporary, p)
                 except Exception:
-                    continue
+                    try:
+                        os.unlink(temporary)
+                    except OSError:
+                        pass
+                    raise
 
     return len(html_files), changed_files, rewritten
 

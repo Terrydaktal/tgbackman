@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -162,7 +163,8 @@ def sha256_file(path: Path) -> str:
 
 async def download_media(message: Any, media_root: Path, media_type: str, retries: int,
                          expected_size: Optional[int] = None, progress: Optional[ProgressReporter] = None,
-                         plan: Optional[MediaDownloadPlan] = None) -> Optional[str]:
+                         plan: Optional[MediaDownloadPlan] = None,
+                         *, max_file_size: Optional[int] = None) -> Optional[str]:
     selected_plan = plan or media_download_plan(message)
     if selected_plan is not None:
         media_type, expected_size = selected_plan.media_type, selected_plan.expected_size
@@ -172,8 +174,18 @@ async def download_media(message: Any, media_root: Path, media_type: str, retrie
         media_dir.chmod(0o700)
     filename = media_filename(message, selected_plan)
     destination = media_dir / filename
+    checksum_path = destination.with_name(destination.name + ".sha256")
     if destination.exists() and destination.is_file() and destination.stat().st_size > 0:
-        if expected_size is None or destination.stat().st_size == expected_size:
+        reusable = expected_size is None or destination.stat().st_size == expected_size
+        if reusable and checksum_path.is_file():
+            try:
+                recorded_hash = checksum_path.read_text(encoding="ascii").strip()
+                reusable = len(recorded_hash) == 64 and sha256_file(destination) == recorded_hash
+            except (OSError, UnicodeError):
+                reusable = False
+        else:
+            reusable = False
+        if reusable:
             with contextlib.suppress(OSError):
                 destination.chmod(0o600)
             if progress:
@@ -185,28 +197,51 @@ async def download_media(message: Any, media_root: Path, media_type: str, retrie
     attempt = 0
     while attempt <= max(0, retries):
         try:
-            if destination.exists():
-                destination.unlink()
+            temporary = destination.with_name(
+                f".{destination.name}.part-{os.getpid()}-{attempt}"
+            )
+            with contextlib.suppress(OSError):
+                temporary.unlink()
             reported_total = 0
-            kwargs: dict[str, Any] = {"file": str(destination)}
+            kwargs: dict[str, Any] = {"file": str(temporary)}
             if selected_plan is not None and selected_plan.thumb_type is not None:
                 kwargs["thumb"] = selected_plan.thumb_type
             if progress:
                 def report_download(received: int, total: int) -> None:
                     nonlocal reported_total
                     reported_total = max(reported_total, int(total or 0))
+                    if max_file_size and (reported_total > max_file_size or int(received) > max_file_size):
+                        raise ExportError(
+                            f"media for message {message.id} exceeds max file size ({max_file_size} bytes)"
+                        )
                     progress.media_download_progress(int(message.id), filename, int(received), int(total or 0))
                 kwargs["progress_callback"] = report_download
+            elif max_file_size:
+                def enforce_size(received: int, total: int) -> None:
+                    nonlocal reported_total
+                    reported_total = max(reported_total, int(total or 0))
+                    if reported_total > max_file_size or int(received) > max_file_size:
+                        raise ExportError(
+                            f"media for message {message.id} exceeds max file size ({max_file_size} bytes)"
+                        )
+                kwargs["progress_callback"] = enforce_size
             downloaded = await message.download_media(**kwargs)
-            if downloaded and destination.is_file() and destination.stat().st_size > 0:
-                actual_size = destination.stat().st_size
+            if downloaded and temporary.is_file() and temporary.stat().st_size > 0:
+                actual_size = temporary.stat().st_size
                 if expected_size is not None and reported_total and expected_size != reported_total:
                     last_error = ExportError(f"media for message {message.id} has inconsistent Telegram sizes ({expected_size} metadata, {reported_total} transfer)")
                 elif expected_size is not None and actual_size != expected_size:
                     last_error = ExportError(f"media for message {message.id} has size {actual_size}, expected {expected_size}")
                 elif expected_size is None and reported_total and actual_size != reported_total:
                     last_error = ExportError(f"media for message {message.id} has size {actual_size}, expected transfer size {reported_total}")
+                elif max_file_size and actual_size > max_file_size:
+                    last_error = ExportError(f"media for message {message.id} exceeds max file size ({actual_size} > {max_file_size})")
                 else:
+                    digest = sha256_file(temporary)
+                    os.replace(temporary, destination)
+                    checksum_path.write_text(digest + "\n", encoding="ascii")
+                    with contextlib.suppress(OSError):
+                        checksum_path.chmod(0o600)
                     with contextlib.suppress(OSError):
                         destination.chmod(0o600)
                     return destination.relative_to(media_root.parent).as_posix()
@@ -222,6 +257,9 @@ async def download_media(message: Any, media_root: Path, media_type: str, retrie
                 await asyncio.sleep(wait_seconds)
                 continue
             last_error = exc
+        finally:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
         attempt += 1
         if attempt <= retries:
             await asyncio.sleep(min(30, 2**attempt))

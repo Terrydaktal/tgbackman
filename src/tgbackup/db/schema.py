@@ -7,6 +7,7 @@ import an application-level importer.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 
@@ -15,6 +16,8 @@ from ..config import (
     DIALOGS_TABLE,
     EXPORTS_TABLE,
     PURGES_TABLE,
+    RUN_ARCHIVE_TABLE,
+    RUN_ATTEMPTS_TABLE,
     RUN_MESSAGES_TABLE,
     RUNS_TABLE,
     TARGETS_TABLE,
@@ -88,6 +91,11 @@ def ensure_archive_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS message_sources (
             chat_id TEXT NOT NULL, message_id INTEGER NOT NULL, source_key TEXT NOT NULL,
             PRIMARY KEY(chat_id, message_id, source_key), FOREIGN KEY(source_key) REFERENCES backup_sources(source_key)
+        );
+        CREATE TABLE IF NOT EXISTS message_source_media (
+          source_key TEXT NOT NULL, chat_id TEXT NOT NULL, message_id INTEGER NOT NULL,
+          media_path TEXT, media_size INTEGER, media_sha256 TEXT, media_status TEXT,
+          checked_unix INTEGER NOT NULL, PRIMARY KEY(source_key, chat_id, message_id)
         );
         CREATE INDEX IF NOT EXISTS idx_messages_source_key ON messages(source_key);
         """
@@ -165,6 +173,14 @@ def ensure_targets_schema(conn: sqlite3.Connection) -> None:
           media_error TEXT, PRIMARY KEY(run_key, message_id),
           FOREIGN KEY(run_key) REFERENCES {RUNS_TABLE}(run_key) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS {RUN_ARCHIVE_TABLE} (
+          run_key TEXT NOT NULL, message_id INTEGER NOT NULL, record_json TEXT NOT NULL,
+          media_error TEXT, PRIMARY KEY(run_key, message_id)
+        );
+        CREATE TABLE IF NOT EXISTS {RUN_ATTEMPTS_TABLE} (
+          attempt_key TEXT PRIMARY KEY, run_key TEXT NOT NULL, started_unix INTEGER NOT NULL,
+          completed_unix INTEGER, status TEXT NOT NULL, error TEXT
+        );
         CREATE TABLE IF NOT EXISTS {EXPORTS_TABLE} (
           export_key TEXT PRIMARY KEY, target_key TEXT NOT NULL, source_name TEXT NOT NULL,
           chat_id TEXT NOT NULL, output_path TEXT NOT NULL UNIQUE, message_count INTEGER NOT NULL DEFAULT 0,
@@ -183,6 +199,10 @@ def ensure_targets_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # Every application connection must have the same searchable schema.  An
+    # older database can have all archival tables but still be missing FTS
+    # triggers, so this cannot be limited to fresh database creation.
+    ensure_search_schema(conn)
     conn.execute(
         f"""INSERT OR IGNORE INTO {TARGET_CHAT_LINKS_TABLE}(target_key, chat_id, match_method, linked_unix)
             SELECT target_key, chat_id, 'canonical', strftime('%s','now') FROM {TARGETS_TABLE}
@@ -194,7 +214,8 @@ def ensure_targets_schema(conn: sqlite3.Connection) -> None:
 def refresh_chat_statistics(conn: sqlite3.Connection, chat_id: str) -> None:
     row = conn.execute(
         """SELECT MIN(message_id), MAX(message_id), COUNT(*), MIN(timestamp), MAX(timestamp),
-                  MIN(timestamp_unix), MAX(timestamp_unix) FROM messages WHERE chat_id=?""", (chat_id,)
+                  MIN(timestamp_unix), MAX(timestamp_unix) FROM messages
+           WHERE chat_id=? AND COALESCE(is_deleted, 0)=0""", (chat_id,)
     ).fetchone()
     conn.execute(
         """UPDATE chats SET min_msg_id=?, max_msg_id=?, msg_count=?, min_timestamp=?, max_timestamp=?,
@@ -208,6 +229,8 @@ def setup_database(db_path: str | os.PathLike[str]) -> sqlite3.Connection:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(parent, 0o700)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
@@ -219,4 +242,7 @@ def setup_database(db_path: str | os.PathLike[str]) -> sqlite3.Connection:
     ensure_targets_schema(conn)
     ensure_search_schema(conn)
     conn.commit()
+    for candidate in (path, f"{path}-wal", f"{path}-shm"):
+        with contextlib.suppress(OSError):
+            os.chmod(candidate, 0o600)
     return conn

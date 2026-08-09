@@ -20,7 +20,7 @@ A high-performance, compiled Rust search utility designed for lightning-fast que
   - `--no-time`: Strips dates and times from displayed records.
 
 ### 2. `rules/` (Sanitisation Mapping)
-- **`sanitise_rules.txt`**: Plain text file containing one name replacement rule per line (e.g. `lewis:Jim`). Supports both `:` and `=` delimiters and `#` comments.
+- **`sanitise_rules.txt`**: Plain text file containing one name replacement rule per line (e.g. `username:REDACTED`). Supports both `:` and `=` delimiters and `#` comments.
 - **`bad_lanaguge_rules.txt`**: Extends the standard rules by adding expletive-to-clean mappings (e.g. `fuck:frick`, `cunt:fool`) to allow sharing clean logs publicly.
 
 ### 3. `out/` (Export Folders)
@@ -47,13 +47,13 @@ Execute queries using the compiled binary.
 
 #### Example A: Standard Deduplicated Context Search
 ```bash
-target/release/tgsearch "/media/lewis/1b/sqlitedb/telegram_backup.db" "makeup" -c 1 -l 80 --dedupe
+target/release/tgsearch "/path/to/telegram_backup.db" "example-term" -c 1 -l 80 --dedupe
 ```
 *Retrieves up to 80 unique matches with 1 line of preceding/succeeding context, deduplicating identical messages cleanly across backup overlaps.*
 
 #### Example B: Sanitised and Compact Output (Perfect for Sharing)
 ```bash
-target/release/tgsearch "/media/lewis/1b/sqlitedb/telegram_backup.db" "makeup OR alcohol" --no-time -l -1 --dedupe --no-header --sanitise "rules/bad_lanaguge_rules.txt" > out/makeup.txt
+target/release/tgsearch "/path/to/telegram_backup.db" "example-term OR another-term" --no-time -l -1 --dedupe --no-header --sanitise "rules/sanitise_rules.txt" > out/results.txt
 ```
 *Queries unlimited matches containing either "makeup" or "alcohol", suppresses headers and timestamps, maps all real names and expletives to safe replacements, and writes a clean, anonymous result log directly to `out/makeup.txt`.*
 
@@ -61,4 +61,4 @@ target/release/tgsearch "/media/lewis/1b/sqlitedb/telegram_backup.db" "makeup OR
 
 ## 🔒 Security & Privacy Notes
 - **Local SQLite Access:** The database file is opened strictly in `read-only` mode (`SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI`), preventing any accidental modifications to the source archive.
-- **Leak Protection:** When utilizing `--sanitise`, the parser automatically aliases the user's username variations (`lewis` and `siwel`) together. Replacing either username automatically replaces both, preventing accidental real-name leaks across database and HTML backup formats.
+- **Leak Protection:** When utilizing `--sanitise`, every configured replacement is applied case-insensitively to chat names, senders, queries, and message text. Keep your local rules file outside version control when it contains private names.

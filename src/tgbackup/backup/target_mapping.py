@@ -42,8 +42,8 @@ def legacy_chat_id(conn: sqlite3.Connection, source_name: str, peer_kind: str, p
         value = str(row["chat_id"])
         if value == suffix or value.endswith(f"_{suffix}"):
             return value
-    if len(rows) == 1:
-        return str(rows[0]["chat_id"])
+    # A display name is mutable and not unique.  Never reuse a legacy ID on
+    # title alone; callers must provide a peer-derived ID or an explicit link.
     prefix = "dialog" if peer_kind == "user" else "group" if peer_kind == "group" else "channel"
     return f"{prefix}_{peer_id}"
 
@@ -319,11 +319,13 @@ def match_dialogs_to_database_chats(
         if chat.chat_id in assigned_chat_ids:
             continue
         matches = by_name.get(normalized_chat_name(chat.name), [])
-        if len(matches) == 1:
-            description = matches[0][1]
-            assignments.setdefault((description[0], description[3]), []).append((chat, "exact-title"))
-        elif len(matches) > 1:
-            unresolved.append((chat, "title matches more than one Telegram dialog"))
+        # Titles are only useful as a review hint.  They are deliberately not
+        # sufficient to link a legacy row or inherit its watermark.
+        if matches:
+            detail = "title match requires explicit peer confirmation"
+            if len(matches) > 1:
+                detail = "title matches more than one dialog; explicit peer confirmation required"
+            unresolved.append((chat, detail))
         else:
             unresolved.append((chat, "no exact Telegram dialog match"))
     return assignments, unresolved

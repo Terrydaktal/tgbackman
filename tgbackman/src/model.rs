@@ -32,6 +32,8 @@ pub(crate) struct ActiveChatView {
     pub(crate) backup_name: String,
     pub(crate) chat_id: String,
     pub(crate) messages: Vec<BackupMessage>,
+    pub(crate) total_messages: i64,
+    pub(crate) truncated: bool,
     pub(crate) scroll_to_bottom: bool,
     pub(crate) search_query: String,
     pub(crate) filtered_indices: Vec<usize>,
@@ -95,7 +97,7 @@ impl BackupInfo {
     pub(crate) fn compute_media_stats(&self, db_path: &str) -> MediaStats {
         let mut stats = MediaStats::default();
         if let Ok(conn) = rusqlite::Connection::open(db_path) {
-            if let Ok(mut stmt) = conn.prepare("SELECT media_type, media_path FROM messages WHERE chat_id = ? AND media_type IN ('photo', 'video', 'voice_message', 'file')") {
+            if let Ok(mut stmt) = conn.prepare("SELECT media_type, media_path FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0 AND media_type IN ('photo', 'video', 'voice_message', 'file')") {
                 if let Ok(rows) = stmt.query_map(rusqlite::params![self.chat_id], |row| {
                     Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
                 }) {
