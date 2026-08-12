@@ -45,7 +45,7 @@ tgbackman/
 │       └── staging.py                 # Durable failed-run staging/resume
 ├── systemd/                           # Example/generated user service and timer units
 ├── tests/                              # Offline regression tests for exporter/indexer invariants
-├── tgbackman/                         # Rust GUI overlap and coverage visualizer
+├── tgbackman/                         # Rust backup manager, chat viewer, and coverage visualizer
 │   ├── Cargo.toml                     # Rust GUI project manifest
 │   └── src/                           # Rust GUI source code
 └── tgsearch/                          # High-performance compiled Rust search companion
@@ -135,7 +135,7 @@ This section outlines what each script does, its inputs, and its outputs.
 
   # Strictly verify a canonical DB and all recorded media
   uv run tgbackman-db-import --verify-db /path/to/archive.db \
-    --require-archived-sources --check-media
+    --require-archived-sources --require-complete-metadata --check-media
   ```
   For a lossless migration, do not point the importer at the live database. Build a new one beside it:
   ```bash
@@ -207,15 +207,15 @@ This section outlines what each script does, its inputs, and its outputs.
 ### 10. Canonical database — `tgbackman-backup`
 
 * **Purpose**: Authenticates one Telegram user account through Telethon, maps active database chats to stable Telegram peer IDs, downloads only the required messages/media, and commits them directly into the canonical SQLite database. No HTML or JSON export is written in normal operation.
-* **Security**: The API hash and Telethon session are stored outside the repository. The first login is interactive; later scheduled runs reuse the local session. Never commit or share either credential.
+* **Security**: The API hash and Telethon session are stored outside the repository. The first login is interactive; later scheduled runs reuse the local session. Never commit or share either credential. The canonical database is also sensitive and is not encrypted by SQLite: exact Telegram entity snapshots may contain usernames, phone/contact fields visible to the account, access hashes, restrictions, and other profile/chat metadata. Protect the database and its independent backups with appropriate filesystem permissions and full-disk encryption.
 * **Inputs**:
   - Existing master SQLite database (`--db`).
   - Credentials file (`--config`, default `~/.config/tgbackman/credentials.env`) containing `TG_API_ID` and `TG_API_HASH`.
   - A Telegram user session (`--session`, default `~/.local/share/tgbackman/telegram`).
 * **Outputs**:
-  - Canonical message rows, compressed raw Telegram records, rich metadata, source provenance, run coverage, and watermarks in `--db`.
+  - Canonical message rows plus the exact Telegram TL bytes and presentation-friendly JSON for every fetched message, full basic/detailed chat snapshots, sender entity snapshots, complete API-visible reactor and public-poll voter pages, source provenance, run coverage, and watermarks in `--db`.
   - Media under each stable chat directory as `<chat>/media/<type>/...`; database rows store paths relative to that chat root.
-  - Resumable staging rows in `telegram_backup_run_messages`. A watermark advances only in the same transaction that merges and verifies those rows. Failed and running staging is retained for recovery; completed staging rows are deleted inside the successful merge transaction, and each later run prunes completed rows left by older versions while retaining the compact run/ledger metadata.
+  - Resumable staging rows in `telegram_backup_run_messages`. A watermark advances only in the same transaction that verifies and merges message bytes, entity snapshots, secondary metadata, and media. Failed and running staging is retained for recovery; completed staging rows are deleted inside the successful merge transaction, and each later run prunes completed rows left by older versions while retaining the compact run/ledger metadata. Staging created before the lossless-metadata schema is deliberately re-read from Telegram, although already-valid media files remain reusable.
   - `--legacy-json-export` is an opt-in compatibility mode for dated `result.json` folders; it is not used by default.
 * **Initial setup**:
   ```bash
@@ -292,7 +292,8 @@ This section outlines what each script does, its inputs, and its outputs.
   ```
   `--chat-output-dir` is restricted to one explicit target and now controls only that chat's stable media location; messages go directly into `--db`. By default the exporter requests IDs strictly greater than the stored watermark, so no redundant overlap is stored as a second message row. `UNIQUE(chat_id,message_id)` and upserts also prevent duplicate rows.
 
-  For edit/media repair, use `--overlap-ids 1000` (and optionally a date window). Existing rows are updated in place and recovered files replace missing media metadata. `--full-rescan` walks the entire current server history, repairs all returned messages, and tombstones previously archived IDs no longer returned; it never deletes their archived row. Exact mode cannot notice older edits/deletions that it does not re-read.
+  For edit/media repair, use `--overlap-ids 1000` (and optionally a date window). Existing rows are updated in place and recovered files replace missing media metadata. `--full-rescan` walks the entire current server history, upgrades every returned legacy row to the lossless metadata contract, repairs mutable metadata, and tombstones previously archived IDs no longer returned; it never deletes their archived row. Exact incremental mode is complete for the newly fetched range but cannot notice older edits, deletions, changed reaction lists, poll changes, or other mutable fields that it does not re-read.
+  Replies remain references rather than embedded message copies. The archive normalizes the parent chat/peer and message ID, forum-topic root, selected quote and formatting, reply-media fallback, and story reference. The GUI resolves an available parent directly from the local database—even when it falls outside the displayed history window—and clearly falls back to preserved quote/header information when the original message or story is unavailable.
 * **Repair historical backup dates**:
   ```bash
   uv run tgbackman-backup \
@@ -332,7 +333,7 @@ This section outlines what each script does, its inputs, and its outputs.
   - A normal `--dry-run` reads message metadata only and does not write the DB or download media. Add `--download-media` to test downloads in temporary files: `uv run tgbackman-backup run --target TARGET_KEY --dry-run --download-media --max-messages 25`. `--max-messages` is restricted to dry runs so a probe cannot advance a real watermark.
   - Media failures are retried three times by default, Telegram `FloodWait` durations are respected, history requests are paced by `--request-delay 1.0`, expected byte sizes and SHA-256 are checked, and already-valid files are reused. Web previews are resolved using the same document-before-photo rule as Telethon; photo downloads pin the exact cached, stripped, progressive, or video representation so type, extension, and expected size all describe the bytes actually downloaded. Increase the delay instead of repeatedly restarting a rate-limited job. Without `--allow-media-errors`, any failed attachment leaves the chat watermark unchanged and the staged DB rows/media available for retry; a retry reuses the staged prefix and resumes fetching after it, revisiting only an invalid staged-media boundary when necessary.
   - Progress is enabled by default. It reports processed and resumed-staging counts, latest message ID/date, messages per second, ready/reused/skipped/failed media, downloaded bytes, elapsed time, individual media transfer percentage/speed, verification, atomic commit, and the new watermark. The defaults are `--progress-interval 5` and `--progress-every 100`; either can be changed, and `--no-progress` suppresses periodic lines while retaining errors and final summaries. A process that was already running before this feature was installed must finish or be restarted before it can display the new output.
-  - Verify the canonical store with `uv run tgbackman-db-import --verify-db sqlitedb/telegram_backup.db --check-media`. Add `--require-archived-sources` after a lossless legacy rebuild. The `uv run tgbackman-backup verify` command remains for `--legacy-json-export` folders.
+  - Verify the canonical store with `uv run tgbackman-db-import --verify-db sqlitedb/telegram_backup.db --check-media`. Add `--require-complete-metadata` to require exact current message/chat TL snapshots and version-2 manifests for every non-deleted row; add `--require-archived-sources` after a lossless legacy rebuild. The `uv run tgbackman-backup verify` command remains for `--legacy-json-export` folders.
 * **Scheduled runs**:
   ```bash
   uv run tgbackman-backup install-systemd \
@@ -343,7 +344,11 @@ This section outlines what each script does, its inputs, and its outputs.
   ```
   The generated user timer runs daily at 03:30 with a randomized 15-minute delay. For removable storage, pass an exact mountpoint such as `/media/example/backup-volume`; the generated service then refuses to run unless that mount is present. The service also carries custom `--config` and `--session` paths and uses a non-blocking single-run lock.
 
-  The exporter covers message attachments (photos, videos/video notes, voice, audio, documents, stickers, and animations) plus structured Telegram metadata. This is a message-history archive, not a byte-for-byte Telegram Desktop account export: only the primary downloadable media object per message is materialized, while profile photos, stories, account settings, contacts, and other non-message data are outside the API scope. Telegram-deleted/inaccessible media is recorded as unavailable rather than silently claimed as complete.
+  **Metadata reconstruction contract:** each fetched message is stored twice in complementary forms: its exact binary Telegram TL object (with layer, Telethon version, byte count, and SHA-256) and its complete JSON object for presentation code. This preserves present and future message/service/media types without waiting for a normalized database column. The database also stores exact basic and `GetFull*` chat/user responses, the message sender entity, reply/forum/story references and quote metadata, text entities and embedded URLs, forwards, albums, locations, contacts, polls, reactions, keyboards, service actions, restrictions, counters, and every other field in the message object. Visible reactor lists and non-anonymous poll voters are fetched through every API page; the exact response pages include their user/chat entities. Replies stay non-duplicating local references, so a viewer joins the parent by chat/message ID.
+
+  Completeness is explicit rather than guessed. Secondary metadata is recorded as `complete`, `not_applicable`, or `not_exposed`; anonymous poll voters, hidden reactor lists, and sender entities Telegram withholds retain a reason. The exporter refuses to commit a partially paginated list, missing exact message/chat bytes, mismatched sender, corrupt hash, or incomplete ledger. `--require-complete-metadata` verifies the immutable run record and the current materialized row independently and reports legacy rows that still need a full rescan.
+
+  This contract reconstructs the current API-visible conversation snapshot, not historical or account-global state Telegram never supplies. It cannot recover messages/media deleted or expired before capture, secret chats, earlier edit revisions, past membership/reaction states, inaccessible stories, hidden identities, or settings such as drafts/read state from another client. `not_exposed` is therefore a truthful boundary, not silent data loss. For a one-time upgrade of all eligible chats, run `tgbackman-backup ... run --all --full-rescan`, then run the strict verifier above. A full rescan is intentionally slower and may make extra rate-limited requests for full chat data, reactors, and public poll voters.
 
   To report duplicate media without changing anything, run `tgbackman-media-dedupe /path/to/media`. On a Btrfs media volume, add `--apply` only after reviewing the report; it replaces duplicates with verified `cp --reflink=always` copies and never falls back to ordinary copies or hardlinks.
 
@@ -460,12 +465,39 @@ Analyze the integrity of your backup database, verifying alignment coverages and
 uv run tgbackman-db-overlap-report --db "/media/example/backup-volume/sqlitedb/telegram_backup.db"
 ```
 
-### 7️⃣ Step 7: GUI Overlap Visualization
-Run the Rust-based visualizer `tgbackman` to see coverage ranges, duplicates, and stats interactively:
+### 7️⃣ Step 7: GUI Backup Manager and Chat Viewer
+
+Run `tgbackman` against the canonical database to inspect backup coverage and
+read the archived conversations:
+
 ```bash
-cd tgbackman
-cargo run -- "/media/example/backup-volume/sqlitedb/telegram_backup.db"
+TGBACKMAN_DB="/media/example/backup-volume/sqlitedb/telegram_backup.db" \
+  cargo run --manifest-path tgbackman/Cargo.toml
 ```
+
+The left search field searches conversation titles immediately and searches
+message text across the entire database after a short debounce. Select a
+message result to open its chat at the exact saved message. **💬 Messages** or
+**💬 Open Chat** opens the integrated, read-only Telegram-style conversation
+view. Its own search covers the complete selected chat, not merely the visible
+page. Both searches report their exact totals. Global results are virtualized:
+the complete lightweight row-ID order is retained, while only visible rows and
+nearby compact 250-row database pages are materialized. Missing pages are
+fetched automatically as the scrollbar moves. Every
+match remains directly reachable without a “load more” click, including broad
+queries with hundreds of thousands of hits. In-chat results are retrieved with
+one background count and sort. Matching terms are highlighted in result
+previews and message bubbles. Results can be
+stepped through and the viewer loads a bounded page around each hit. **Load
+older messages**, **Load newer messages**, and **Jump to latest** use a composite
+timeline index, while sender identity resolution is reused after the chat
+opens. This navigates very large chats without loading their full history into
+RAM. Outgoing messages are placed on the right using stable Telegram sender
+IDs, including inferred legacy sender names when linked backups overlap. The
+database inventory is versioned and cached; ordinary incremental backups reuse
+structural clustering and refresh only invalidated chat statistics. Media cards
+and locally resolved reply previews are rendered from the canonical database;
+no Telegram credentials or network access are used by the viewer.
 
 ### 8️⃣ Step 8: Search Companion Ingestion
 Navigate to the `tgsearch/` subdirectory and invoke the ultra-fast Rust search companion `tgsearch` to perform query searches, deduplication, and case-insensitive username sanitization:

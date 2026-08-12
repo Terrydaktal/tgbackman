@@ -10,12 +10,20 @@ mod inventory;
 mod matching;
 mod model;
 mod ui;
+mod viewer;
 
 use app::OverlapApp;
-use database::set_chat_ids_blacklisted;
+use database::{MESSAGE_SEARCH_PAGE_SIZE, set_chat_ids_blacklisted};
 use matching::format_unix_to_ts;
-use model::{CalcMessage, CompareMessage, LoadMessage, MediaCalcMessage, SingleChatMessage};
+use model::{
+    ActiveChatView, CalcMessage, ChatPageRequest, CompareMessage, LoadMessage, MediaCalcMessage,
+    MessageSearchMessage, SingleChatMessage,
+};
 use ui::{draw_gantt_chart, get_color_by_idx, render_message_bubble, render_missing_placeholder};
+use viewer::{
+    ChatViewerAction, GLOBAL_SEARCH_RESULT_ROW_HEIGHT, render_chat_view, render_global_result,
+    render_global_result_placeholder,
+};
 
 #[cfg(test)]
 use cache::cache_is_fresh;
@@ -158,13 +166,42 @@ impl eframe::App for OverlapApp {
                 Ok(SingleChatMessage::Loading(msg)) => {
                     self.status_msg = msg;
                 }
-                Ok(SingleChatMessage::Finished(chat_view)) => {
-                    *self.active_chat_view.lock().unwrap() = Some(chat_view);
+                Ok(SingleChatMessage::Finished(page)) => {
+                    let pending_highlight = self.pending_chat_highlight_query.take();
+                    let mut active = self.active_chat_view.lock().unwrap();
+                    if let Some(chat_view) =
+                        active.as_mut().filter(|view| view.chat_id == page.chat_id)
+                    {
+                        chat_view.apply_page(page);
+                        if let Some(query) = pending_highlight.clone() {
+                            chat_view.highlight_query = query;
+                        }
+                    } else {
+                        *active = Some(ActiveChatView {
+                            backup_name: page.backup_name,
+                            chat_id: page.chat_id,
+                            messages: page.messages,
+                            total_messages: page.total_messages,
+                            has_older: page.has_older,
+                            has_newer: page.has_newer,
+                            scroll_to_bottom: page.focus_message_id.is_none() && !page.has_newer,
+                            search_query: String::new(),
+                            highlight_query: pending_highlight.unwrap_or_default(),
+                            search_results: Vec::new(),
+                            total_search_matches: 0,
+                            searching: false,
+                            search_error: None,
+                            current_search_match_idx: None,
+                            focus_message_id: page.focus_message_id,
+                            self_sender_aliases: page.self_sender_aliases,
+                        });
+                    }
                     self.loading_chat_view = false;
                     self.status_msg = "Chat messages loaded successfully.".to_string();
                     self.chat_view_rx = None;
                 }
                 Ok(SingleChatMessage::Error(err)) => {
+                    self.pending_chat_highlight_query = None;
                     self.status_msg = format!("Chat loading failed: {}", err);
                     self.loading_chat_view = false;
                     self.chat_view_rx = None;
@@ -177,10 +214,157 @@ impl eframe::App for OverlapApp {
             }
         }
 
+        if let Some(ref rx) = self.global_search_rx {
+            match rx.try_recv() {
+                Ok(MessageSearchMessage::IndexReady {
+                    request_id,
+                    row_ids,
+                    results,
+                }) if request_id == self.global_search_request_id => {
+                    self.global_search_results.clear();
+                    for (position, result) in results.into_iter().enumerate() {
+                        self.global_search_results.insert(position, result);
+                    }
+                    self.global_search_total_matches = row_ids.len();
+                    self.global_search_row_ids = row_ids;
+                    self.global_searching = false;
+                    self.global_search_error = None;
+                    self.global_search_rx = None;
+                }
+                Ok(MessageSearchMessage::Finished {
+                    request_id,
+                    offset,
+                    total_matches,
+                    results,
+                    done: _,
+                }) if request_id == self.global_search_request_id => {
+                    if offset == 0 {
+                        self.global_search_results.clear();
+                    }
+                    let page_size = MESSAGE_SEARCH_PAGE_SIZE as usize;
+                    let keep_start = offset.saturating_sub(page_size * 4);
+                    let keep_end = offset.saturating_add(page_size * 5);
+                    self.global_search_results
+                        .retain(|position, _| *position >= keep_start && *position < keep_end);
+                    for (position, result) in results.into_iter().enumerate() {
+                        self.global_search_results.insert(offset + position, result);
+                    }
+                    self.global_search_total_matches = total_matches;
+                    self.global_searching = false;
+                    self.global_search_error = None;
+                    self.global_search_rx = None;
+                }
+                Ok(MessageSearchMessage::Error {
+                    request_id,
+                    offset,
+                    message,
+                }) if request_id == self.global_search_request_id => {
+                    if offset == 0 {
+                        self.global_search_results.clear();
+                        self.global_search_row_ids.clear();
+                        self.global_search_total_matches = 0;
+                    }
+                    self.global_searching = false;
+                    self.global_search_error = Some(message);
+                    self.global_search_rx = None;
+                }
+                Ok(_) | Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.global_searching = false;
+                    self.global_search_error =
+                        Some("Search worker stopped unexpectedly".to_string());
+                    self.global_search_rx = None;
+                }
+            }
+        }
+
+        if let Some(ref rx) = self.chat_search_rx {
+            match rx.try_recv() {
+                Ok(MessageSearchMessage::Finished {
+                    request_id,
+                    offset,
+                    total_matches,
+                    results,
+                    done,
+                }) if request_id == self.chat_search_request_id => {
+                    if let Ok(mut active) = self.active_chat_view.lock()
+                        && let Some(chat) = active.as_mut()
+                    {
+                        let previous_current = chat.current_search_match_idx;
+                        if offset == 0 {
+                            chat.search_results = results;
+                        } else if offset == chat.search_results.len() {
+                            chat.search_results.extend(results);
+                        }
+                        chat.total_search_matches = total_matches;
+                        chat.searching = !done;
+                        chat.search_error = None;
+                        chat.current_search_match_idx = if offset > 0 {
+                            previous_current
+                        } else if chat.search_results.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        };
+                    }
+                    if done {
+                        self.chat_search_rx = None;
+                    }
+                }
+                Ok(MessageSearchMessage::Error {
+                    request_id,
+                    offset,
+                    message,
+                }) if request_id == self.chat_search_request_id => {
+                    if let Ok(mut active) = self.active_chat_view.lock()
+                        && let Some(chat) = active.as_mut()
+                    {
+                        if offset == 0 {
+                            chat.search_results.clear();
+                            chat.total_search_matches = 0;
+                            chat.current_search_match_idx = None;
+                        }
+                        chat.searching = false;
+                        chat.search_error = Some(message);
+                    }
+                    self.chat_search_rx = None;
+                }
+                Ok(_) | Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Ok(mut active) = self.active_chat_view.lock()
+                        && let Some(chat) = active.as_mut()
+                    {
+                        chat.searching = false;
+                        chat.search_error = Some("Search worker stopped unexpectedly".to_string());
+                    }
+                    self.chat_search_rx = None;
+                }
+            }
+        }
+
+        if let Some(started) = self.global_search_scheduled_at {
+            let delay = std::time::Duration::from_millis(300);
+            if started.elapsed() >= delay {
+                self.trigger_global_message_search(self.search_query.clone(), 0, ctx.clone());
+            } else {
+                ctx.request_repaint_after(delay.saturating_sub(started.elapsed()));
+            }
+        }
+
         // Dark theme adjustments
         let mut visuals = egui::Visuals::dark();
         visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(20, 20, 25);
         ctx.set_visuals(visuals);
+        let chat_is_open = self
+            .active_chat_view
+            .lock()
+            .map(|view| view.is_some())
+            .unwrap_or(false);
+        let mut close_chat_view = false;
+        let mut open_selected_chat = false;
+        let mut open_group_chat = None;
+        let mut open_global_result = None;
+        let mut global_search_page_request = None;
 
         // Top Control Panel
         egui::TopBottomPanel::top("control_panel")
@@ -192,6 +376,15 @@ impl eframe::App for OverlapApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("📊 tgbackman");
+                    if ui
+                        .selectable_label(!chat_is_open, "Backup manager")
+                        .clicked()
+                    {
+                        close_chat_view = true;
+                    }
+                    if ui.selectable_label(chat_is_open, "💬 Messages").clicked() {
+                        open_selected_chat = true;
+                    }
                     ui.label("  |  ");
                     ui.label("Database Path:");
                     ui.text_edit_singleline(&mut self.db_path);
@@ -222,6 +415,17 @@ impl eframe::App for OverlapApp {
                 });
             });
 
+        if close_chat_view {
+            if let Ok(mut view) = self.active_chat_view.lock() {
+                *view = None;
+            }
+            self.chat_view_rx = None;
+            self.chat_search_rx = None;
+            self.loading_chat_view = false;
+        } else if open_selected_chat && let Some(group_idx) = self.selected_group_idx {
+            self.trigger_load_preferred_chat(group_idx, ctx.clone());
+        }
+
         // Left Side Chat List Panel
         egui::SidePanel::left("left_panel")
             .resizable(true)
@@ -232,86 +436,247 @@ impl eframe::App for OverlapApp {
                     .fill(egui::Color32::from_rgb(15, 15, 20)),
             )
             .show(ctx, |ui| {
-                ui.label("🔍 Search Chats:");
+                ui.label("🔍 Search chats and all saved messages:");
                 if ui.text_edit_singleline(&mut self.search_query).changed() {
                     self.filter_groups();
+                    if self.search_query.trim().is_empty() {
+                        self.trigger_global_message_search(String::new(), 0, ctx.clone());
+                    } else {
+                        self.global_search_scheduled_at = Some(std::time::Instant::now());
+                        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                    }
                 }
                 ui.add_space(8.0);
 
+                let search_active = !self.search_query.trim().is_empty();
                 ui.heading("Conversations");
                 ui.separator();
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut next_selected_idx = None;
-                    let now = Utc::now().timestamp();
-                    for &idx in &self.filtered_groups {
-                        // A refresh replaces `groups` asynchronously. Keep the
-                        // render loop defensive as well as clearing the index
-                        // list when a load starts; an invalid stale index must
-                        // never be able to panic the GUI.
-                        let Some(group) = self.groups.get(idx) else {
-                            continue;
-                        };
-                        let selected = self.selected_group_idx == Some(idx);
-
-                        let latest_backup_unix = group
-                            .backups
-                            .iter()
-                            .filter_map(|b| b.last_backup_run_unix.or(b.last_backup_unix))
-                            .max();
-                        let latest_message_unix =
-                            group.backups.iter().filter_map(|b| b.max_unix).max();
-
-                        let format_age = |timestamp: Option<i64>| match timestamp {
-                            Some(ts) => {
-                                let days = (now - ts) / 86400;
-                                if days >= 0 {
-                                    format!("{}d ago", days)
-                                } else {
-                                    "0d ago".to_string()
+                let mut next_selected_idx = None;
+                let now = Utc::now().timestamp();
+                let conversation_row_height = 22.0;
+                let conversation_height = if search_active {
+                    (self.filtered_groups.len().min(6) as f32 * conversation_row_height)
+                        .min(ui.available_height() * 0.3)
+                } else {
+                    ui.available_height()
+                };
+                if self.filtered_groups.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(130, 151, 170),
+                        "No matching conversations.",
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_source("conversation_list")
+                        .auto_shrink([false, true])
+                        .max_height(conversation_height.max(conversation_row_height))
+                        .show_rows(
+                            ui,
+                            conversation_row_height,
+                            self.filtered_groups.len(),
+                            |ui, visible_rows| {
+                                for position in visible_rows {
+                                    // A refresh replaces `groups` asynchronously. Keep the
+                                    // render loop defensive as well as clearing the index list.
+                                    let Some(&idx) = self.filtered_groups.get(position) else {
+                                        continue;
+                                    };
+                                    let Some(group) = self.groups.get(idx) else {
+                                        continue;
+                                    };
+                                    let selected = self.selected_group_idx == Some(idx);
+                                    let latest_backup_unix = group
+                                        .backups
+                                        .iter()
+                                        .filter_map(|backup| {
+                                            backup.last_backup_run_unix.or(backup.last_backup_unix)
+                                        })
+                                        .max();
+                                    let latest_message_unix =
+                                        group.backups.iter().filter_map(|b| b.max_unix).max();
+                                    let format_age = |timestamp: Option<i64>| match timestamp {
+                                        Some(ts) => {
+                                            let days = (now - ts) / 86400;
+                                            format!("{}d ago", days.max(0))
+                                        }
+                                        None => "never".to_string(),
+                                    };
+                                    let group_blacklisted = group.is_blacklisted();
+                                    let item_color = if group_blacklisted {
+                                        egui::Color32::from_rgb(72, 74, 82)
+                                    } else if group.is_active() {
+                                        egui::Color32::from_rgb(46, 204, 113)
+                                    } else if group.max_count == 0 {
+                                        egui::Color32::from_rgb(130, 135, 145)
+                                    } else {
+                                        egui::Color32::from_rgb(231, 76, 60)
+                                    };
+                                    let mut label_text = egui::RichText::new(format!(
+                                        "{} ({} msgs) - {} - {}",
+                                        group.name,
+                                        group.max_count,
+                                        format_age(latest_message_unix),
+                                        format_age(latest_backup_unix),
+                                    ))
+                                    .color(item_color);
+                                    if group_blacklisted {
+                                        label_text = label_text.strikethrough();
+                                    }
+                                    let response = ui.selectable_label(selected, label_text);
+                                    if response.clicked() {
+                                        next_selected_idx = Some(idx);
+                                    }
+                                    if response.double_clicked() && group.max_count > 0 {
+                                        next_selected_idx = Some(idx);
+                                        open_group_chat = Some(idx);
+                                    }
                                 }
-                            }
-                            None => "never".to_string(),
-                        };
-                        let run_age = format_age(latest_backup_unix);
-                        let message_age = format_age(latest_message_unix);
+                            },
+                        );
+                }
+                if let Some(idx) = next_selected_idx {
+                    self.select_group(idx);
+                    if chat_is_open {
+                        open_group_chat = Some(idx);
+                    }
+                }
 
-                        let group_blacklisted = group.is_blacklisted();
-                        let item_color = if group_blacklisted {
-                            egui::Color32::from_rgb(72, 74, 82) // Never-back-up rule
-                        } else if group.is_active() {
-                            egui::Color32::from_rgb(46, 204, 113) // Green
-                        } else if group.max_count == 0 {
-                            egui::Color32::from_rgb(130, 135, 145) // Discovered, not backed up
+                if search_active {
+                    ui.add_space(8.0);
+                    ui.heading("Messages");
+                    ui.separator();
+                    let submitted_query_matches =
+                        self.global_search_last_submitted == self.search_query.trim();
+                    if !submitted_query_matches {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            ui.label("Preparing full-archive search…");
+                        });
+                    } else if let Some(error) = self.global_search_error.as_deref() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(235, 112, 102),
+                            format!("Search failed: {error}"),
+                        );
+                    } else if self.global_search_total_matches == 0 {
+                        if self.global_searching {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new());
+                                ui.label("Searching the full archive…");
+                            });
                         } else {
-                            egui::Color32::from_rgb(231, 76, 60) // Red
-                        };
-                        let mut label_text = egui::RichText::new(format!(
-                            "{} ({} msgs) - {} - {}",
-                            group.name, group.max_count, message_age, run_age,
-                        ))
-                        .color(item_color);
-                        if group_blacklisted {
-                            label_text = label_text.strikethrough();
+                            ui.label("No saved messages matched.");
                         }
-                        let response = ui.selectable_label(selected, label_text);
-
-                        if response.clicked() {
-                            next_selected_idx = Some(idx);
-                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            if self.global_searching {
+                                ui.add(egui::Spinner::new());
+                                ui.label("Loading visible matches…");
+                            } else {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(130, 151, 170),
+                                    format!(
+                                        "{} matches · scroll anywhere",
+                                        self.global_search_total_matches
+                                    ),
+                                );
+                            }
+                        });
+                        let result_height = (ui.available_height() - 22.0).max(100.0);
+                        egui::ScrollArea::vertical()
+                            .id_source(format!(
+                                "global_message_results_{}",
+                                self.global_search_request_id
+                            ))
+                            .auto_shrink([false; 2])
+                            .max_height(result_height)
+                            .show_rows(
+                                ui,
+                                GLOBAL_SEARCH_RESULT_ROW_HEIGHT,
+                                self.global_search_total_matches,
+                                |ui, visible_rows| {
+                                    let first_visible = visible_rows.start;
+                                    let last_visible = visible_rows.end;
+                                    for position in visible_rows {
+                                        if let Some(result) =
+                                            self.global_search_results.get(&position)
+                                        {
+                                            if render_global_result(ui, result, &self.search_query)
+                                                .clicked()
+                                            {
+                                                open_global_result = Some(result.clone());
+                                            }
+                                        } else {
+                                            render_global_result_placeholder(ui);
+                                            global_search_page_request.get_or_insert(
+                                                position / MESSAGE_SEARCH_PAGE_SIZE as usize
+                                                    * MESSAGE_SEARCH_PAGE_SIZE as usize,
+                                            );
+                                        }
+                                    }
+                                    if last_visible > first_visible {
+                                        let page_size = MESSAGE_SEARCH_PAGE_SIZE as usize;
+                                        let current_page = (last_visible - 1) / page_size;
+                                        let next_offset = (current_page + 1) * page_size;
+                                        if last_visible.saturating_add(40) >= next_offset
+                                            && next_offset < self.global_search_total_matches
+                                            && !self
+                                                .global_search_results
+                                                .contains_key(&next_offset)
+                                        {
+                                            global_search_page_request.get_or_insert(next_offset);
+                                        }
+                                    }
+                                },
+                            );
                     }
-                    if let Some(idx) = next_selected_idx {
-                        self.select_group(idx);
-                    }
-                });
+                }
             });
+
+        if let Some(offset) = global_search_page_request
+            && !self.global_searching
+            && self.global_search_last_submitted == self.search_query.trim()
+        {
+            self.trigger_global_message_search(self.search_query.clone(), offset, ctx.clone());
+        }
+
+        if let Some(group_idx) = open_group_chat {
+            self.trigger_load_preferred_chat(group_idx, ctx.clone());
+        }
+        if let Some(result) = open_global_result {
+            if let Some((group_idx, _)) = self.groups.iter().enumerate().find(|(_, group)| {
+                group
+                    .backups
+                    .iter()
+                    .any(|backup| backup.chat_id == result.chat_id)
+            }) {
+                self.select_group(group_idx);
+            }
+            self.pending_chat_highlight_query = Some(self.search_query.clone());
+            self.trigger_load_chat_page(
+                result.chat_id,
+                result.chat_name,
+                ChatPageRequest::Around {
+                    message_id: result.message_id,
+                },
+                ctx.clone(),
+            );
+        }
 
         // Central Panel (Gantt and Detail View)
         let mut compare_pair = None;
         let mut open_chat_idx = None;
+        let mut chat_view_action = None;
+        let active_chat_clone = self.active_chat_view.clone();
+        let chat_loading = self.loading_chat_view;
         egui::CentralPanel::default()
             .frame(egui::Frame::none().inner_margin(16.0).fill(egui::Color32::from_rgb(20, 20, 25)))
             .show(ctx, |ui| {
+                if let Ok(mut active_chat) = active_chat_clone.lock()
+                    && let Some(chat) = active_chat.as_mut()
+                {
+                    chat_view_action = render_chat_view(ui, chat, chat_loading);
+                    return;
+                }
                 if let Some(idx) = self.selected_group_idx {
                     let mut toggle_group_active = None;
                     let mut toggle_group_blacklisted = None;
@@ -622,6 +987,106 @@ impl eframe::App for OverlapApp {
                 }
             });
 
+        if let Some(action) = chat_view_action {
+            match action {
+                ChatViewerAction::Close => {
+                    if let Ok(mut view) = self.active_chat_view.lock() {
+                        *view = None;
+                    }
+                    self.chat_view_rx = None;
+                    self.chat_search_rx = None;
+                    self.loading_chat_view = false;
+                }
+                ChatViewerAction::ClearSearch => {
+                    self.chat_search_request_id = self.chat_search_request_id.wrapping_add(1);
+                    self.chat_search_rx = None;
+                    if let Ok(mut view) = self.active_chat_view.lock()
+                        && let Some(chat) = view.as_mut()
+                    {
+                        chat.searching = false;
+                        chat.total_search_matches = 0;
+                    }
+                }
+                ChatViewerAction::Search(query) => {
+                    let chat_id = self
+                        .active_chat_view
+                        .lock()
+                        .ok()
+                        .and_then(|view| view.as_ref().map(|chat| chat.chat_id.clone()));
+                    if let Some(chat_id) = chat_id {
+                        self.trigger_chat_message_search(chat_id, query, 0, ctx.clone());
+                    }
+                }
+                ChatViewerAction::LoadOlder => {
+                    let request = self.active_chat_view.lock().ok().and_then(|view| {
+                        let chat = view.as_ref()?;
+                        let message = chat.messages.first()?;
+                        Some((
+                            chat.chat_id.clone(),
+                            chat.backup_name.clone(),
+                            ChatPageRequest::Before {
+                                timestamp_unix: message.timestamp_unix,
+                                message_id: message.message_id,
+                            },
+                        ))
+                    });
+                    if let Some((chat_id, name, request)) = request {
+                        self.trigger_load_chat_page(chat_id, name, request, ctx.clone());
+                    }
+                }
+                ChatViewerAction::LoadNewer => {
+                    let request = self.active_chat_view.lock().ok().and_then(|view| {
+                        let chat = view.as_ref()?;
+                        let message = chat.messages.last()?;
+                        Some((
+                            chat.chat_id.clone(),
+                            chat.backup_name.clone(),
+                            ChatPageRequest::After {
+                                timestamp_unix: message.timestamp_unix,
+                                message_id: message.message_id,
+                            },
+                        ))
+                    });
+                    if let Some((chat_id, name, request)) = request {
+                        self.trigger_load_chat_page(chat_id, name, request, ctx.clone());
+                    }
+                }
+                ChatViewerAction::LoadLatest => {
+                    let identity = self.active_chat_view.lock().ok().and_then(|view| {
+                        view.as_ref()
+                            .map(|chat| (chat.chat_id.clone(), chat.backup_name.clone()))
+                    });
+                    if let Some((chat_id, name)) = identity {
+                        self.trigger_load_chat_page(
+                            chat_id,
+                            name,
+                            ChatPageRequest::Latest,
+                            ctx.clone(),
+                        );
+                    }
+                }
+                ChatViewerAction::JumpToSearchResult(index) => {
+                    let target = self.active_chat_view.lock().ok().and_then(|view| {
+                        let chat = view.as_ref()?;
+                        let result = chat.search_results.get(index)?;
+                        Some((
+                            chat.chat_id.clone(),
+                            chat.backup_name.clone(),
+                            result.message_id,
+                        ))
+                    });
+                    if let Some((chat_id, name, message_id)) = target {
+                        self.trigger_load_chat_page(
+                            chat_id,
+                            name,
+                            ChatPageRequest::Around { message_id },
+                            ctx.clone(),
+                        );
+                    }
+                }
+            }
+        }
+
         if let Some((i, j)) = compare_pair {
             self.trigger_comparison(i, j, ctx.clone());
         }
@@ -643,7 +1108,13 @@ impl eframe::App for OverlapApp {
                 });
         }
 
-        if self.loading_chat_view {
+        if self.loading_chat_view
+            && self
+                .active_chat_view
+                .lock()
+                .map(|view| view.is_none())
+                .unwrap_or(true)
+        {
             egui::Window::new("⏳ Loading Chat History...")
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .collapsible(false)
@@ -654,165 +1125,6 @@ impl eframe::App for OverlapApp {
                         ui.label(&self.status_msg);
                     });
                 });
-        }
-
-        let active_chat_clone = self.active_chat_view.clone();
-        let is_chat_active = active_chat_clone.lock().unwrap().is_some();
-        if is_chat_active {
-            let title = {
-                let lock = active_chat_clone.lock().unwrap();
-                let chat = lock.as_ref().unwrap();
-                format!("💬 Chat Viewer: {}", chat.backup_name)
-            };
-
-            let viewport_id = egui::ViewportId::from_hash_of("chat_viewer_window");
-            ctx.show_viewport_immediate(
-                viewport_id,
-                egui::ViewportBuilder::default()
-                    .with_title(title)
-                    .with_inner_size([650.0, 700.0]),
-                move |ctx, class| {
-                    if class == egui::ViewportClass::Immediate {
-                        egui::CentralPanel::default()
-                            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(20, 20, 25)))
-                            .show(ctx, |ui| {
-                                let mut chat_lock = active_chat_clone.lock().unwrap();
-                                if let Some(ref mut chat_view) = *chat_lock {
-                                    // Header controls
-                                    ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.strong(format!("Chat: {}", chat_view.backup_name));
-                                            let loaded_label = if chat_view.truncated {
-                                                format!(
-                                                    "{} of {} messages (latest 100,000)",
-                                                    chat_view.messages.len(),
-                                                    chat_view.total_messages
-                                                )
-                                            } else {
-                                                format!("{} messages", chat_view.total_messages)
-                                            };
-                                            ui.colored_label(egui::Color32::from_rgb(130, 150, 170), loaded_label);
-                                        });
-                                        ui.add_space(20.0);
-
-                                        // Search
-                                        ui.label("🔍 Search:");
-                                        let search_changed = ui.text_edit_singleline(&mut chat_view.search_query).changed();
-
-                                        if search_changed {
-                                            let q = chat_view.search_query.to_lowercase();
-                                            chat_view.filtered_indices.clear();
-                                            if !q.is_empty() {
-                                                for (i, m) in chat_view.messages.iter().enumerate() {
-                                                    if m.clean_text.contains(&q) || m.sender.to_lowercase().contains(&q) {
-                                                        chat_view.filtered_indices.push(i);
-                                                    }
-                                                }
-                                            }
-                                            chat_view.search_matches_count = chat_view.filtered_indices.len();
-                                            if chat_view.search_matches_count > 0 {
-                                                chat_view.current_search_match_idx = Some(0);
-                                                chat_view.scroll_to_row_idx = Some(chat_view.filtered_indices[0]);
-                                            } else {
-                                                chat_view.current_search_match_idx = None;
-                                            }
-                                        }
-
-                                        if chat_view.search_matches_count > 0 {
-                                            let curr = chat_view.current_search_match_idx.unwrap_or(0);
-                                            ui.label(format!("{} of {}", curr + 1, chat_view.search_matches_count));
-
-                                            if ui.button("⬅️").on_hover_text("Previous match").clicked() {
-                                                let prev = if curr == 0 { chat_view.search_matches_count - 1 } else { curr - 1 };
-                                                chat_view.current_search_match_idx = Some(prev);
-                                                chat_view.scroll_to_row_idx = Some(chat_view.filtered_indices[prev]);
-                                            }
-                                            if ui.button("➡️").on_hover_text("Next match").clicked() {
-                                                let next = (curr + 1) % chat_view.search_matches_count;
-                                                chat_view.current_search_match_idx = Some(next);
-                                                chat_view.scroll_to_row_idx = Some(chat_view.filtered_indices[next]);
-                                            }
-                                        } else if !chat_view.search_query.is_empty() {
-                                            ui.colored_label(egui::Color32::from_rgb(231, 76, 60), "No matches");
-                                        }
-                                    });
-                                    ui.separator();
-
-                                    let num_rows = chat_view.messages.len();
-                                    let row_height = 80.0; // Estimated average height of a bubble message row
-
-                                    egui::Frame::none()
-                                        .fill(egui::Color32::from_rgb(14, 22, 33)) // Telegram dark background
-                                        .inner_margin(12.0)
-                                        .show(ui, |ui| {
-                                            let mut scroll_area = egui::ScrollArea::vertical()
-                                                .id_source("chat_view_scroll_area")
-                                                .auto_shrink([false; 2]);
-
-                                            if chat_view.scroll_to_bottom {
-                                                let target_y = (num_rows as f32 * 85.0).max(0.0);
-                                                scroll_area = scroll_area.scroll_offset(egui::vec2(0.0, target_y));
-                                                chat_view.scroll_to_bottom = false;
-                                            }
-
-                                            if let Some(target_idx) = chat_view.scroll_to_row_idx {
-                                                let spacing_y = ui.spacing().item_spacing.y;
-                                                let target_y = (target_idx as f32 * (row_height + spacing_y) - 200.0).max(0.0);
-                                                scroll_area = scroll_area.scroll_offset(egui::vec2(0.0, target_y));
-                                                chat_view.scroll_to_row_idx = None;
-                                            }
-
-                                            scroll_area.show_rows(ui, row_height, num_rows, |ui, row_range| {
-                                                for idx in row_range {
-                                                    let msg = &chat_view.messages[idx];
-
-                                                    // Parse date string for Date Separator
-                                                    let date_part = if msg.timestamp_str.len() >= 10 {
-                                                        &msg.timestamp_str[0..10]
-                                                    } else {
-                                                        ""
-                                                    };
-
-                                                    let show_date_header = if idx == 0 {
-                                                        true
-                                                    } else {
-                                                        let prev_msg = &chat_view.messages[idx - 1];
-                                                        let prev_msg_date = if prev_msg.timestamp_str.len() >= 10 {
-                                                            &prev_msg.timestamp_str[0..10]
-                                                        } else {
-                                                            ""
-                                                        };
-                                                        date_part != prev_msg_date
-                                                    };
-
-                                                    if show_date_header && !date_part.is_empty() {
-                                                        ui.add_space(8.0);
-                                                        ui.vertical_centered(|ui| {
-                                                            egui::Frame::none()
-                                                                .fill(egui::Color32::from_rgba_unmultiplied(16, 30, 47, 180))
-                                                                .rounding(12.0)
-                                                                .inner_margin(egui::Margin::symmetric(14.0, 4.0))
-                                                                .show(ui, |ui| {
-                                                                    ui.colored_label(egui::Color32::from_rgb(170, 190, 210), date_part);
-                                                                });
-                                                        });
-                                                        ui.add_space(8.0);
-                                                    }
-
-                                                    render_message_bubble(ui, msg, false, false, true);
-                                                    ui.add_space(6.0);
-                                                }
-                                            });
-                                        });
-
-                                    if ctx.input(|i| i.viewport().close_requested()) {
-                                        *chat_lock = None;
-                                    }
-                                }
-                            });
-                    }
-                }
-            );
         }
 
         let active_comp_clone = self.active_comparison.clone();
@@ -930,6 +1242,7 @@ impl eframe::App for OverlapApp {
                                                                         row.is_discrepancy,
                                                                         true,
                                                                         false,
+                                                                        None,
                                                                     );
                                                                 } else {
                                                                     render_missing_placeholder(
@@ -948,6 +1261,7 @@ impl eframe::App for OverlapApp {
                                                                         row.is_discrepancy,
                                                                         false,
                                                                         false,
+                                                                        None,
                                                                     );
                                                                 } else {
                                                                     render_missing_placeholder(
@@ -1378,13 +1692,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a live database via TGBACKMAN_DB"]
     fn test_run_inventory_performance() {
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-        let volume = std::env::var("TGBACKMAN_REMOVABLE_VOLUME")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "backup-volume".to_string());
-        let db_path = format!("/media/{}/{}/sqlitedb/telegram_backup.db", user, volume);
+        let db_path = std::env::var("TGBACKMAN_DB").unwrap_or_else(|_| {
+            let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+            let volume = std::env::var("TGBACKMAN_REMOVABLE_VOLUME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "backup-volume".to_string());
+            format!("/media/{}/{}/sqlitedb/telegram_backup.db", user, volume)
+        });
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let start = std::time::Instant::now();
         let result = run_inventory(&conn, &db_path);
@@ -1396,6 +1713,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a mounted legacy media archive"]
     fn test_compute_media_stats_split_and_unofficial() {
         let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
         let volume = std::env::var("TGBACKMAN_REMOVABLE_VOLUME")

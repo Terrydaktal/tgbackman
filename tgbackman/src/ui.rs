@@ -4,6 +4,7 @@ use chrono::{TimeZone, Utc};
 use eframe::egui;
 
 use crate::model::{BackupInfo, BackupMessage};
+use std::ops::Range;
 
 pub(crate) fn get_color_by_idx(idx: usize) -> egui::Color32 {
     let colors = [
@@ -229,12 +230,117 @@ pub(crate) fn draw_gantt_chart(ui: &mut egui::Ui, backups: &[BackupInfo]) {
 
 pub(crate) fn is_outgoing_sender(sender: &str) -> bool {
     let s = sender.to_lowercase();
-    let me_name = std::env::var("USER").unwrap_or_default().to_lowercase();
-    let me_rev: String = me_name.chars().rev().collect();
-    s == "me"
-        || s == "self"
-        || s == "outgoing"
-        || (!me_name.is_empty() && (s == me_name || s == me_rev))
+    matches!(s.as_str(), "me" | "self" | "you" | "outgoing")
+}
+
+fn lowercase_prefix_end(text: &str, lowercase_needle: &str) -> Option<usize> {
+    let mut lowercase = String::new();
+    for (index, character) in text.char_indices() {
+        lowercase.extend(character.to_lowercase());
+        if lowercase.len() >= lowercase_needle.len() {
+            return lowercase
+                .starts_with(lowercase_needle)
+                .then_some(index + character.len_utf8());
+        }
+    }
+    None
+}
+
+pub(crate) fn match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut position = 0;
+    while position < text.len() {
+        let best_end = terms
+            .iter()
+            .filter_map(|term| lowercase_prefix_end(&text[position..], term))
+            .max();
+        if let Some(relative_end) = best_end {
+            let end = position + relative_end;
+            ranges.push(position..end);
+            position = end;
+        } else {
+            position += text[position..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+        }
+    }
+    ranges
+}
+
+pub(crate) fn highlighted_text_job(
+    text: &str,
+    query: &str,
+    size: f32,
+    color: egui::Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let normal = egui::TextFormat {
+        font_id: egui::FontId::proportional(size),
+        color,
+        ..Default::default()
+    };
+    let highlighted = egui::TextFormat {
+        font_id: egui::FontId::proportional(size),
+        color: egui::Color32::WHITE,
+        background: egui::Color32::from_rgb(180, 122, 20),
+        ..Default::default()
+    };
+    let ranges = match_ranges(text, query);
+    let mut cursor = 0;
+    for range in ranges {
+        if cursor < range.start {
+            job.append(&text[cursor..range.start], 0.0, normal.clone());
+        }
+        job.append(&text[range.clone()], 0.0, highlighted.clone());
+        cursor = range.end;
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, normal);
+    }
+    job
+}
+
+pub(crate) fn match_preview(text: &str, query: &str, context_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(first_match) = match_ranges(&compact, query).into_iter().next() else {
+        let mut characters = compact.chars();
+        let preview: String = characters.by_ref().take(context_chars * 2).collect();
+        return if characters.next().is_some() {
+            format!("{preview}…")
+        } else {
+            preview
+        };
+    };
+    let prefix_chars = compact[..first_match.start].chars().count();
+    let start_char = prefix_chars.saturating_sub(context_chars);
+    let start = compact
+        .char_indices()
+        .nth(start_char)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let match_end_chars = compact[..first_match.end].chars().count();
+    let end_char = match_end_chars.saturating_add(context_chars);
+    let end = compact
+        .char_indices()
+        .nth(end_char)
+        .map(|(index, _)| index)
+        .unwrap_or(compact.len());
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        &compact[start..end],
+        if end < compact.len() { "…" } else { "" }
+    )
 }
 
 pub(crate) fn get_sender_color(sender: &str) -> egui::Color32 {
@@ -292,20 +398,184 @@ pub(crate) fn render_telegram_media_box(ui: &mut egui::Ui, msg: &BackupMessage) 
         });
 }
 
+fn reply_preview_text(text: &str, media_type: Option<&str>) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !compact.is_empty() {
+        let mut chars = compact.chars();
+        let preview: String = chars.by_ref().take(140).collect();
+        return if chars.next().is_some() {
+            format!("{preview}…")
+        } else {
+            preview
+        };
+    }
+    media_type
+        .map(|kind| format!("[{kind}]"))
+        .unwrap_or_else(|| "No preserved preview".to_string())
+}
+
+fn render_reply_preview(ui: &mut egui::Ui, reply: &crate::model::ReplyPreview) {
+    let accent = if reply.missing {
+        egui::Color32::from_rgb(150, 160, 170)
+    } else {
+        egui::Color32::from_rgb(82, 171, 238)
+    };
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(18, 31, 43))
+        .stroke(egui::Stroke::new(1.0, accent))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(7.0, 4.0))
+        .show(ui, |ui| {
+            let mut heading = if let Some(story_id) = reply.story_id {
+                format!("↩ Story #{story_id}")
+            } else if reply.missing {
+                match reply.message_id {
+                    Some(message_id) => format!("↩ Original unavailable · ID {message_id}"),
+                    None => "↩ Reply context unavailable".to_string(),
+                }
+            } else {
+                format!(
+                    "↩ {}",
+                    reply.sender.as_deref().unwrap_or("Referenced message")
+                )
+            };
+            if let Some(chat_name) = reply.chat_name.as_deref() {
+                heading.push_str(&format!(" · {chat_name}"));
+            } else if reply.missing
+                && let (Some(kind), Some(peer_id)) = (reply.peer_kind.as_deref(), reply.peer_id)
+            {
+                heading.push_str(&format!(" · {kind}:{peer_id}"));
+            }
+            if let Some(topic_id) = reply.topic_id {
+                heading.push_str(&format!(" · topic #{topic_id}"));
+            }
+            ui.colored_label(accent, egui::RichText::new(heading).size(11.0).strong());
+            ui.colored_label(
+                egui::Color32::from_rgb(190, 205, 218),
+                egui::RichText::new(reply_preview_text(&reply.text, reply.media_type.as_deref()))
+                    .size(11.0),
+            );
+        });
+}
+
+fn spaced_type_name(value: &str) -> String {
+    let value = value.strip_prefix("MessageAction").unwrap_or(value);
+    let mut result = String::new();
+    for character in value.chars() {
+        if character.is_uppercase() && !result.is_empty() {
+            result.push(' ');
+        }
+        result.push(character);
+    }
+    result
+}
+
+fn service_action_text(msg: &BackupMessage) -> String {
+    if !msg.text.trim().is_empty() && msg.text.trim() != "[service]" {
+        return msg.text.clone();
+    }
+    let Some(action) = msg.action_json.as_deref() else {
+        return "Service message".to_string();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(action) else {
+        return "Service message".to_string();
+    };
+    let kind = value
+        .get("_")
+        .and_then(serde_json::Value::as_str)
+        .map(spaced_type_name)
+        .unwrap_or_else(|| "Service message".to_string());
+    if let Some(seconds) = value.get("duration").and_then(serde_json::Value::as_i64) {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        let seconds = seconds % 60;
+        let duration = if hours > 0 {
+            format!("{hours}h {minutes}m")
+        } else if minutes > 0 {
+            format!("{minutes}m {seconds}s")
+        } else {
+            format!("{seconds}s")
+        };
+        format!("{kind} · {duration}")
+    } else {
+        kind
+    }
+}
+
+fn reaction_badges(reactions_json: Option<&str>) -> Vec<String> {
+    let Some(reactions_json) = reactions_json else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(reactions_json) else {
+        return Vec::new();
+    };
+    value
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let count = result
+                .get("count")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if count <= 0 {
+                return None;
+            }
+            let reaction = result.get("reaction").unwrap_or(result);
+            let glyph = reaction
+                .get("emoticon")
+                .or_else(|| reaction.get("emoji"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    if reaction.get("_").and_then(serde_json::Value::as_str) == Some("ReactionPaid")
+                    {
+                        "⭐"
+                    } else {
+                        "✨"
+                    }
+                });
+            Some(if count == 1 {
+                glyph.to_string()
+            } else {
+                format!("{glyph} {count}")
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn render_message_bubble(
     ui: &mut egui::Ui,
     msg: &BackupMessage,
     is_discrepancy: bool,
     is_left: bool,
     is_single_chat: bool,
+    highlight_query: Option<&str>,
 ) {
+    if is_single_chat && msg.message_type.as_deref() == Some("service") {
+        ui.vertical_centered(|ui| {
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgba_unmultiplied(16, 30, 47, 220))
+                .rounding(12.0)
+                .inner_margin(egui::Margin::symmetric(12.0, 5.0))
+                .show(ui, |ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(178, 196, 211),
+                        service_action_text(msg),
+                    );
+                });
+        });
+        return;
+    }
+    let is_outgoing = is_single_chat && (msg.is_outgoing || is_outgoing_sender(&msg.sender));
     let (bubble_color, border_color, border_width) = if is_discrepancy {
         (
             egui::Color32::from_rgb(45, 25, 25),
             egui::Color32::from_rgb(231, 76, 60),
             1.0,
         )
-    } else if is_left {
+    } else if (is_single_chat && !is_outgoing) || (!is_single_chat && is_left) {
         (
             egui::Color32::from_rgb(24, 37, 51),
             egui::Color32::from_rgb(33, 47, 61),
@@ -318,8 +588,6 @@ pub(crate) fn render_message_bubble(
             0.0,
         )
     };
-
-    let is_outgoing = is_single_chat && is_outgoing_sender(&msg.sender);
 
     let rounding = if is_single_chat {
         if is_outgoing {
@@ -381,40 +649,94 @@ pub(crate) fn render_message_bubble(
                         );
                     }
 
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&msg.text)
-                                .color(egui::Color32::WHITE)
-                                .size(13.0),
-                        )
-                        .wrap(true),
-                    );
+                    if let Some(forwarded_from) = msg
+                        .forwarded_from
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(82, 171, 238),
+                            egui::RichText::new(format!("Forwarded from {forwarded_from}"))
+                                .size(11.5),
+                        );
+                        ui.add_space(3.0);
+                    }
+
+                    if let Some(reply) = msg.reply.as_ref() {
+                        render_reply_preview(ui, reply);
+                        ui.add_space(5.0);
+                    }
+
+                    let query = highlight_query.unwrap_or_default();
+                    if query.trim().is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&msg.text)
+                                    .color(egui::Color32::WHITE)
+                                    .size(13.0),
+                            )
+                            .wrap(true),
+                        );
+                    } else {
+                        ui.add(
+                            egui::Label::new(highlighted_text_job(
+                                &msg.text,
+                                query,
+                                13.0,
+                                egui::Color32::WHITE,
+                            ))
+                            .wrap(true),
+                        );
+                    }
 
                     if msg.media_type.is_some() || msg.media_path.is_some() {
                         ui.add_space(6.0);
                         render_telegram_media_box(ui, msg);
                     }
 
+                    let reaction_badges = reaction_badges(msg.reactions_json.as_deref());
+                    if !reaction_badges.is_empty() {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for reaction in reaction_badges {
+                                egui::Frame::none()
+                                    .fill(egui::Color32::from_rgb(31, 55, 73))
+                                    .stroke(egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgb(58, 102, 132),
+                                    ))
+                                    .rounding(12.0)
+                                    .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                                    .show(ui, |ui| {
+                                        ui.label(reaction);
+                                    });
+                            }
+                        });
+                    }
+
                     ui.add_space(2.0);
 
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let check_marks = if !is_single_chat && is_discrepancy {
-                                "⚠️"
-                            } else {
-                                "✓✓"
-                            };
-                            ui.colored_label(egui::Color32::from_rgb(110, 140, 160), check_marks);
-                            ui.add_space(4.0);
+                            if !is_single_chat && is_discrepancy {
+                                ui.colored_label(egui::Color32::from_rgb(110, 140, 160), "⚠️");
+                                ui.add_space(4.0);
+                            }
 
-                            let time_part = if msg.timestamp_str.len() >= 19 {
-                                msg.timestamp_str[11..19].to_string()
-                            } else if msg.timestamp_str.len() >= 16 {
-                                format!("{}:00", &msg.timestamp_str[11..16])
-                            } else {
-                                msg.timestamp_str.clone()
-                            };
+                            let time_part = msg
+                                .timestamp_str
+                                .get(11..19)
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    msg.timestamp_str
+                                        .get(11..16)
+                                        .map(|time| format!("{time}:00"))
+                                })
+                                .unwrap_or_else(|| msg.timestamp_str.clone());
                             ui.colored_label(egui::Color32::from_rgb(120, 145, 165), time_part);
+                            if msg.edit_timestamp.is_some() {
+                                ui.colored_label(egui::Color32::from_rgb(120, 145, 165), "edited");
+                            }
                             ui.add_space(10.0);
                             ui.colored_label(
                                 egui::Color32::from_rgb(90, 110, 130),
@@ -442,4 +764,31 @@ pub(crate) fn render_missing_placeholder(ui: &mut egui::Ui, text: &str) {
                 ui.colored_label(egui::Color32::from_rgb(231, 76, 60), format!("🚫 {}", text));
             });
         });
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::{match_preview, match_ranges, reaction_badges, spaced_type_name};
+
+    #[test]
+    fn telegram_metadata_is_presented_without_raw_type_names() {
+        assert_eq!(spaced_type_name("MessageActionPhoneCall"), "Phone Call");
+        let reactions = reaction_badges(Some(
+            r#"{"results":[{"count":3,"reaction":{"_":"ReactionEmoji","emoticon":"👍"}},{"count":1,"reaction":{"_":"ReactionPaid"}}]}"#,
+        ));
+        assert_eq!(reactions, vec!["👍 3", "⭐"]);
+    }
+
+    #[test]
+    fn search_highlighting_is_case_insensitive_and_unicode_safe() {
+        assert_eq!(match_ranges("Hello hello", "HEL"), vec![0..3, 6..9]);
+        assert_eq!(match_ranges("Straße", "stra"), vec![0..4]);
+        let preview = match_preview(
+            "a long prefix that should not hide the important matched phrase from view",
+            "matched",
+            8,
+        );
+        assert!(preview.contains("matched"));
+        assert!(preview.starts_with('…'));
+    }
 }

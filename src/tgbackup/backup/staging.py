@@ -7,6 +7,8 @@ Telegram for an already downloaded prefix again.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -40,6 +42,87 @@ def verify_record_media(record: dict[str, Any], target_dir: Path) -> None:
         raise ExportError(f"downloaded media hash mismatch: {path}")
 
 
+def _verify_tl_envelope(envelope: Any, description: str) -> None:
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("json"), dict):
+        raise ExportError(f"{description} has no structured JSON representation")
+    if envelope.get("tl_encoding") != "base64" or not envelope.get("tl_data"):
+        raise ExportError(f"{description} has no exact TL payload")
+    try:
+        payload = base64.b64decode(str(envelope["tl_data"]), validate=True)
+    except (TypeError, ValueError) as exc:
+        raise ExportError(f"{description} has invalid TL base64") from exc
+    if len(payload) != int(envelope.get("tl_size", -1)):
+        raise ExportError(f"{description} TL payload size does not match")
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != envelope.get("tl_sha256") or digest != envelope.get("snapshot_sha256"):
+        raise ExportError(f"{description} TL payload hash does not match")
+    if envelope.get("telethon_layer") is None or not envelope.get("telethon_version"):
+        raise ExportError(f"{description} has no Telethon layer/version")
+
+
+def verify_record_metadata(record: dict[str, Any]) -> None:
+    if int(record.get("metadata_schema_version") or 0) < 2:
+        return
+    if not isinstance(record.get("raw_message"), dict):
+        raise ExportError(f"message {record.get('id')} has no complete raw JSON object")
+    _verify_tl_envelope(record.get("raw_message_tl"), f"message {record.get('id')}")
+    sender_status = record.get("sender_entity_status")
+    if sender_status not in {"complete", "not_exposed", "not_applicable"}:
+        raise ExportError(f"message {record.get('id')} has invalid sender-entity status")
+    if sender_status == "complete":
+        _verify_tl_envelope(
+            record.get("sender_entity"),
+            f"sender entity for message {record.get('id')}",
+        )
+        sender_id = record.get("from_id") or record.get("actor_id")
+        entity_peer_id = record["sender_entity"].get("peer_id")
+        if sender_id is not None and entity_peer_id is not None and int(sender_id) != int(entity_peer_id):
+            raise ExportError(f"message {record.get('id')} sender entity has the wrong peer ID")
+    elif sender_status == "not_exposed" and not record.get("sender_entity_error"):
+        raise ExportError(f"message {record.get('id')} does not explain unavailable sender metadata")
+    elif sender_status == "not_exposed" and record.get("sender_entity") is not None:
+        _verify_tl_envelope(
+            record.get("sender_entity"),
+            f"partial sender entity for message {record.get('id')}",
+        )
+    expanded = record.get("expanded_metadata")
+    if not isinstance(expanded, dict) or expanded.get("schema_version") != 1:
+        raise ExportError(f"message {record.get('id')} has no expanded-metadata ledger")
+    for category in ("reactions", "poll_votes"):
+        detail = expanded.get(category)
+        if not isinstance(detail, dict) or detail.get("status") not in {
+            "complete",
+            "not_exposed",
+            "not_applicable",
+        }:
+            raise ExportError(f"message {record.get('id')} has incomplete {category} metadata")
+        for page_number, page in enumerate(detail.get("pages") or [], 1):
+            _verify_tl_envelope(
+                page,
+                f"{category} page {page_number} for message {record.get('id')}",
+            )
+        if detail["status"] == "complete":
+            try:
+                api_count = int(detail["api_count"])
+                fetched_count = int(detail["fetched_count"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ExportError(
+                    f"message {record.get('id')} has no verified {category} counts"
+                ) from exc
+            if api_count != fetched_count:
+                raise ExportError(
+                    f"message {record.get('id')} has incomplete {category} pagination"
+                )
+            if fetched_count and not detail.get("pages"):
+                raise ExportError(
+                    f"message {record.get('id')} has no {category} result pages"
+                )
+        elif detail["status"] == "not_exposed" and not detail.get("reason"):
+            raise ExportError(
+                f"message {record.get('id')} does not explain unavailable {category} metadata"
+            )
+
+
 def staged_resume_after_id(conn: sqlite3.Connection, run_key: str,
                            target_dir: Path) -> tuple[Optional[int], int]:
     rows = conn.execute(f"SELECT message_id, record_json, media_error FROM {RUN_MESSAGES_TABLE} "
@@ -56,13 +139,12 @@ def staged_resume_after_id(conn: sqlite3.Connection, run_key: str,
         except (TypeError, ValueError):
             earliest_retry_id = message_id if earliest_retry_id is None else min(earliest_retry_id, message_id)
             continue
-        if not record.get("media_type") or record.get("media_skipped"):
-            continue
-        if row["media_error"] or record.get("media_error"):
-            earliest_retry_id = message_id if earliest_retry_id is None else min(earliest_retry_id, message_id)
-            continue
         try:
-            verify_record_media(record, target_dir)
+            verify_record_metadata(record)
+            if record.get("media_type") and not record.get("media_skipped"):
+                if row["media_error"] or record.get("media_error"):
+                    raise ExportError(f"message {message_id} has an unresolved media error")
+                verify_record_media(record, target_dir)
         except ExportError:
             earliest_retry_id = message_id if earliest_retry_id is None else min(earliest_retry_id, message_id)
     return (max(0, earliest_retry_id - 1) if earliest_retry_id is not None else staged_max_id, staged_count)
@@ -81,4 +163,9 @@ def prune_completed_staging(conn: sqlite3.Connection, *, run_key: Optional[str] 
     return max(0, int(deleted))
 
 
-__all__ = ["verify_record_media", "staged_resume_after_id", "prune_completed_staging"]
+__all__ = [
+    "prune_completed_staging",
+    "staged_resume_after_id",
+    "verify_record_media",
+    "verify_record_metadata",
+]

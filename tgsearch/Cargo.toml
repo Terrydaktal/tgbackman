@@ -9,3 +9,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 clap = { version = "4.4", features = ["derive"] }
 colored = "2.1"
 chrono = "0.4"
+fuzzy-rank = { path = "../../fuzzy-rank" }

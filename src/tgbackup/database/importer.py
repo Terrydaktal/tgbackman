@@ -10,8 +10,9 @@ using indexes and FTS5 full-text search.
 
 from __future__ import annotations
 
-import html
+import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -570,6 +571,7 @@ def create_post_load_indexes(conn: sqlite3.Connection):
 
     # Standard B-tree indexes for fast filtering and range querying
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp_unix);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_ts_id ON messages(chat_id, timestamp_unix, message_id);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp_unix);")
 
@@ -1577,6 +1579,7 @@ def verify_database_archive(
     *,
     require_archived_sources: bool = False,
     check_media: bool = False,
+    require_complete_metadata: bool = False,
 ) -> List[str]:
     """Return strict integrity/coverage/media errors for one canonical database."""
     errors: List[str] = []
@@ -1593,13 +1596,35 @@ def verify_database_archive(
         }
         required_tables = {
             "chats", "messages", "backup_sources", "backup_import_files",
-            "message_sources", "message_source_media",
+            "message_sources", "message_source_media", "telegram_entity_snapshots",
+            "telegram_message_entity_refs", "telegram_chat_entity_refs",
+            "telegram_chat_snapshot_sources",
         }
         missing_tables = sorted(required_tables - tables)
         if missing_tables:
             errors.append(
                 "database has not been migrated to the archival schema; missing tables: "
                 + ", ".join(missing_tables)
+            )
+            return errors
+        message_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")
+        }
+        required_message_columns = {
+            "raw_payload",
+            "raw_tl_payload",
+            "raw_tl_sha256",
+            "raw_tl_layer",
+            "raw_tl_library",
+            "expanded_metadata_json",
+            "source_key",
+            "source_format",
+        }
+        missing_columns = sorted(required_message_columns - message_columns)
+        if missing_columns:
+            errors.append(
+                "database has not been migrated to the lossless message schema; "
+                "missing messages columns: " + ", ".join(missing_columns)
             )
             return errors
         foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchmany(10)
@@ -1619,6 +1644,38 @@ def verify_database_archive(
         ).fetchone()[0]
         if orphan_provenance:
             errors.append(f"{orphan_provenance} provenance row(s) refer to absent messages")
+        orphan_message_entities = conn.execute(
+            """SELECT count(*) FROM telegram_message_entity_refs AS r
+               LEFT JOIN messages AS m
+                 ON m.chat_id=r.chat_id AND m.message_id=r.message_id
+               WHERE m.id IS NULL"""
+        ).fetchone()[0]
+        if orphan_message_entities:
+            errors.append(
+                f"{orphan_message_entities} entity reference(s) refer to absent messages"
+            )
+        orphan_chat_entities = conn.execute(
+            """SELECT count(*) FROM telegram_chat_entity_refs AS r
+               LEFT JOIN chats AS c ON c.chat_id=r.chat_id
+               WHERE c.chat_id IS NULL"""
+        ).fetchone()[0]
+        if orphan_chat_entities:
+            errors.append(
+                f"{orphan_chat_entities} entity reference(s) refer to absent chats"
+            )
+        orphan_chat_snapshot_sources = conn.execute(
+            """SELECT count(*) FROM telegram_chat_snapshot_sources AS s
+               LEFT JOIN chats AS c ON c.chat_id=s.chat_id
+               LEFT JOIN telegram_chat_entity_refs AS r
+                 ON r.chat_id=s.chat_id
+                AND r.snapshot_sha256=s.snapshot_sha256
+                AND r.role=s.role
+               WHERE c.chat_id IS NULL OR r.snapshot_sha256 IS NULL"""
+        ).fetchone()[0]
+        if orphan_chat_snapshot_sources:
+            errors.append(
+                f"{orphan_chat_snapshot_sources} API-run chat snapshot link(s) are orphaned"
+            )
         if require_archived_sources:
             unprovenanced = conn.execute(
                 """SELECT count(*) FROM messages AS m WHERE NOT EXISTS (
@@ -1628,6 +1685,43 @@ def verify_database_archive(
             ).fetchone()[0]
             if unprovenanced:
                 errors.append(f"{unprovenanced} message row(s) have no source provenance")
+        if require_complete_metadata:
+            incomplete_metadata = conn.execute(
+                """SELECT count(*) FROM messages
+                   WHERE COALESCE(is_deleted, 0)=0 AND (
+                       COALESCE(source_format, '')!='telegram_api'
+                       OR raw_payload IS NULL
+                       OR raw_tl_payload IS NULL
+                       OR raw_tl_sha256 IS NULL
+                       OR expanded_metadata_json IS NULL
+                   )"""
+            ).fetchone()[0]
+            if incomplete_metadata:
+                errors.append(
+                    f"{incomplete_metadata} current message row(s) lack complete Telegram API metadata; "
+                    "run a full rescan for their chats"
+                )
+            chats_without_entities = conn.execute(
+                """SELECT count(*) FROM chats AS c
+                   WHERE EXISTS (
+                       SELECT 1 FROM messages AS m
+                       WHERE m.chat_id=c.chat_id AND COALESCE(m.is_deleted, 0)=0
+                   ) AND (NOT EXISTS (
+                       SELECT 1 FROM telegram_chat_entity_refs AS r
+                       JOIN telegram_entity_snapshots AS e USING(snapshot_sha256)
+                       WHERE r.chat_id=c.chat_id AND r.role='entity'
+                         AND e.tl_payload IS NOT NULL
+                   ) OR NOT EXISTS (
+                       SELECT 1 FROM telegram_chat_entity_refs AS r
+                       JOIN telegram_entity_snapshots AS e USING(snapshot_sha256)
+                       WHERE r.chat_id=c.chat_id AND r.role='full'
+                         AND e.tl_payload IS NOT NULL
+                   ))"""
+            ).fetchone()[0]
+            if chats_without_entities:
+                errors.append(
+                    f"{chats_without_entities} chat(s) with current messages lack exact basic/full Telegram snapshots"
+                )
 
         if "messages_fts" in tables:
             try:
@@ -1658,6 +1752,7 @@ def verify_database_archive(
             except sqlite3.DatabaseError as exc:
                 errors.append(f"FTS integrity check failed: {exc}")
 
+        api_metadata_versions: dict[str, int] = {}
         for source in conn.execute("SELECT * FROM backup_sources ORDER BY source_key"):
             compression = str(source["compression"])
             payload = bytes(source["payload"])
@@ -1685,9 +1780,19 @@ def verify_database_archive(
                     try:
                         manifest = json.loads(decoded)
                         run_key = str(manifest["run_key"])
+                        metadata_schema_version = int(
+                            manifest.get("metadata_schema_version") or 0
+                        )
+                        chat_metadata_schema_version = int(
+                            manifest.get("chat_metadata_schema_version") or 0
+                        )
+                        chat_snapshot_sha256 = manifest.get("chat_snapshot_sha256") or {}
+                        if not isinstance(chat_snapshot_sha256, dict):
+                            raise ValueError("chat_snapshot_sha256 is not an object")
                     except (ValueError, KeyError, TypeError) as exc:
                         errors.append(f"invalid Telegram API manifest {source['source_key']}: {exc}")
                         continue
+                    api_metadata_versions[str(source["source_key"])] = metadata_schema_version
                     digest = hashlib.sha256()
                     count = 0
                     archive_table = "telegram_backup_run_records" if "telegram_backup_run_records" in tables else "telegram_backup_run_messages"
@@ -1695,13 +1800,144 @@ def verify_database_archive(
                         f"SELECT record_json FROM {archive_table} WHERE run_key=? ORDER BY message_id",
                         (run_key,),
                     ):
-                        digest.update(str(row[0]).encode("utf-8"))
+                        record_json = str(row[0])
+                        digest.update(record_json.encode("utf-8"))
                         digest.update(b"\n")
                         count += 1
+                        if metadata_schema_version >= 2:
+                            try:
+                                from ..backup.staging import verify_record_metadata
+
+                                verify_record_metadata(json.loads(record_json))
+                            except Exception as exc:
+                                errors.append(
+                                    f"Telegram API metadata record is incomplete "
+                                    f"({run_key}): {exc}"
+                                )
                     if digest.hexdigest() != source["content_sha256"]:
                         errors.append(f"Telegram API run hash mismatch: {run_key}")
                     if count != int(source["message_count"] or 0):
                         errors.append(f"Telegram API run count mismatch: {run_key}")
+                    if metadata_schema_version >= 2:
+                        import_row = conn.execute(
+                            "SELECT chat_id FROM backup_imports WHERE source_key=?",
+                            (source["source_key"],),
+                        ).fetchone()
+                        if import_row is None or import_row["chat_id"] is None:
+                            errors.append(f"Telegram API run has no chat identity: {run_key}")
+                        else:
+                            required_roles = (
+                                {"entity", "full"}
+                                if chat_metadata_schema_version >= 1
+                                else {"entity"}
+                            )
+                            captured_snapshots = {
+                                (str(row[0]), str(row[1]))
+                                for row in conn.execute(
+                                    """SELECT role, snapshot_sha256
+                                         FROM telegram_chat_snapshot_sources
+                                       WHERE chat_id=? AND source_key=?""",
+                                    (import_row["chat_id"], source["source_key"]),
+                                )
+                            }
+                            if chat_metadata_schema_version >= 1:
+                                missing_roles = {
+                                    role
+                                    for role in required_roles
+                                    if (
+                                        role,
+                                        str(chat_snapshot_sha256.get(role) or ""),
+                                    ) not in captured_snapshots
+                                }
+                            else:
+                                captured_roles = {
+                                    role for role, _snapshot in captured_snapshots
+                                }
+                                missing_roles = required_roles - captured_roles
+                            if missing_roles:
+                                errors.append(
+                                    f"Telegram API run has incomplete chat metadata ({run_key}): "
+                                    + ", ".join(sorted(missing_roles))
+                                )
+
+        from ..backup.staging import verify_record_metadata
+
+        unverifiable_current_rows = 0
+        for row in conn.execute(
+            """SELECT chat_id, message_id, raw_payload, raw_tl_payload,
+                      raw_tl_sha256, raw_tl_layer, raw_tl_library,
+                      expanded_metadata_json, source_key
+                 FROM messages WHERE source_format='telegram_api'"""
+        ):
+            source_key = str(row["source_key"] or "")
+            if api_metadata_versions.get(source_key, 0) < 2:
+                if require_complete_metadata:
+                    unverifiable_current_rows += 1
+                continue
+            try:
+                record = json.loads(zlib.decompress(bytes(row["raw_payload"])))
+                verify_record_metadata(record)
+                envelope = record["raw_message_tl"]
+                envelope_tl = base64.b64decode(
+                    str(envelope["tl_data"]), validate=True
+                )
+                if envelope_tl != bytes(row["raw_tl_payload"]):
+                    raise ValueError("stored TL payload differs from archival record")
+                if int(row["raw_tl_layer"]) != int(envelope["telethon_layer"]):
+                    raise ValueError("stored Telegram layer differs from archival record")
+                if str(row["raw_tl_library"]) != str(envelope["telethon_version"]):
+                    raise ValueError("stored Telethon version differs from archival record")
+                if record.get("expanded_metadata") != json.loads(
+                    str(row["expanded_metadata_json"])
+                ):
+                    raise ValueError("expanded metadata differs from archival record")
+                if record.get("sender_entity_status") == "complete" and conn.execute(
+                    """SELECT 1 FROM telegram_message_entity_refs
+                       WHERE chat_id=? AND message_id=? AND role='sender' LIMIT 1""",
+                    (row["chat_id"], row["message_id"]),
+                ).fetchone() is None:
+                    raise ValueError("complete sender entity has no database reference")
+            except Exception as exc:
+                errors.append(
+                    "current Telegram message metadata is not reconstructible "
+                    f"({row['chat_id']}/{row['message_id']}): {exc}"
+                )
+        if unverifiable_current_rows:
+            errors.append(
+                f"{unverifiable_current_rows} current Telegram API message row(s) "
+                "have no version-2 archival manifest"
+            )
+
+        for row in conn.execute(
+            """SELECT chat_id, message_id, raw_tl_payload, raw_tl_sha256
+                 FROM messages WHERE raw_tl_payload IS NOT NULL"""
+        ):
+            payload = bytes(row["raw_tl_payload"])
+            if hashlib.sha256(payload).hexdigest() != row["raw_tl_sha256"]:
+                errors.append(
+                    f"raw Telegram TL hash mismatch: {row['chat_id']}/{row['message_id']}"
+                )
+        for row in conn.execute(
+            """SELECT snapshot_sha256, entity_json, tl_payload, tl_sha256,
+                      telethon_layer, telethon_version
+                 FROM telegram_entity_snapshots"""
+        ):
+            payload = (
+                bytes(row["tl_payload"])
+                if row["tl_payload"] is not None
+                else str(row["entity_json"]).encode("utf-8")
+            )
+            digest = hashlib.sha256(payload).hexdigest()
+            if digest != row["snapshot_sha256"]:
+                errors.append(f"Telegram entity snapshot hash mismatch: {row['snapshot_sha256']}")
+            if row["tl_payload"] is not None and (
+                digest != row["tl_sha256"]
+                or row["telethon_layer"] is None
+                or not row["telethon_version"]
+            ):
+                errors.append(
+                    f"Telegram entity TL metadata is incomplete: {row['snapshot_sha256']}"
+                )
 
         if check_media:
             for row in conn.execute(
@@ -1789,6 +2025,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Verify every local media path, expected size, and recorded SHA-256",
     )
+    ap.add_argument(
+        "--require-complete-metadata",
+        action="store_true",
+        help="Fail if any current message/chat still lacks lossless Telegram API metadata",
+    )
     args = ap.parse_args(argv)
 
     if args.verify_db:
@@ -1796,6 +2037,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.verify_db,
             require_archived_sources=args.require_archived_sources,
             check_media=args.check_media,
+            require_complete_metadata=args.require_complete_metadata,
         )
         if problems:
             for problem in problems:

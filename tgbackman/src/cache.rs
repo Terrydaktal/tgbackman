@@ -22,6 +22,13 @@ pub(crate) fn get_clusters_cache_path(db_path: &str) -> String {
         format!("{}_clusters.json", db_path)
     }
 }
+pub(crate) fn get_inventory_cache_path(db_path: &str) -> String {
+    if db_path.ends_with(".db") {
+        format!("{}_inventory.json", &db_path[..db_path.len() - 3])
+    } else {
+        format!("{}_inventory.json", db_path)
+    }
+}
 pub(crate) fn newest_database_mtime(path: &Path) -> Option<SystemTime> {
     let mut candidates = vec![path.to_path_buf()];
     let wal = PathBuf::from(format!("{}-wal", path.display()));

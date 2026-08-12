@@ -3,12 +3,11 @@ use colored::*;
 use rusqlite::{Connection, Result};
 use std::collections::{HashMap, HashSet};
 
-mod fuzzy_rank;
 mod models;
 mod render;
 mod search_support;
 
-use fuzzy_rank::{sort_matches, MessageCandidate, MessageField, MessageQuery};
+use fuzzy_rank::fields::literal::{sort_matches, MessageCandidate, MessageField, MessageQuery};
 
 use models::{ContextRow, MatchRow, MergedGroup};
 use render::{apply_sanitisation, format_ts, highlight_term, normalize_sender};
@@ -233,14 +232,13 @@ fn main() -> Result<()> {
         params_vec.push(rusqlite::types::Value::Text(sub));
     }
 
-    let sql_limit = if args.dedupe {
-        if args.limit < 0 {
-            -1
-        } else {
-            args.limit * 10
-        }
+    // FTS orders by recency here, while fuzzy-rank orders by relevance. Fetch
+    // a bounded candidate pool so an older but better match is not discarded
+    // before reranking.
+    let sql_limit = if args.limit < 0 {
+        -1
     } else {
-        args.limit
+        args.limit.saturating_mul(10).min(args.limit.max(2_000))
     };
 
     let limit_param_idx = params_vec.len() + 1;
@@ -309,7 +307,7 @@ fn main() -> Result<()> {
 
     rerank_matches(&args.query, &mut matches);
 
-    if args.dedupe && args.limit >= 0 {
+    if args.limit >= 0 {
         matches.truncate(args.limit as usize);
     }
 

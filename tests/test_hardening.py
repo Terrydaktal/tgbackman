@@ -13,6 +13,7 @@ from unittest import mock
 
 import tgbackup.exporter as exporter
 from tgbackup.backup.media import download_media
+from tgbackup.backup.records import tl_object_envelope
 from tgbackup.backup.targets import target_output_dir
 from tgbackup.database.importer import (
     _iter_multi_chat_json,
@@ -245,6 +246,8 @@ class DatabaseHardeningTests(unittest.TestCase):
 
     def test_empty_full_rescan_is_authoritative(self):
         async def run() -> None:
+            from telethon.tl import types
+
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 conn = setup_database(root / "archive.db")
@@ -264,7 +267,33 @@ class DatabaseHardeningTests(unittest.TestCase):
                     if False:
                         yield {}, None
 
-                stats = await exporter.write_database_stream(conn, target, no_records(), root / "chat", "empty-full", 99, 999, True)
+                stats = await exporter.write_database_stream(
+                    conn,
+                    target,
+                    no_records(),
+                    root / "chat",
+                    "empty-full",
+                    99,
+                    999,
+                    True,
+                    chat_entity_snapshot=tl_object_envelope(
+                        types.User(id=1, access_hash=2, first_name="Chat"),
+                        require_binary=True,
+                    ),
+                    chat_full_snapshot=tl_object_envelope(
+                        types.users.UserFull(
+                            full_user=types.UserFull(
+                                id=1,
+                                settings=types.PeerSettings(),
+                                notify_settings=types.PeerNotifySettings(),
+                                common_chats_count=0,
+                            ),
+                            chats=[],
+                            users=[types.User(id=1, access_hash=2, first_name="Chat")],
+                        ),
+                        require_binary=True,
+                    ),
+                )
                 self.assertEqual(stats.message_count, 0)
                 self.assertEqual(conn.execute("SELECT is_deleted FROM messages WHERE message_id=99").fetchone()[0], 1)
                 self.assertIsNone(conn.execute("SELECT last_message_id FROM telegram_backup_targets").fetchone()[0])

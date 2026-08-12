@@ -12,7 +12,15 @@ from pathlib import Path
 from unittest import mock
 
 import tgbackup.exporter as exporter
+from tgbackup.backup.records import reply_metadata, tl_object_envelope
+from tgbackup.backup.staging import verify_record_metadata
 from tgbackup.database import importer as db_indexer
+from tgbackup.db import (
+    ensure_targets_schema,
+    setup_database,
+    upsert_archival_message,
+    upsert_chat_entity_snapshot,
+)
 
 
 class FakeMessage:
@@ -34,6 +42,7 @@ class FakeMessage:
         self.document = None
         self.file = None
         self.reply_to_msg_id = None
+        self.reply_to = None
         self.forward = None
         self.edit_date = None
         self.entities = None
@@ -70,6 +79,524 @@ class ExportClient(FakeClient):
         return None
 
 
+class ReplyMetadataTests(unittest.TestCase):
+    def test_message_record_normalizes_cross_chat_quote_and_topic(self):
+        from telethon.tl import types
+
+        async def run():
+            with tempfile.TemporaryDirectory() as directory:
+                message = FakeMessage(20)
+                message.reply_to_msg_id = 7
+                message.reply_to = types.MessageReplyHeader(
+                    reply_to_msg_id=7,
+                    reply_to_peer_id=types.PeerChannel(99),
+                    reply_to_top_id=3,
+                    quote_text="selected words",
+                    quote_entities=[types.MessageEntityBold(offset=0, length=8)],
+                    quote_offset=4,
+                    reply_media=types.MessageMediaEmpty(),
+                )
+                record, error = await exporter.message_record(
+                    message,
+                    Path(directory) / "media",
+                    False,
+                    set(exporter.MEDIA_TYPES),
+                    0,
+                    False,
+                    0,
+                )
+                self.assertIsNone(error)
+                self.assertEqual(record["reply_to_message_id"], 7)
+                self.assertEqual(record["reply_to_peer_kind"], "channel")
+                self.assertEqual(record["reply_to_peer_id"], 99)
+                self.assertEqual(record["reply_to_top_id"], 3)
+                self.assertEqual(record["reply_quote_text"], "selected words")
+                self.assertEqual(record["reply_quote_offset"], 4)
+                self.assertEqual(record["reply_quote_entities"][0]["_"], "MessageEntityBold")
+                self.assertEqual(record["reply_media"]["_"], "MessageMediaEmpty")
+
+        asyncio.run(run())
+
+    def test_story_reply_keeps_peer_and_story_reference(self):
+        from telethon.tl import types
+
+        message = FakeMessage(20)
+        message.reply_to = types.MessageReplyStoryHeader(types.PeerUser(42), 11)
+        self.assertEqual(
+            reply_metadata(message),
+            {
+                "reply_to_peer_kind": "user",
+                "reply_to_peer_id": 42,
+                "reply_to_story_id": 11,
+            },
+        )
+
+    def test_database_resolves_cross_chat_parent_without_embedding_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conn = setup_database(Path(directory) / "archive.db")
+            conn.executemany(
+                "INSERT INTO chats(chat_id, chat_name) VALUES (?, ?)",
+                (("child", "Child"), ("parent", "Parent")),
+            )
+            conn.execute(
+                """INSERT INTO telegram_backup_targets(
+                       target_key, source_name, chat_id, peer_kind, peer_id, title,
+                       created_unix, updated_unix
+                   ) VALUES ('parent-key', 'Parent', 'parent', 'channel', 99,
+                             'Parent', 1, 1)"""
+            )
+            conn.execute(
+                """INSERT INTO backup_sources(
+                       source_key, source_format, original_path, content_sha256,
+                       content_size, compressed_size, compression, payload, imported_unix
+                   ) VALUES ('source', 'telegram_api', 'telegram://test', 'hash',
+                             1, 1, 'zlib', X'00', 1)"""
+            )
+            upsert_archival_message(
+                conn,
+                "parent",
+                {"id": 7, "text": "parent body"},
+                directory,
+                "source",
+                "telegram_api",
+            )
+            upsert_archival_message(
+                conn,
+                "child",
+                {
+                    "id": 20,
+                    "text": "reply body",
+                    "reply_to_message_id": 7,
+                    "reply_to_peer_kind": "channel",
+                    "reply_to_peer_id": 99,
+                    "reply_to_top_id": 3,
+                    "reply_quote_text": "selected words",
+                    "reply_quote_entities": [{"_": "MessageEntityBold"}],
+                    "reply_quote_offset": 4,
+                    "reply_media": {"_": "MessageMediaEmpty"},
+                },
+                directory,
+                "source",
+                "telegram_api",
+            )
+            row = conn.execute(
+                """SELECT reply_to_id, reply_to_chat_id, reply_to_peer_kind,
+                          reply_to_peer_id, reply_to_top_id, reply_quote_text,
+                          reply_quote_entities_json, reply_quote_offset,
+                          reply_media_json
+                     FROM messages WHERE chat_id='child' AND message_id=20"""
+            ).fetchone()
+            self.assertEqual(tuple(row[:6]), (7, "parent", "channel", 99, 3, "selected words"))
+            self.assertIn("MessageEntityBold", row[6])
+            self.assertEqual(row[7], 4)
+            self.assertIn("MessageMediaEmpty", row[8])
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM messages WHERE chat_id='parent' AND message_id=7"
+                ).fetchone()[0],
+                1,
+            )
+            conn.execute(
+                """UPDATE messages
+                      SET reply_to_chat_id=NULL, reply_to_peer_kind=NULL,
+                          reply_to_peer_id=NULL, reply_to_top_id=NULL,
+                          reply_quote_text=NULL, reply_quote_entities_json=NULL,
+                          reply_quote_offset=NULL, reply_media_json=NULL
+                    WHERE chat_id='child' AND message_id=20"""
+            )
+            conn.execute(
+                "DELETE FROM archive_schema_migrations WHERE migration_name='normalize_reply_metadata_v1'"
+            )
+            ensure_targets_schema(conn)
+            migrated = conn.execute(
+                """SELECT reply_to_chat_id, reply_to_peer_kind, reply_to_peer_id,
+                          reply_to_top_id, reply_quote_text
+                     FROM messages WHERE chat_id='child' AND message_id=20"""
+            ).fetchone()
+            self.assertEqual(
+                tuple(migrated),
+                ("parent", "channel", 99, 3, "selected words"),
+            )
+            conn.close()
+
+
+class MetadataCompletenessTests(unittest.TestCase):
+    @staticmethod
+    def _message_with_sender(message_id=1):
+        from telethon.tl import types
+
+        sender = types.User(id=7, access_hash=9, first_name="Seven")
+        message = types.Message(
+            id=message_id,
+            peer_id=types.PeerUser(8),
+            from_id=types.PeerUser(7),
+            date=datetime.now(timezone.utc),
+            message="lossless",
+        )
+        message._sender = sender
+        return message, sender
+
+    @staticmethod
+    def _full_user_snapshot(peer_id=8):
+        from telethon.tl import types
+
+        return tl_object_envelope(
+            types.users.UserFull(
+                full_user=types.UserFull(
+                    id=peer_id,
+                    settings=types.PeerSettings(),
+                    notify_settings=types.PeerNotifySettings(),
+                    common_chats_count=0,
+                ),
+                chats=[],
+                users=[types.User(id=peer_id, access_hash=10, first_name="Chat peer")],
+            ),
+            require_binary=True,
+        )
+
+    def test_exact_message_and_entity_tl_are_persisted_and_linked(self):
+        from telethon.extensions import BinaryReader
+        from telethon.tl import types
+
+        async def run():
+            message, sender = self._message_with_sender()
+            with tempfile.TemporaryDirectory() as directory:
+                record, error = await exporter.message_record(
+                    message,
+                    Path(directory) / "media",
+                    False,
+                    set(exporter.MEDIA_TYPES),
+                    0,
+                    False,
+                    0,
+                )
+                self.assertIsNone(error)
+                record["expanded_metadata"] = await exporter.expanded_message_metadata(
+                    object(), object(), message, 0
+                )
+                verify_record_metadata(record)
+
+                conn = setup_database(Path(directory) / "archive.db")
+                conn.execute("INSERT INTO chats(chat_id, chat_name) VALUES ('chat', 'Chat')")
+                conn.execute(
+                    """INSERT INTO backup_sources(
+                           source_key, source_format, original_path, content_sha256,
+                           content_size, compressed_size, compression, payload, imported_unix
+                       ) VALUES ('source', 'telegram_api', 'telegram://test', 'hash',
+                                 1, 1, 'zlib', X'00', 1)"""
+                )
+                upsert_archival_message(
+                    conn, "chat", record, directory, "source", "telegram_api"
+                )
+                chat = tl_object_envelope(
+                    types.User(id=8, access_hash=10, first_name="Chat peer"),
+                    require_binary=True,
+                )
+                upsert_chat_entity_snapshot(conn, "chat", chat, "source")
+                row = conn.execute(
+                    """SELECT raw_tl_payload, raw_tl_sha256, raw_tl_layer,
+                              raw_tl_library, expanded_metadata_json
+                         FROM messages WHERE chat_id='chat' AND message_id=1"""
+                ).fetchone()
+                self.assertEqual(bytes(row[0]), bytes(message))
+                with BinaryReader(bytes(row[0])) as reader:
+                    reconstructed = reader.tgread_object()
+                self.assertEqual(bytes(reconstructed), bytes(message))
+                self.assertEqual(reconstructed.id, message.id)
+                self.assertEqual(reconstructed.message, message.message)
+                self.assertEqual(row[1], hashlib.sha256(bytes(message)).hexdigest())
+                self.assertIsNotNone(row[2])
+                self.assertTrue(row[3])
+                self.assertEqual(json.loads(row[4])["schema_version"], 1)
+                sender_row = conn.execute(
+                    """SELECT e.tl_payload FROM telegram_message_entity_refs AS r
+                       JOIN telegram_entity_snapshots AS e USING(snapshot_sha256)
+                       WHERE r.chat_id='chat' AND r.message_id=1 AND r.role='sender'"""
+                ).fetchone()
+                self.assertEqual(bytes(sender_row[0]), bytes(sender))
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM telegram_chat_entity_refs WHERE chat_id='chat'"
+                    ).fetchone()[0],
+                    1,
+                )
+                conn.close()
+
+        asyncio.run(run())
+
+    def test_reactors_and_public_poll_voters_are_fully_paginated(self):
+        from telethon.tl import types
+
+        now = datetime.now(timezone.utc)
+        user = types.User(id=7, access_hash=9, first_name="Seven")
+
+        class PagingClient:
+            def __init__(self):
+                self.reaction_offsets = []
+                self.vote_offsets = []
+
+            async def __call__(self, request):
+                if type(request).__name__ == "GetMessageReactionsListRequest":
+                    self.reaction_offsets.append(request.offset)
+                    start = 7 if request.offset is None else 8
+                    return types.messages.MessageReactionsList(
+                        count=2,
+                        reactions=[
+                            types.MessagePeerReaction(
+                                types.PeerUser(start), now, types.ReactionEmoji("👍")
+                            )
+                        ],
+                        chats=[],
+                        users=[user],
+                        next_offset="second" if request.offset is None else None,
+                    )
+                self.vote_offsets.append(request.offset)
+                start = 7 if request.offset is None else 8
+                return types.messages.VotesList(
+                    count=2,
+                    votes=[types.MessagePeerVote(types.PeerUser(start), b"a", now)],
+                    chats=[],
+                    users=[user],
+                    next_offset="second" if request.offset is None else None,
+                )
+
+        async def run():
+            client = PagingClient()
+            message, _ = self._message_with_sender()
+            message.reactions = types.MessageReactions(
+                results=[types.ReactionCount(types.ReactionEmoji("👍"), 2)],
+                can_see_list=True,
+            )
+            poll = types.Poll(
+                id=5,
+                question=types.TextWithEntities("Question", []),
+                answers=[types.PollAnswer(types.TextWithEntities("A", []), b"a")],
+                hash=1,
+                public_voters=True,
+            )
+            message.media = types.MessageMediaPoll(
+                poll,
+                types.PollResults(total_voters=2),
+            )
+            expanded = await exporter.expanded_message_metadata(
+                client, types.InputPeerUser(8, 10), message, 0
+            )
+            self.assertEqual(expanded["reactions"]["status"], "complete")
+            self.assertEqual(expanded["reactions"]["fetched_count"], 2)
+            self.assertEqual(len(expanded["reactions"]["pages"]), 2)
+            self.assertEqual(client.reaction_offsets, [None, "second"])
+            self.assertEqual(expanded["poll_votes"]["status"], "complete")
+            self.assertEqual(expanded["poll_votes"]["fetched_count"], 2)
+            self.assertEqual(len(expanded["poll_votes"]["pages"]), 2)
+            self.assertEqual(client.vote_offsets, [None, "second"])
+
+        asyncio.run(run())
+
+    def test_full_chat_information_is_captured_as_exact_tl(self):
+        class FullMetadataClient:
+            def __init__(self, response):
+                self.response = response
+                self.request = None
+
+            async def __call__(self, request):
+                self.request = request
+                return self.response
+
+        async def run():
+            from telethon.tl import types
+
+            tl_response = types.users.UserFull(
+                full_user=types.UserFull(
+                    id=8,
+                    settings=types.PeerSettings(),
+                    notify_settings=types.PeerNotifySettings(),
+                    common_chats_count=0,
+                    about="complete profile metadata",
+                ),
+                chats=[],
+                users=[types.User(id=8, access_hash=10, first_name="Chat peer")],
+            )
+            client = FullMetadataClient(tl_response)
+            target = make_target()
+            target.peer_id = 8
+            envelope = await exporter.full_chat_metadata(
+                client, types.InputPeerUser(8, 10), target, 0
+            )
+            self.assertEqual(type(client.request).__name__, "GetFullUserRequest")
+            self.assertEqual(envelope["json"]["full_user"]["about"], "complete profile metadata")
+            self.assertEqual(envelope["tl_sha256"], hashlib.sha256(bytes(tl_response)).hexdigest())
+
+        asyncio.run(run())
+
+    def test_private_lists_are_explicitly_marked_not_exposed(self):
+        from telethon.tl import types
+
+        async def run():
+            message, _ = self._message_with_sender()
+            message.reactions = types.MessageReactions(
+                results=[types.ReactionCount(types.ReactionEmoji("👍"), 1)],
+                can_see_list=False,
+            )
+            poll = types.Poll(
+                id=5,
+                question=types.TextWithEntities("Question", []),
+                answers=[types.PollAnswer(types.TextWithEntities("A", []), b"a")],
+                hash=1,
+                public_voters=False,
+            )
+            message.media = types.MessageMediaPoll(
+                poll,
+                types.PollResults(total_voters=1),
+            )
+            expanded = await exporter.expanded_message_metadata(
+                object(), object(), message, 0
+            )
+            self.assertEqual(expanded["reactions"]["status"], "not_exposed")
+            self.assertEqual(expanded["poll_votes"]["status"], "not_exposed")
+
+        asyncio.run(run())
+
+    def test_database_verifier_checks_the_reconstructible_current_row(self):
+        from telethon.tl import types
+
+        async def run():
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                db_path = root / "archive.db"
+                conn = setup_database(db_path)
+                target = make_target()
+                conn.execute(
+                    "INSERT INTO chats(chat_id, chat_name, is_active) VALUES ('chat_1', 'Chat', 1)"
+                )
+                conn.execute(
+                    """INSERT INTO telegram_backup_targets(
+                           target_key, source_name, chat_id, peer_kind, peer_id,
+                           access_hash, title, enabled, created_unix, updated_unix
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, 1)""",
+                    (
+                        target.target_key,
+                        target.source_name,
+                        target.chat_id,
+                        target.peer_kind,
+                        target.peer_id,
+                        target.access_hash,
+                        target.title,
+                    ),
+                )
+                message, _ = self._message_with_sender()
+                record, _ = await exporter.message_record(
+                    message,
+                    root / "chat" / "media",
+                    False,
+                    set(exporter.MEDIA_TYPES),
+                    0,
+                    False,
+                    0,
+                )
+                record["expanded_metadata"] = await exporter.expanded_message_metadata(
+                    object(), object(), message, 0
+                )
+
+                async def records():
+                    yield record, None
+
+                await exporter.write_database_stream(
+                    conn,
+                    target,
+                    records(),
+                    root / "chat",
+                    "lossless-run",
+                    None,
+                    None,
+                    False,
+                    chat_entity_snapshot=tl_object_envelope(
+                        types.User(id=8, access_hash=10, first_name="Chat peer"),
+                        require_binary=True,
+                    ),
+                    chat_full_snapshot=self._full_user_snapshot(),
+                )
+                conn.close()
+                self.assertEqual(
+                    db_indexer.verify_database_archive(
+                        str(db_path), require_complete_metadata=True
+                    ),
+                    [],
+                )
+
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "UPDATE messages SET expanded_metadata_json='{}' WHERE chat_id='chat_1'"
+                )
+                conn.commit()
+                conn.close()
+                problems = db_indexer.verify_database_archive(str(db_path))
+                self.assertTrue(
+                    any("not reconstructible" in problem for problem in problems),
+                    problems,
+                )
+
+        asyncio.run(run())
+
+    def test_strict_metadata_coverage_identifies_legacy_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "archive.db"
+            conn = setup_database(db_path)
+            conn.execute("INSERT INTO chats(chat_id, chat_name) VALUES ('legacy', 'Legacy')")
+            conn.execute(
+                """INSERT INTO messages(message_id, chat_id, text, source_format)
+                   VALUES (1, 'legacy', 'old export', 'json')"""
+            )
+            conn.commit()
+            conn.close()
+            problems = db_indexer.verify_database_archive(
+                str(db_path), require_complete_metadata=True
+            )
+            self.assertTrue(
+                any("lack complete Telegram API metadata" in problem for problem in problems),
+                problems,
+            )
+            self.assertTrue(
+                any("lack exact basic/full Telegram snapshots" in problem for problem in problems),
+                problems,
+            )
+
+    def test_unchanged_chat_snapshot_keeps_provenance_for_every_run(self):
+        from telethon.tl import types
+
+        with tempfile.TemporaryDirectory() as directory:
+            conn = setup_database(Path(directory) / "archive.db")
+            conn.execute("INSERT INTO chats(chat_id, chat_name) VALUES ('chat', 'Chat')")
+            conn.executemany(
+                """INSERT INTO backup_sources(
+                       source_key, source_format, original_path, content_sha256,
+                       content_size, compressed_size, compression, payload, imported_unix
+                   ) VALUES (?, 'telegram_api', ?, ?, 1, 1, 'zlib', X'00', 1)""",
+                [
+                    ("source-1", "telegram://one", "1" * 64),
+                    ("source-2", "telegram://two", "2" * 64),
+                ],
+            )
+            snapshot = tl_object_envelope(
+                types.User(id=8, access_hash=10, first_name="Chat peer"),
+                require_binary=True,
+            )
+            upsert_chat_entity_snapshot(
+                conn, "chat", snapshot, "source-1", role="entity"
+            )
+            upsert_chat_entity_snapshot(
+                conn, "chat", snapshot, "source-2", role="entity"
+            )
+            self.assertEqual(
+                [
+                    row[0]
+                    for row in conn.execute(
+                        """SELECT source_key FROM telegram_chat_snapshot_sources
+                           WHERE chat_id='chat' ORDER BY source_key"""
+                    )
+                ],
+                ["source-1", "source-2"],
+            )
+            conn.close()
 def make_target() -> exporter.Target:
     return exporter.Target(
         target_key="chat-key",
@@ -834,6 +1361,32 @@ class IncrementalExporterTests(unittest.TestCase):
                     ("chat_keep", 20, "shared-source"),
                 ],
             )
+            conn.execute(
+                """INSERT INTO telegram_entity_snapshots(
+                       snapshot_sha256, entity_type, entity_json,
+                       first_captured_unix, last_captured_unix
+                   ) VALUES (?, 'User', '{}', 1, 1)""",
+                (hashlib.sha256(b"{}").hexdigest(),),
+            )
+            entity_hash = hashlib.sha256(b"{}").hexdigest()
+            conn.execute(
+                """INSERT INTO telegram_message_entity_refs(
+                       chat_id, message_id, role, snapshot_sha256
+                   ) VALUES ('chat_purge', 10, 'sender', ?)""",
+                (entity_hash,),
+            )
+            conn.execute(
+                """INSERT INTO telegram_chat_entity_refs(
+                       chat_id, snapshot_sha256, captured_unix, source_key, role
+                   ) VALUES ('chat_purge', ?, 1, 'exclusive-source', 'entity')""",
+                (entity_hash,),
+            )
+            conn.execute(
+                """INSERT INTO telegram_chat_snapshot_sources(
+                       chat_id, snapshot_sha256, source_key, role, captured_unix
+                   ) VALUES ('chat_purge', ?, 'exclusive-source', 'entity', 1)""",
+                (entity_hash,),
+            )
             conn.executemany(
                 """INSERT INTO backup_imports
                 (source_key, source_format, original_path, chat_id, expected_messages,
@@ -918,6 +1471,10 @@ class IncrementalExporterTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM telegram_backup_target_chats").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT count(*) FROM telegram_backup_runs").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT count(*) FROM telegram_backup_exports").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM telegram_message_entity_refs").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM telegram_chat_entity_refs").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM telegram_chat_snapshot_sources").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM telegram_entity_snapshots").fetchone()[0], 0)
             self.assertIsNone(
                 conn.execute(
                     "SELECT source_key FROM backup_sources WHERE source_key='exclusive-source'"
@@ -1287,6 +1844,29 @@ class IncrementalExporterTests(unittest.TestCase):
                 conn, "run", Path(directory) / "Chat"
             )
             self.assertEqual((resume_after, count), (11, 2))
+            conn.close()
+
+    def test_staged_resume_rejects_incomplete_metadata_without_media(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "db.sqlite"
+            db_indexer.setup_database(str(db_path)).close()
+            conn = exporter.open_db(db_path)
+            conn.execute(
+                """INSERT INTO telegram_backup_runs
+                (run_key, target_key, chat_id, status, started_unix)
+                VALUES ('run', 'target', 'chat', 'failed', 1)"""
+            )
+            conn.execute(
+                """INSERT INTO telegram_backup_run_messages(
+                       run_key, message_id, record_json
+                   ) VALUES ('run', 10, ?)""",
+                (json.dumps({"id": 10, "metadata_schema_version": 2}),),
+            )
+            conn.commit()
+            resume_after, count = exporter.staged_resume_after_id(
+                conn, "run", Path(directory) / "Chat"
+            )
+            self.assertEqual((resume_after, count), (9, 1))
             conn.close()
 
     def test_prune_completed_staging_keeps_failed_runs(self):

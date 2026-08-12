@@ -69,6 +69,7 @@ from .db import (
     ensure_targets_schema as canonical_ensure_targets_schema,
     refresh_chat_statistics as canonical_refresh_chat_statistics,
     upsert_archival_message,
+    upsert_chat_entity_snapshot,
     blacklisted_target_keys,
     database_chats,
     load_targets,
@@ -99,14 +100,21 @@ from .backup.media import (
     media_type_for,
     sha256_file,
 )
-from .backup.staging import prune_completed_staging, staged_resume_after_id, verify_record_media
+from .backup.staging import (
+    prune_completed_staging,
+    staged_resume_after_id,
+    verify_record_media,
+    verify_record_metadata,
+)
 from .telegram.client import connect_client, require_telethon, resolve_peer, target_input_peer
 from .backup.records import (
     database_run_key,
     json_safe,
     range_dir_name,
     range_dir_name_from_stats,
+    reply_metadata,
     sender_label,
+    tl_object_envelope,
 )
 from .backup import target_mapping as target_mapping_service
 from .backup.target_mapping import (
@@ -329,20 +337,19 @@ async def message_record(
 
     sender = getattr(message, "sender", None)
     sender_id = getattr(message, "sender_id", None)
-    if sender is None and sender_id is not None:
-        for sender_attempt in range(3):
+    if (sender is None or bool(getattr(sender, "min", False))) and sender_id is not None:
+        while True:
             try:
                 sender = await message.get_sender()
                 break
             except Exception as exc:
                 wait_seconds = flood_wait_seconds(exc)
                 if wait_seconds is None:
-                    sender = None
-                    break
+                    raise ExportError(
+                        f"sender entity for message {message.id}: {type(exc).__name__}: {exc}"
+                    ) from exc
                 print(f"Telegram requested a {wait_seconds}s sender wait; sleeping", file=sys.stderr)
                 await asyncio.sleep(wait_seconds)
-                if sender_attempt == 2:
-                    sender = None
 
     media_plan = media_download_plan(message)
     media_type = media_plan.media_type if media_plan else None
@@ -408,8 +415,7 @@ async def message_record(
         "from_id": str(sender_id) if sender_id is not None else None,
         "text": text,
     }
-    if getattr(message, "reply_to_msg_id", None) is not None:
-        record["reply_to_message_id"] = int(message.reply_to_msg_id)
+    record.update(reply_metadata(message))
     if forwarded_from:
         record["forwarded_from"] = forwarded_from
     if media_type:
@@ -447,7 +453,275 @@ async def message_record(
     # not yet have a dedicated searchable column.  The canonical DB stores
     # this compressed in messages.raw_payload.
     record["raw_message"] = json_safe(message)
+    try:
+        message_envelope = tl_object_envelope(message, require_binary=True)
+        sender_envelope = tl_object_envelope(sender, require_binary=True)
+    except ValueError as exc:
+        raise ExportError(f"message {message.id}: {exc}") from exc
+    if message_envelope is not None:
+        record["metadata_schema_version"] = 2
+        record["raw_message_tl"] = message_envelope
+    if sender_envelope is not None and not bool(getattr(sender, "min", False)):
+        record["sender_entity"] = sender_envelope
+        record["sender_entity_status"] = "complete"
+    elif sender_envelope is not None:
+        record["sender_entity"] = sender_envelope
+        record["sender_entity_status"] = "not_exposed"
+        record["sender_entity_error"] = (
+            "Telegram returned only a minimal sender entity after an explicit refresh"
+        )
+    elif sender_id is not None:
+        record["sender_entity_status"] = "not_exposed"
+        record["sender_entity_error"] = "Telegram returned no sender entity for this sender ID"
+    else:
+        record["sender_entity_status"] = "not_applicable"
     return record, error
+
+
+_METADATA_NOT_EXPOSED_ERRORS = {
+    "BroadcastPublicVotersForbiddenError",
+    "ChatAdminRequiredError",
+}
+
+
+async def _metadata_request(client: Any, request: Any, description: str) -> Any:
+    while True:
+        try:
+            return await client(request)
+        except Exception as exc:
+            wait_seconds = flood_wait_seconds(exc)
+            if wait_seconds is None:
+                raise ExportError(f"{description}: {type(exc).__name__}: {exc}") from exc
+            print(
+                f"Telegram requested a {wait_seconds}s metadata wait for {description}; sleeping",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(wait_seconds)
+
+
+async def _reaction_metadata(
+    client: Any,
+    entity: Any,
+    message: Any,
+    request_delay: float,
+    progress: Optional[ProgressReporter] = None,
+) -> dict[str, Any]:
+    summary = getattr(message, "reactions", None)
+    if summary is None:
+        return {"status": "not_applicable"}
+    expected_summary = sum(
+        int(getattr(result, "count", 0) or 0)
+        for result in (getattr(summary, "results", None) or [])
+    )
+    metadata: dict[str, Any] = {
+        "status": "complete" if expected_summary == 0 else "pending",
+        "summary_count": expected_summary,
+        "can_see_list": bool(getattr(summary, "can_see_list", False)),
+        "pages": [],
+    }
+    if expected_summary == 0:
+        metadata.update({"api_count": 0, "fetched_count": 0})
+        return metadata
+    if not metadata["can_see_list"]:
+        metadata["status"] = "not_exposed"
+        metadata["reason"] = "Telegram did not expose the complete reactor list"
+        return metadata
+
+    from telethon.tl.functions.messages import GetMessageReactionsListRequest
+
+    offset: Optional[str] = None
+    seen_offsets: set[str] = set()
+    fetched = 0
+    api_count: Optional[int] = None
+    while True:
+        if request_delay > 0:
+            await asyncio.sleep(request_delay)
+        try:
+            page = await _metadata_request(
+                client,
+                GetMessageReactionsListRequest(
+                    peer=entity,
+                    id=int(message.id),
+                    limit=100,
+                    offset=offset,
+                ),
+                f"reaction list for message {message.id}",
+            )
+        except ExportError as exc:
+            cause_name = type(exc.__cause__).__name__ if exc.__cause__ is not None else ""
+            if cause_name in _METADATA_NOT_EXPOSED_ERRORS:
+                metadata.update({"status": "not_exposed", "reason": str(exc)})
+                return metadata
+            raise
+        envelope = tl_object_envelope(page, require_binary=True)
+        if envelope is None:
+            raise ExportError(f"reaction list for message {message.id} was not a TL object")
+        metadata["pages"].append(envelope)
+        page_items = getattr(page, "reactions", None) or []
+        fetched += len(page_items)
+        page_count = int(getattr(page, "count", fetched) or 0)
+        api_count = page_count if api_count is None else api_count
+        if progress and (page_count > 100 or getattr(page, "next_offset", None)):
+            progress.phase(
+                f"metadata message {message.id}: reactors {fetched:,}/{page_count:,}"
+            )
+        next_offset = getattr(page, "next_offset", None)
+        if not next_offset:
+            break
+        if str(next_offset) in seen_offsets:
+            raise ExportError(f"reaction pagination repeated offset for message {message.id}")
+        seen_offsets.add(str(next_offset))
+        offset = str(next_offset)
+    if api_count is None or fetched != api_count:
+        raise ExportError(
+            f"reaction list for message {message.id} returned {fetched} of {api_count} reactors"
+        )
+    metadata.update({"status": "complete", "api_count": api_count, "fetched_count": fetched})
+    return metadata
+
+
+async def _poll_vote_metadata(
+    client: Any,
+    entity: Any,
+    message: Any,
+    request_delay: float,
+    progress: Optional[ProgressReporter] = None,
+) -> dict[str, Any]:
+    media = getattr(message, "media", None)
+    poll = getattr(media, "poll", None)
+    results = getattr(media, "results", None)
+    if poll is None:
+        return {"status": "not_applicable"}
+    expected = int(getattr(results, "total_voters", 0) or 0)
+    metadata: dict[str, Any] = {
+        "status": "complete" if expected == 0 else "pending",
+        "summary_count": expected,
+        "public_voters": bool(getattr(poll, "public_voters", False)),
+        "pages": [],
+    }
+    if expected == 0:
+        metadata.update({"api_count": 0, "fetched_count": 0})
+        return metadata
+    if not metadata["public_voters"]:
+        metadata["status"] = "not_exposed"
+        metadata["reason"] = "Telegram marks this poll as anonymous"
+        return metadata
+
+    from telethon.tl.functions.messages import GetPollVotesRequest
+
+    offset: Optional[str] = None
+    seen_offsets: set[str] = set()
+    fetched = 0
+    api_count: Optional[int] = None
+    while True:
+        if request_delay > 0:
+            await asyncio.sleep(request_delay)
+        try:
+            page = await _metadata_request(
+                client,
+                GetPollVotesRequest(
+                    peer=entity,
+                    id=int(message.id),
+                    limit=100,
+                    offset=offset,
+                ),
+                f"poll voters for message {message.id}",
+            )
+        except ExportError as exc:
+            cause_name = type(exc.__cause__).__name__ if exc.__cause__ is not None else ""
+            if cause_name in _METADATA_NOT_EXPOSED_ERRORS:
+                metadata.update({"status": "not_exposed", "reason": str(exc)})
+                return metadata
+            raise
+        envelope = tl_object_envelope(page, require_binary=True)
+        if envelope is None:
+            raise ExportError(f"poll voter list for message {message.id} was not a TL object")
+        metadata["pages"].append(envelope)
+        page_items = getattr(page, "votes", None) or []
+        fetched += len(page_items)
+        page_count = int(getattr(page, "count", fetched) or 0)
+        api_count = page_count if api_count is None else api_count
+        if progress and (page_count > 100 or getattr(page, "next_offset", None)):
+            progress.phase(
+                f"metadata message {message.id}: poll voters {fetched:,}/{page_count:,}"
+            )
+        next_offset = getattr(page, "next_offset", None)
+        if not next_offset:
+            break
+        if str(next_offset) in seen_offsets:
+            raise ExportError(f"poll-voter pagination repeated offset for message {message.id}")
+        seen_offsets.add(str(next_offset))
+        offset = str(next_offset)
+    if api_count is None or fetched != api_count:
+        raise ExportError(
+            f"poll voter list for message {message.id} returned {fetched} of {api_count} voters"
+        )
+    metadata.update({"status": "complete", "api_count": api_count, "fetched_count": fetched})
+    return metadata
+
+
+async def expanded_message_metadata(
+    client: Any,
+    entity: Any,
+    message: Any,
+    request_delay: float,
+    progress: Optional[ProgressReporter] = None,
+) -> dict[str, Any]:
+    """Fetch secondary metadata needed to reconstruct all API-visible details."""
+    return {
+        "schema_version": 1,
+        "reactions": await _reaction_metadata(
+            client, entity, message, request_delay, progress
+        ),
+        "poll_votes": await _poll_vote_metadata(
+            client, entity, message, request_delay, progress
+        ),
+    }
+
+
+async def full_chat_metadata(
+    client: Any,
+    entity: Any,
+    target: Target,
+    request_delay: float,
+) -> dict[str, Any]:
+    """Capture Telegram's complete chat/user information response."""
+    if target.peer_kind == "user":
+        from telethon.tl.functions.users import GetFullUserRequest
+
+        request = GetFullUserRequest(id=entity)
+    elif target.peer_kind == "channel":
+        from telethon.tl.functions.channels import GetFullChannelRequest
+
+        request = GetFullChannelRequest(channel=entity)
+    elif target.peer_kind == "group":
+        from telethon.tl.functions.messages import GetFullChatRequest
+
+        request = GetFullChatRequest(chat_id=int(target.peer_id))
+    else:
+        raise ExportError(f"unsupported Telegram peer kind: {target.peer_kind}")
+    if request_delay > 0:
+        await asyncio.sleep(request_delay)
+    response = await _metadata_request(
+        client,
+        request,
+        f"full chat metadata for {target.source_name}",
+    )
+    envelope = tl_object_envelope(response, require_binary=True)
+    if envelope is None:
+        raise ExportError(
+            f"Telegram returned no serializable full metadata for {target.source_name}"
+        )
+    full_object = getattr(response, "full_user", None) or getattr(
+        response, "full_chat", None
+    )
+    full_peer_id = getattr(full_object, "id", None)
+    if full_peer_id is None or abs(int(full_peer_id)) != abs(int(target.peer_id)):
+        raise ExportError(
+            f"Telegram returned full metadata for the wrong peer: expected "
+            f"{target.peer_id}, got {full_peer_id}"
+        )
+    return envelope
 
 
 async def iter_message_records(
@@ -473,6 +747,27 @@ async def iter_message_records(
     """Yield records incrementally, optionally including a bounded older overlap."""
     cutoff = (baseline_unix or 0) - overlap_seconds if baseline_unix else 0
     selected = 0
+
+    async def build_record(message: Any) -> tuple[dict[str, Any], Optional[str]]:
+        record, media_error = await message_record(
+            message,
+            media_root,
+            allow_media_errors,
+            selected_media,
+            max_file_size,
+            download_media_enabled,
+            media_retries,
+            progress,
+        )
+        if record.get("metadata_schema_version") == 2:
+            record["expanded_metadata"] = await expanded_message_metadata(
+                client,
+                entity,
+                message,
+                request_delay,
+                progress,
+            )
+        return record, media_error
 
     if not full_rescan and baseline_id:
         if discard_overlap:
@@ -509,16 +804,7 @@ async def iter_message_records(
                 )
             )
             if message_id > baseline_id or in_overlap:
-                record, error = await message_record(
-                    message,
-                    media_root,
-                    allow_media_errors,
-                    selected_media,
-                    max_file_size,
-                    download_media_enabled,
-                    media_retries,
-                    progress,
-                )
+                record, error = await build_record(message)
                 selected += 1
                 if progress:
                     progress.observe(record, error)
@@ -549,16 +835,7 @@ async def iter_message_records(
                 # message created within that same second.
                 if overlap_seconds == 0 and date_unix < (baseline_unix or 0):
                     continue
-            record, error = await message_record(
-                message,
-                media_root,
-                allow_media_errors,
-                selected_media,
-                max_file_size,
-                download_media_enabled,
-                media_retries,
-                progress,
-            )
+            record, error = await build_record(message)
             selected += 1
             if progress:
                 progress.observe(record, error)
@@ -575,16 +852,7 @@ async def iter_message_records(
         async for message in iterator:
             if resume_after_id is not None and int(message.id) <= int(resume_after_id):
                 continue
-            record, error = await message_record(
-                message,
-                media_root,
-                allow_media_errors,
-                selected_media,
-                max_file_size,
-                download_media_enabled,
-                media_retries,
-                progress,
-            )
+            record, error = await build_record(message)
             selected += 1
             if progress:
                 progress.observe(record, error)
@@ -721,6 +989,8 @@ async def write_database_stream(
     full_rescan: bool,
     progress: Optional[ProgressReporter] = None,
     activate_chat: bool = True,
+    chat_entity_snapshot: Optional[dict[str, Any]] = None,
+    chat_full_snapshot: Optional[dict[str, Any]] = None,
 ) -> ExportStats:
     """Stage a resumable fetch, then atomically merge messages and watermark."""
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -766,6 +1036,7 @@ async def write_database_stream(
 
         stats = ExportStats()
         digest = hashlib.sha256()
+        run_metadata_schema_version = 2
         for row in conn.execute(
             f"SELECT record_json, media_error FROM {RUN_MESSAGES_TABLE} WHERE run_key=? ORDER BY message_id",
             (run_key,),
@@ -774,10 +1045,23 @@ async def write_database_stream(
             digest.update(raw.encode("utf-8"))
             digest.update(b"\n")
             record = json.loads(raw)
+            verify_record_metadata(record)
             verify_record_media(record, target_dir)
             stats.observe(record, str(row["media_error"]) if row["media_error"] else None)
+            run_metadata_schema_version = min(
+                run_metadata_schema_version,
+                int(record.get("metadata_schema_version") or 0),
+            )
 
         if stats.message_count == 0 and not full_rescan:
+            if chat_entity_snapshot is not None:
+                upsert_chat_entity_snapshot(
+                    conn, target.chat_id, chat_entity_snapshot, None, role="entity"
+                )
+            if chat_full_snapshot is not None:
+                upsert_chat_entity_snapshot(
+                    conn, target.chat_id, chat_full_snapshot, None, role="full"
+                )
             record_chat_backup_run(conn, target, "completed_no_new_messages")
             conn.execute(
                 f"UPDATE {RUNS_TABLE} SET status='completed', completed_unix=? WHERE run_key=?",
@@ -791,9 +1075,31 @@ async def write_database_stream(
             conn.commit()
             return stats
 
+        if run_metadata_schema_version >= 2 and (
+            chat_entity_snapshot is None or chat_full_snapshot is None
+        ):
+            raise ExportError(
+                f"lossless Telegram metadata for {target.source_name} has no complete chat snapshot"
+            )
+
         records_sha256 = digest.hexdigest()
+        chat_snapshot_hashes = {
+            "entity": (
+                str(chat_entity_snapshot["snapshot_sha256"])
+                if chat_entity_snapshot is not None
+                else None
+            ),
+            "full": (
+                str(chat_full_snapshot["snapshot_sha256"])
+                if chat_full_snapshot is not None
+                else None
+            ),
+        }
         source_key = hashlib.sha256(
-            f"telegram_api\0{target.peer_kind}\0{target.peer_id}\0{records_sha256}".encode("utf-8")
+            (
+                f"telegram_api\0{target.peer_kind}\0{target.peer_id}\0{records_sha256}\0"
+                f"{chat_snapshot_hashes['entity'] or ''}\0{chat_snapshot_hashes['full'] or ''}"
+            ).encode("utf-8")
         ).hexdigest()
         manifest = json.dumps(
             {
@@ -804,6 +1110,13 @@ async def write_database_stream(
                 "peer_id": target.peer_id,
                 "records_sha256": records_sha256,
                 "message_count": stats.message_count,
+                "metadata_schema_version": run_metadata_schema_version,
+                "chat_metadata_schema_version": (
+                    1
+                    if chat_entity_snapshot is not None and chat_full_snapshot is not None
+                    else 0
+                ),
+                "chat_snapshot_sha256": chat_snapshot_hashes,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -862,6 +1175,22 @@ async def write_database_stream(
             commit=False,
             activate_chat=activate_chat,
         )
+        if chat_entity_snapshot is not None:
+            upsert_chat_entity_snapshot(
+                conn,
+                target.chat_id,
+                chat_entity_snapshot,
+                source_key,
+                role="entity",
+            )
+        if chat_full_snapshot is not None:
+            upsert_chat_entity_snapshot(
+                conn,
+                target.chat_id,
+                chat_full_snapshot,
+                source_key,
+                role="full",
+            )
         for row in conn.execute(
             f"SELECT message_id, record_json, media_error FROM {RUN_MESSAGES_TABLE} WHERE run_key=? ORDER BY message_id",
             (run_key,),
@@ -1923,12 +2252,30 @@ def delete_purge_database_rows(
             plan.chat_ids,
         )
         conn.execute(
+            f"DELETE FROM telegram_message_entity_refs WHERE chat_id IN ({chat_placeholders})",
+            plan.chat_ids,
+        )
+        conn.execute(
+            f"DELETE FROM telegram_chat_snapshot_sources WHERE chat_id IN ({chat_placeholders})",
+            plan.chat_ids,
+        )
+        conn.execute(
+            f"DELETE FROM telegram_chat_entity_refs WHERE chat_id IN ({chat_placeholders})",
+            plan.chat_ids,
+        )
+        conn.execute(
             f"DELETE FROM messages WHERE chat_id IN ({chat_placeholders})",
             plan.chat_ids,
         )
         if plan.exclusive_source_keys:
             source_placeholders = sqlite_placeholders(plan.exclusive_source_keys)
-            for table in ("message_sources", "message_source_media", "backup_imports", "backup_import_files"):
+            for table in (
+                "telegram_chat_snapshot_sources",
+                "message_sources",
+                "message_source_media",
+                "backup_imports",
+                "backup_import_files",
+            ):
                 conn.execute(
                     f"DELETE FROM {table} WHERE source_key IN ({source_placeholders})",
                     plan.exclusive_source_keys,
@@ -1948,6 +2295,19 @@ def delete_purge_database_rows(
         conn.execute(
             f"DELETE FROM chats WHERE chat_id IN ({chat_placeholders})",
             plan.chat_ids,
+        )
+        conn.execute(
+            """DELETE FROM telegram_entity_snapshots
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM telegram_message_entity_refs AS r
+                   WHERE r.snapshot_sha256=telegram_entity_snapshots.snapshot_sha256
+               ) AND NOT EXISTS (
+                   SELECT 1 FROM telegram_chat_entity_refs AS r
+                   WHERE r.snapshot_sha256=telegram_entity_snapshots.snapshot_sha256
+               ) AND NOT EXISTS (
+                   SELECT 1 FROM telegram_chat_snapshot_sources AS r
+                   WHERE r.snapshot_sha256=telegram_entity_snapshots.snapshot_sha256
+               )"""
         )
         conn.execute(
             f"""UPDATE {TARGETS_TABLE}
@@ -2704,6 +3064,50 @@ async def run_exports(args: argparse.Namespace) -> int:
             progress: Optional[ProgressReporter] = None
             try:
                 entity = await client.get_input_entity(target_input_peer(target))
+                chat_entity_snapshot: Optional[dict[str, Any]] = None
+                chat_full_snapshot: Optional[dict[str, Any]] = None
+                if (
+                    not args.legacy_json_export
+                    and not args.dry_run
+                    and hasattr(client, "get_entity")
+                ):
+                    try:
+                        chat_entity = await client.get_entity(entity)
+                        chat_entity_snapshot = tl_object_envelope(
+                            chat_entity,
+                            require_binary=True,
+                        )
+                    except Exception as exc:
+                        raise ExportError(
+                            f"could not capture complete chat entity for {target.source_name}: {exc}"
+                        ) from exc
+                    if chat_entity_snapshot is None:
+                        raise ExportError(
+                            f"Telegram returned no serializable chat entity for {target.source_name}"
+                        )
+                    if bool(getattr(chat_entity, "min", False)):
+                        raise ExportError(
+                            f"Telegram returned only a minimal chat entity for {target.source_name}"
+                        )
+                    if (
+                        chat_entity_snapshot.get("peer_kind") != target.peer_kind
+                        or int(chat_entity_snapshot.get("peer_id") or 0) != int(target.peer_id)
+                    ):
+                        raise ExportError(
+                            f"Telegram returned the wrong chat entity for {target.source_name}: "
+                            f"expected {target.peer_kind}:{target.peer_id}, got "
+                            f"{chat_entity_snapshot.get('peer_kind')}:"
+                            f"{chat_entity_snapshot.get('peer_id')}"
+                        )
+                    print(
+                        f"[{target.source_name}] capturing complete chat metadata..."
+                    )
+                    chat_full_snapshot = await full_chat_metadata(
+                        client,
+                        entity,
+                        target,
+                        args.request_delay,
+                    )
                 baseline_id, baseline_unix = baseline_for_target(conn, target)
                 print(
                     f"[{target.source_name}] baseline message_id={baseline_id or 'none'} "
@@ -2784,6 +3188,8 @@ async def run_exports(args: argparse.Namespace) -> int:
                         args.full_rescan,
                         progress,
                         activate_chat=not args.run_all,
+                        chat_entity_snapshot=chat_entity_snapshot,
+                        chat_full_snapshot=chat_full_snapshot,
                     )
                     if stats.message_count == 0:
                         progress.finish("no new messages; database unchanged")

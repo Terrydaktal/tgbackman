@@ -1,18 +1,24 @@
 //! GUI controller state and background-task orchestration.
 
 use eframe::egui;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::cache::{
-    cache_is_fresh, default_database_path, get_cache_path, get_media_cache_path, secure_cache_file,
+    cache_is_fresh, default_database_path, get_cache_path, get_inventory_cache_path,
+    get_media_cache_path, secure_cache_file,
 };
-use crate::database::run_inventory;
+use crate::database::{
+    MESSAGE_SEARCH_PAGE_SIZE, count_search_messages, load_chat_page_with_aliases,
+    load_search_results_by_rowids, run_inventory, search_message_page, search_message_rowids,
+};
 use crate::matching::{clean_text_for_match, count_missing_messages, format_unix_to_ts};
 use crate::model::{
     ActiveChatView, ActiveComparison, AlignedMessageRow, BackupMessage, CalcMessage, ChatGroup,
-    CompareMessage, LoadMessage, MediaCalcMessage, MediaStats, SingleChatMessage,
+    ChatPageRequest, CompareMessage, LoadMessage, MediaCalcMessage, MediaStats,
+    MessageSearchMessage, MessageSearchResult, SingleChatMessage,
 };
 
 fn ensure_column(
@@ -48,6 +54,32 @@ fn atomic_write_json<T: Serialize>(path: &str, value: &T) -> std::io::Result<()>
     result
 }
 
+fn open_readonly_database(path: &str) -> rusqlite::Result<rusqlite::Connection> {
+    rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+}
+
+const INVENTORY_CACHE_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct InventoryCache {
+    version: u32,
+    groups: Vec<ChatGroup>,
+}
+
+fn load_inventory_cache(cache_path: &str, db_path: &str) -> Option<Vec<ChatGroup>> {
+    if !cache_is_fresh(cache_path, db_path) {
+        return None;
+    }
+    let file = std::fs::File::open(cache_path).ok()?;
+    let cache: InventoryCache = serde_json::from_reader(file).ok()?;
+    (cache.version == INVENTORY_CACHE_VERSION).then_some(cache.groups)
+}
+
 pub(crate) struct OverlapApp {
     pub(crate) db_path: String,
     pub(crate) loaded_db_path: Option<String>,
@@ -72,6 +104,18 @@ pub(crate) struct OverlapApp {
     pub(crate) active_chat_view: Arc<Mutex<Option<ActiveChatView>>>,
     pub(crate) loading_chat_view: bool,
     pub(crate) chat_view_rx: Option<std::sync::mpsc::Receiver<SingleChatMessage>>,
+    pub(crate) global_search_results: HashMap<usize, MessageSearchResult>,
+    pub(crate) global_search_row_ids: Vec<i64>,
+    pub(crate) global_search_total_matches: usize,
+    pub(crate) global_searching: bool,
+    pub(crate) global_search_error: Option<String>,
+    pub(crate) global_search_rx: Option<std::sync::mpsc::Receiver<MessageSearchMessage>>,
+    pub(crate) global_search_request_id: u64,
+    pub(crate) global_search_scheduled_at: Option<Instant>,
+    pub(crate) global_search_last_submitted: String,
+    pub(crate) chat_search_rx: Option<std::sync::mpsc::Receiver<MessageSearchMessage>>,
+    pub(crate) chat_search_request_id: u64,
+    pub(crate) pending_chat_highlight_query: Option<String>,
 }
 
 impl Default for OverlapApp {
@@ -100,6 +144,18 @@ impl Default for OverlapApp {
             active_chat_view: Arc::new(Mutex::new(None)),
             loading_chat_view: false,
             chat_view_rx: None,
+            global_search_results: HashMap::new(),
+            global_search_row_ids: Vec::new(),
+            global_search_total_matches: 0,
+            global_searching: false,
+            global_search_error: None,
+            global_search_rx: None,
+            global_search_request_id: 0,
+            global_search_scheduled_at: None,
+            global_search_last_submitted: String::new(),
+            chat_search_rx: None,
+            chat_search_request_id: 0,
+            pending_chat_highlight_query: None,
         }
     }
 }
@@ -391,10 +447,20 @@ impl OverlapApp {
         self.media_rx = None;
         self.compare_rx = None;
         self.chat_view_rx = None;
+        self.global_search_rx = None;
+        self.chat_search_rx = None;
         self.calculating_overlaps = false;
         self.calculating_media = false;
         self.loading_comparison = false;
         self.loading_chat_view = false;
+        self.global_searching = false;
+        self.global_search_results.clear();
+        self.global_search_row_ids.clear();
+        self.global_search_total_matches = 0;
+        self.global_search_error = None;
+        self.global_search_scheduled_at = None;
+        self.global_search_last_submitted.clear();
+        self.pending_chat_highlight_query = None;
         self.active_comparison = Arc::new(Mutex::new(None));
         self.active_chat_view = Arc::new(Mutex::new(None));
 
@@ -478,6 +544,51 @@ impl OverlapApp {
                             "deleted_unix",
                             "ALTER TABLE messages ADD COLUMN deleted_unix INTEGER",
                         ),
+                        (
+                            "messages",
+                            "reply_to_chat_id",
+                            "ALTER TABLE messages ADD COLUMN reply_to_chat_id TEXT",
+                        ),
+                        (
+                            "messages",
+                            "reply_to_peer_kind",
+                            "ALTER TABLE messages ADD COLUMN reply_to_peer_kind TEXT",
+                        ),
+                        (
+                            "messages",
+                            "reply_to_peer_id",
+                            "ALTER TABLE messages ADD COLUMN reply_to_peer_id INTEGER",
+                        ),
+                        (
+                            "messages",
+                            "reply_to_top_id",
+                            "ALTER TABLE messages ADD COLUMN reply_to_top_id INTEGER",
+                        ),
+                        (
+                            "messages",
+                            "reply_to_story_id",
+                            "ALTER TABLE messages ADD COLUMN reply_to_story_id INTEGER",
+                        ),
+                        (
+                            "messages",
+                            "reply_quote_text",
+                            "ALTER TABLE messages ADD COLUMN reply_quote_text TEXT",
+                        ),
+                        (
+                            "messages",
+                            "reply_quote_entities_json",
+                            "ALTER TABLE messages ADD COLUMN reply_quote_entities_json TEXT",
+                        ),
+                        (
+                            "messages",
+                            "reply_quote_offset",
+                            "ALTER TABLE messages ADD COLUMN reply_quote_offset INTEGER",
+                        ),
+                        (
+                            "messages",
+                            "reply_media_json",
+                            "ALTER TABLE messages ADD COLUMN reply_media_json TEXT",
+                        ),
                     ] {
                         if let Err(error) = ensure_column(&c, table, column, sql) {
                             let _ = tx.send(LoadMessage::Error(format!(
@@ -486,6 +597,17 @@ impl OverlapApp {
                             ctx.request_repaint();
                             return;
                         }
+                    }
+                    if let Err(error) = c.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_messages_chat_ts_id
+                         ON messages(chat_id, timestamp_unix, message_id)",
+                        [],
+                    ) {
+                        let _ = tx.send(LoadMessage::Error(format!(
+                            "Database index migration failed: {error}"
+                        )));
+                        ctx.request_repaint();
+                        return;
                     }
                     c
                 }
@@ -497,12 +619,31 @@ impl OverlapApp {
             };
 
             let _ = tx.send(LoadMessage::Loading(
-                "Scanning backup folders and calculating timeline boundaries...".to_string(),
+                "Loading cached database inventory...".to_string(),
+            ));
+            ctx.request_repaint();
+
+            let inventory_cache_path = get_inventory_cache_path(&db_path);
+            if let Some(groups) = load_inventory_cache(&inventory_cache_path, &db_path) {
+                let _ = tx.send(LoadMessage::Finished(groups));
+                ctx.request_repaint();
+                return;
+            }
+
+            let _ = tx.send(LoadMessage::Loading(
+                "Refreshing changed database inventory...".to_string(),
             ));
             ctx.request_repaint();
 
             match run_inventory(&conn, &db_path) {
                 Ok(groups) => {
+                    let cache = InventoryCache {
+                        version: INVENTORY_CACHE_VERSION,
+                        groups: groups.clone(),
+                    };
+                    if atomic_write_json(&inventory_cache_path, &cache).is_ok() {
+                        secure_cache_file(&inventory_cache_path);
+                    }
                     let _ = tx.send(LoadMessage::Finished(groups));
                 }
                 Err(e) => {
@@ -595,6 +736,13 @@ impl OverlapApp {
                             clean_text,
                             media_type: r.get(5)?,
                             media_path: r.get(6)?,
+                            reply: None,
+                            forwarded_from: None,
+                            edit_timestamp: None,
+                            reactions_json: None,
+                            message_type: None,
+                            action_json: None,
+                            is_outgoing: false,
                         })
                     },
                 ) {
@@ -651,6 +799,13 @@ impl OverlapApp {
                             clean_text,
                             media_type: r.get(5)?,
                             media_path: r.get(6)?,
+                            reply: None,
+                            forwarded_from: None,
+                            edit_timestamp: None,
+                            reactions_json: None,
+                            message_type: None,
+                            action_json: None,
+                            is_outgoing: false,
                         })
                     },
                 ) {
@@ -787,136 +942,274 @@ impl OverlapApp {
     }
 
     pub(crate) fn trigger_load_chat(&mut self, idx: usize, ctx: egui::Context) {
-        if let Some(group_idx) = self.selected_group_idx {
-            let group = &self.groups[group_idx];
-            let backup = &group.backups[idx];
+        let Some(group_idx) = self.selected_group_idx else {
+            return;
+        };
+        let Some(group) = self.groups.get(group_idx) else {
+            return;
+        };
+        let Some(backup) = group.backups.get(idx) else {
+            return;
+        };
+        self.trigger_load_chat_page(
+            backup.chat_id.clone(),
+            group.name.clone(),
+            ChatPageRequest::Latest,
+            ctx,
+        );
+    }
 
-            let letter = (b'A' + idx as u8) as char;
-            self.loading_chat_view = true;
-            self.status_msg = format!("Loading chat history for Backup {}...", letter);
+    pub(crate) fn trigger_load_preferred_chat(&mut self, group_idx: usize, ctx: egui::Context) {
+        let Some(group) = self.groups.get(group_idx) else {
+            return;
+        };
+        let Some((backup_idx, _)) = group
+            .backups
+            .iter()
+            .enumerate()
+            .filter(|(_, backup)| backup.count > 0)
+            .max_by_key(|(_, backup)| backup.count)
+        else {
+            self.status_msg = format!("{} has no saved messages yet.", group.name);
+            return;
+        };
+        self.selected_group_idx = Some(group_idx);
+        self.trigger_load_chat(backup_idx, ctx);
+    }
 
-            let db_path = self.active_db_path();
-            let chat_id = backup.chat_id.clone();
-            let backup_name = format!("Backup {} ({})", letter, backup.name);
-
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.chat_view_rx = Some(rx);
-
-            std::thread::spawn(move || {
-                let _ = tx.send(SingleChatMessage::Loading(
-                    "Connecting to database...".to_string(),
-                ));
-                ctx.request_repaint();
-
-                let conn = match rusqlite::Connection::open(&db_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(SingleChatMessage::Error(format!(
-                            "Failed to open DB: {}",
-                            e
-                        )));
-                        ctx.request_repaint();
-                        return;
-                    }
-                };
-
-                let _ = tx.send(SingleChatMessage::Loading(
-                    "Fetching messages from database...".to_string(),
-                ));
-                ctx.request_repaint();
-
-                const CHAT_VIEW_PAGE_SIZE: i64 = 100_000;
-                let total_messages: i64 = match conn.query_row(
-                    "SELECT count(*) FROM messages WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0",
-                    rusqlite::params![chat_id],
-                    |row| row.get(0),
-                ) {
-                    Ok(total) => total,
-                    Err(error) => {
-                        let _ = tx.send(SingleChatMessage::Error(format!(
-                            "Message count query failed: {error}"
-                        )));
-                        ctx.request_repaint();
-                        return;
-                    }
-                };
-                let mut stmt = match conn.prepare(
-                    "SELECT message_id, sender, timestamp_unix, timestamp, text, media_type, media_path
-                     FROM messages
-                     WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0
-                       AND id IN (
-                           SELECT id FROM messages
-                           WHERE chat_id = ? AND COALESCE(is_deleted, 0)=0
-                           ORDER BY timestamp_unix DESC, message_id DESC
-                           LIMIT ?
-                       )
-                     ORDER BY timestamp_unix ASC, message_id ASC"
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(SingleChatMessage::Error(format!("Prepare query failed: {}", e)));
-                        ctx.request_repaint();
-                        return;
-                    }
-                };
-
-                let messages = match stmt.query_map(
-                    rusqlite::params![chat_id, chat_id, CHAT_VIEW_PAGE_SIZE],
-                    |r| {
-                        let text: String = r.get(4)?;
-                        let clean_text = clean_text_for_match(&text);
-                        Ok(BackupMessage {
-                            message_id: r.get(0)?,
-                            sender: r.get(1)?,
-                            timestamp_unix: r.get(2)?,
-                            timestamp_str: r.get(3)?,
-                            text,
-                            clean_text,
-                            media_type: r.get(5)?,
-                            media_path: r.get(6)?,
-                        })
-                    },
-                ) {
-                    Ok(mapped) => {
-                        let mut msgs = Vec::new();
-                        for item in mapped {
-                            match item {
-                                Ok(m) => msgs.push(m),
-                                Err(error) => {
-                                    let _ = tx.send(SingleChatMessage::Error(format!(
-                                        "Row decode failed: {error}"
-                                    )));
-                                    ctx.request_repaint();
-                                    return;
-                                }
-                            }
-                        }
-                        msgs
-                    }
-                    Err(e) => {
-                        let _ = tx.send(SingleChatMessage::Error(format!("Query failed: {}", e)));
-                        ctx.request_repaint();
-                        return;
-                    }
-                };
-
-                let chat_view = ActiveChatView {
-                    backup_name,
-                    chat_id,
-                    messages,
-                    total_messages,
-                    truncated: total_messages > CHAT_VIEW_PAGE_SIZE,
-                    scroll_to_bottom: true,
-                    search_query: String::new(),
-                    filtered_indices: Vec::new(),
-                    search_matches_count: 0,
-                    current_search_match_idx: None,
-                    scroll_to_row_idx: None,
-                };
-
-                let _ = tx.send(SingleChatMessage::Finished(chat_view));
-                ctx.request_repaint();
-            });
+    pub(crate) fn trigger_load_chat_page(
+        &mut self,
+        chat_id: String,
+        backup_name: String,
+        request: ChatPageRequest,
+        ctx: egui::Context,
+    ) {
+        let cached_self_sender_aliases = self.active_chat_view.lock().ok().and_then(|view| {
+            view.as_ref()
+                .filter(|view| view.chat_id == chat_id)
+                .map(|view| view.self_sender_aliases.clone())
+        });
+        let switching_chat = self
+            .active_chat_view
+            .lock()
+            .ok()
+            .and_then(|view| view.as_ref().map(|view| view.chat_id != chat_id))
+            .unwrap_or(true);
+        if switching_chat {
+            if let Ok(mut view) = self.active_chat_view.lock() {
+                *view = None;
+            }
+            self.chat_search_rx = None;
         }
+        self.loading_chat_view = true;
+        self.status_msg = format!("Loading messages for {backup_name}...");
+        let db_path = self.active_db_path();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.chat_view_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let _ = tx.send(SingleChatMessage::Loading(
+                "Fetching a bounded message page from SQLite...".to_string(),
+            ));
+            ctx.request_repaint();
+            let result = open_readonly_database(&db_path).and_then(|conn| {
+                let transaction = conn.unchecked_transaction()?;
+                let page = load_chat_page_with_aliases(
+                    &transaction,
+                    &chat_id,
+                    backup_name,
+                    request,
+                    cached_self_sender_aliases.as_ref(),
+                )?;
+                transaction.commit()?;
+                Ok(page)
+            });
+            match result {
+                Ok(page) => {
+                    let _ = tx.send(SingleChatMessage::Finished(page));
+                }
+                Err(error) => {
+                    let _ = tx.send(SingleChatMessage::Error(format!(
+                        "Message query failed: {error}"
+                    )));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    pub(crate) fn trigger_global_message_search(
+        &mut self,
+        query: String,
+        offset: usize,
+        ctx: egui::Context,
+    ) {
+        let query = query.trim().to_string();
+        self.global_search_scheduled_at = None;
+        if query.is_empty() {
+            self.global_search_request_id = self.global_search_request_id.wrapping_add(1);
+            self.global_search_last_submitted.clear();
+            self.global_search_results.clear();
+            self.global_search_row_ids.clear();
+            self.global_search_total_matches = 0;
+            self.global_search_error = None;
+            self.global_searching = false;
+            self.global_search_rx = None;
+            return;
+        }
+        let new_search = offset == 0 || query != self.global_search_last_submitted;
+        if !new_search && self.global_searching {
+            return;
+        }
+        if new_search {
+            self.global_search_request_id = self.global_search_request_id.wrapping_add(1);
+            self.global_search_last_submitted.clone_from(&query);
+            self.global_search_results.clear();
+            self.global_search_row_ids.clear();
+            self.global_search_total_matches = 0;
+        }
+        let request_id = self.global_search_request_id;
+        let page_row_ids = if new_search {
+            None
+        } else {
+            let end = offset
+                .saturating_add(MESSAGE_SEARCH_PAGE_SIZE as usize)
+                .min(self.global_search_row_ids.len());
+            Some((
+                self.global_search_row_ids
+                    .get(offset..end)
+                    .unwrap_or_default()
+                    .to_vec(),
+                self.global_search_row_ids.len(),
+            ))
+        };
+        self.global_searching = true;
+        self.global_search_error = None;
+        let db_path = self.active_db_path();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.global_search_rx = Some(rx);
+        std::thread::spawn(move || {
+            let conn = match open_readonly_database(&db_path) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    let _ = tx.send(MessageSearchMessage::Error {
+                        request_id,
+                        offset,
+                        message: error.to_string(),
+                    });
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let result = if let Some((row_ids, total_matches)) = page_row_ids {
+                load_search_results_by_rowids(&conn, &row_ids).map(|results| {
+                    MessageSearchMessage::Finished {
+                        request_id,
+                        offset,
+                        total_matches,
+                        done: offset.saturating_add(row_ids.len()) >= total_matches,
+                        results,
+                    }
+                })
+            } else {
+                search_message_rowids(&conn, &query).and_then(|row_ids| {
+                    let first_page_end = row_ids.len().min(MESSAGE_SEARCH_PAGE_SIZE as usize);
+                    load_search_results_by_rowids(&conn, &row_ids[..first_page_end]).map(
+                        |results| MessageSearchMessage::IndexReady {
+                            request_id,
+                            row_ids,
+                            results,
+                        },
+                    )
+                })
+            };
+            match result {
+                Ok(message) => {
+                    let _ = tx.send(message);
+                }
+                Err(error) => {
+                    let _ = tx.send(MessageSearchMessage::Error {
+                        request_id,
+                        offset,
+                        message: error.to_string(),
+                    });
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    pub(crate) fn trigger_chat_message_search(
+        &mut self,
+        chat_id: String,
+        query: String,
+        offset: usize,
+        ctx: egui::Context,
+    ) {
+        let query = query.trim().to_string();
+        self.chat_search_request_id = self.chat_search_request_id.wrapping_add(1);
+        let request_id = self.chat_search_request_id;
+        if query.is_empty() {
+            if let Ok(mut view) = self.active_chat_view.lock()
+                && let Some(view) = view.as_mut()
+            {
+                view.search_results.clear();
+                view.total_search_matches = 0;
+                view.current_search_match_idx = None;
+                view.search_error = None;
+                view.searching = false;
+            }
+            self.chat_search_rx = None;
+            return;
+        }
+        if let Ok(mut view) = self.active_chat_view.lock()
+            && let Some(view) = view.as_mut()
+        {
+            view.searching = true;
+            view.search_error = None;
+            view.highlight_query.clone_from(&query);
+        }
+        let db_path = self.active_db_path();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.chat_search_rx = Some(rx);
+        std::thread::spawn(move || {
+            let conn = match open_readonly_database(&db_path) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    let _ = tx.send(MessageSearchMessage::Error {
+                        request_id,
+                        offset,
+                        message: error.to_string(),
+                    });
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let result =
+                count_search_messages(&conn, &query, Some(&chat_id)).and_then(|total_matches| {
+                    let limit = i64::try_from(total_matches).unwrap_or(i64::MAX);
+                    search_message_page(&conn, &query, Some(&chat_id), limit, offset)
+                        .map(|results| (results, total_matches))
+                });
+            match result {
+                Ok((results, total_matches)) => {
+                    let _ = tx.send(MessageSearchMessage::Finished {
+                        request_id,
+                        offset,
+                        total_matches,
+                        results,
+                        done: true,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(MessageSearchMessage::Error {
+                        request_id,
+                        offset,
+                        message: error.to_string(),
+                    });
+                }
+            }
+            ctx.request_repaint();
+        });
     }
 }

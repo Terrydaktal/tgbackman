@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) enum CalcMessage {
     Progress(String),
@@ -22,8 +22,55 @@ pub(crate) enum CompareMessage {
 }
 pub(crate) enum SingleChatMessage {
     Loading(String),
-    Finished(ActiveChatView),
+    Finished(ChatMessagePage),
     Error(String),
+}
+
+pub(crate) enum MessageSearchMessage {
+    IndexReady {
+        request_id: u64,
+        row_ids: Vec<i64>,
+        results: Vec<MessageSearchResult>,
+    },
+    Finished {
+        request_id: u64,
+        offset: usize,
+        total_matches: usize,
+        results: Vec<MessageSearchResult>,
+        done: bool,
+    },
+    Error {
+        request_id: u64,
+        offset: usize,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ChatPageRequest {
+    Latest,
+    Before {
+        timestamp_unix: i64,
+        message_id: i64,
+    },
+    After {
+        timestamp_unix: i64,
+        message_id: i64,
+    },
+    Around {
+        message_id: i64,
+    },
+}
+
+pub(crate) struct ChatMessagePage {
+    pub(crate) backup_name: String,
+    pub(crate) chat_id: String,
+    pub(crate) messages: Vec<BackupMessage>,
+    pub(crate) total_messages: i64,
+    pub(crate) has_older: bool,
+    pub(crate) has_newer: bool,
+    pub(crate) focus_message_id: Option<i64>,
+    pub(crate) self_sender_aliases: HashSet<String>,
 }
 
 #[allow(dead_code)]
@@ -33,14 +80,59 @@ pub(crate) struct ActiveChatView {
     pub(crate) chat_id: String,
     pub(crate) messages: Vec<BackupMessage>,
     pub(crate) total_messages: i64,
-    pub(crate) truncated: bool,
+    pub(crate) has_older: bool,
+    pub(crate) has_newer: bool,
     pub(crate) scroll_to_bottom: bool,
     pub(crate) search_query: String,
-    pub(crate) filtered_indices: Vec<usize>,
-    pub(crate) search_matches_count: usize,
+    pub(crate) highlight_query: String,
+    pub(crate) search_results: Vec<MessageSearchResult>,
+    pub(crate) total_search_matches: usize,
+    pub(crate) searching: bool,
+    pub(crate) search_error: Option<String>,
     pub(crate) current_search_match_idx: Option<usize>,
-    pub(crate) scroll_to_row_idx: Option<usize>,
+    pub(crate) focus_message_id: Option<i64>,
+    pub(crate) self_sender_aliases: HashSet<String>,
 }
+
+impl ActiveChatView {
+    pub(crate) fn apply_page(&mut self, page: ChatMessagePage) {
+        self.backup_name = page.backup_name;
+        self.chat_id = page.chat_id;
+        self.messages = page.messages;
+        self.total_messages = page.total_messages;
+        self.has_older = page.has_older;
+        self.has_newer = page.has_newer;
+        self.scroll_to_bottom = page.focus_message_id.is_none() && !self.has_newer;
+        self.focus_message_id = page.focus_message_id;
+        self.self_sender_aliases = page.self_sender_aliases;
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MessageSearchResult {
+    pub(crate) chat_id: String,
+    pub(crate) chat_name: String,
+    pub(crate) message_id: i64,
+    pub(crate) sender: String,
+    pub(crate) timestamp_str: String,
+    pub(crate) text: String,
+    pub(crate) media_type: Option<String>,
+}
+#[derive(Clone)]
+pub(crate) struct ReplyPreview {
+    pub(crate) message_id: Option<i64>,
+    pub(crate) story_id: Option<i64>,
+    pub(crate) topic_id: Option<i64>,
+    pub(crate) peer_kind: Option<String>,
+    pub(crate) peer_id: Option<i64>,
+    pub(crate) target_chat_id: Option<String>,
+    pub(crate) chat_name: Option<String>,
+    pub(crate) sender: Option<String>,
+    pub(crate) text: String,
+    pub(crate) media_type: Option<String>,
+    pub(crate) missing: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct BackupMessage {
     pub(crate) message_id: i64,
@@ -51,6 +143,13 @@ pub(crate) struct BackupMessage {
     pub(crate) clean_text: String,
     pub(crate) media_type: Option<String>,
     pub(crate) media_path: Option<String>,
+    pub(crate) reply: Option<ReplyPreview>,
+    pub(crate) forwarded_from: Option<String>,
+    pub(crate) edit_timestamp: Option<String>,
+    pub(crate) reactions_json: Option<String>,
+    pub(crate) message_type: Option<String>,
+    pub(crate) action_json: Option<String>,
+    pub(crate) is_outgoing: bool,
 }
 #[derive(Clone)]
 pub(crate) struct AlignedMessageRow {
@@ -70,7 +169,7 @@ pub(crate) struct ActiveComparison {
     pub(crate) scroll_to_row_idx: Option<usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BackupInfo {
     pub(crate) chat_id: String,
     pub(crate) name: String,
@@ -128,7 +227,7 @@ impl BackupInfo {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ChatGroup {
     pub(crate) name: String,
     pub(crate) max_count: i64,

@@ -20,8 +20,8 @@ from ..config import (
     RUN_ATTEMPTS_TABLE,
     RUN_MESSAGES_TABLE,
     RUNS_TABLE,
-    TARGETS_TABLE,
     TARGET_CHAT_LINKS_TABLE,
+    TARGETS_TABLE,
 )
 
 ARCHIVAL_MESSAGE_COLUMNS = {
@@ -29,6 +29,11 @@ ARCHIVAL_MESSAGE_COLUMNS = {
     "media_size": "INTEGER", "media_sha256": "TEXT", "media_status": "TEXT",
     "grouped_id": "TEXT", "entities_json": "TEXT", "reactions_json": "TEXT",
     "reply_markup_json": "TEXT", "action_json": "TEXT", "forward_json": "TEXT",
+    "reply_to_chat_id": "TEXT", "reply_to_peer_kind": "TEXT", "reply_to_peer_id": "INTEGER",
+    "reply_to_top_id": "INTEGER", "reply_to_story_id": "INTEGER", "reply_quote_text": "TEXT",
+    "reply_quote_entities_json": "TEXT", "reply_quote_offset": "INTEGER", "reply_media_json": "TEXT",
+    "raw_tl_payload": "BLOB", "raw_tl_sha256": "TEXT", "raw_tl_layer": "INTEGER",
+    "raw_tl_library": "TEXT", "expanded_metadata_json": "TEXT",
     "extra_json": "TEXT", "raw_payload": "BLOB", "source_key": "TEXT",
     "source_format": "TEXT", "is_deleted": "INTEGER NOT NULL DEFAULT 0", "deleted_unix": "INTEGER",
 }
@@ -97,8 +102,58 @@ def ensure_archive_schema(conn: sqlite3.Connection) -> None:
           media_path TEXT, media_size INTEGER, media_sha256 TEXT, media_status TEXT,
           checked_unix INTEGER NOT NULL, PRIMARY KEY(source_key, chat_id, message_id)
         );
+        CREATE TABLE IF NOT EXISTS archive_schema_migrations (
+          migration_name TEXT PRIMARY KEY, applied_unix INTEGER NOT NULL,
+          affected_rows INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS telegram_entity_snapshots (
+          snapshot_sha256 TEXT PRIMARY KEY, peer_kind TEXT, peer_id INTEGER,
+          entity_type TEXT NOT NULL, entity_json TEXT NOT NULL, tl_payload BLOB,
+          tl_sha256 TEXT, telethon_layer INTEGER, telethon_version TEXT,
+          first_captured_unix INTEGER NOT NULL, last_captured_unix INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS telegram_message_entity_refs (
+          chat_id TEXT NOT NULL, message_id INTEGER NOT NULL, role TEXT NOT NULL,
+          snapshot_sha256 TEXT NOT NULL,
+          PRIMARY KEY(chat_id, message_id, role),
+          FOREIGN KEY(snapshot_sha256) REFERENCES telegram_entity_snapshots(snapshot_sha256)
+        );
+        CREATE TABLE IF NOT EXISTS telegram_chat_entity_refs (
+          chat_id TEXT NOT NULL, snapshot_sha256 TEXT NOT NULL,
+          captured_unix INTEGER NOT NULL, source_key TEXT,
+          role TEXT NOT NULL DEFAULT 'entity',
+          PRIMARY KEY(chat_id, snapshot_sha256),
+          FOREIGN KEY(snapshot_sha256) REFERENCES telegram_entity_snapshots(snapshot_sha256)
+        );
+        CREATE TABLE IF NOT EXISTS telegram_chat_snapshot_sources (
+          chat_id TEXT NOT NULL, snapshot_sha256 TEXT NOT NULL,
+          source_key TEXT NOT NULL, role TEXT NOT NULL,
+          captured_unix INTEGER NOT NULL,
+          PRIMARY KEY(chat_id, snapshot_sha256, source_key, role),
+          FOREIGN KEY(snapshot_sha256) REFERENCES telegram_entity_snapshots(snapshot_sha256),
+          FOREIGN KEY(source_key) REFERENCES backup_sources(source_key)
+        );
         CREATE INDEX IF NOT EXISTS idx_messages_source_key ON messages(source_key);
+        CREATE INDEX IF NOT EXISTS idx_messages_reply_target
+            ON messages(reply_to_chat_id, reply_to_id);
+        CREATE INDEX IF NOT EXISTS idx_message_entity_refs_snapshot
+            ON telegram_message_entity_refs(snapshot_sha256);
+        CREATE INDEX IF NOT EXISTS idx_chat_entity_refs_snapshot
+            ON telegram_chat_entity_refs(snapshot_sha256);
+        CREATE INDEX IF NOT EXISTS idx_chat_snapshot_sources_source
+            ON telegram_chat_snapshot_sources(source_key);
+        CREATE INDEX IF NOT EXISTS idx_chat_snapshot_sources_chat_source
+            ON telegram_chat_snapshot_sources(chat_id, source_key);
         """
+    )
+    _add_columns(
+        conn,
+        "telegram_chat_entity_refs",
+        {"role": "TEXT NOT NULL DEFAULT 'entity'"},
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_chat_entity_refs_chat_role
+           ON telegram_chat_entity_refs(chat_id, role)"""
     )
 
 
@@ -107,6 +162,8 @@ def ensure_search_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp_unix);
+        CREATE INDEX IF NOT EXISTS idx_messages_chat_ts_id
+            ON messages(chat_id, timestamp_unix, message_id);
         CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
         CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp_unix);
         """
@@ -208,6 +265,11 @@ def ensure_targets_schema(conn: sqlite3.Connection) -> None:
             SELECT target_key, chat_id, 'canonical', strftime('%s','now') FROM {TARGETS_TABLE}
             WHERE EXISTS (SELECT 1 FROM chats WHERE chats.chat_id={TARGETS_TABLE}.chat_id)"""
     )
+    # This one-time local migration reads only already-archived API reply rows;
+    # it never contacts Telegram or duplicates referenced message bodies.
+    from .archive import backfill_reply_metadata
+
+    backfill_reply_metadata(conn)
     conn.commit()
 
 

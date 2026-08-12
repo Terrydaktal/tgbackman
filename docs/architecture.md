@@ -49,7 +49,8 @@ The Rust applications are split into crate-local modules. `tgbackman` keeps
 only the egui frame loop and process entry point in `main.rs`; `app.rs` owns
 GUI state/background workers, `database.rs` owns inventory/statistics/target
 mapping, `matching.rs` owns overlap normalisation/comparison, `ui.rs` owns
-rendering primitives, `model.rs` owns value objects, `cache.rs` owns cache
+shared rendering primitives, `viewer.rs` owns the integrated Telegram-style
+conversation/search presentation, `model.rs` owns value objects, `cache.rs` owns cache
 freshness/path policy, and `inventory.rs` owns union-find. `tgsearch` keeps its
 CLI/query loop in `main.rs`, with `models.rs` for result rows and `render.rs`
 for formatting, highlighting, and sanitisation.
@@ -59,11 +60,57 @@ database; a future background-run button should launch the `tgbackman-backup`
 console process with an explicit database/config/session path and consume its
 stdout as progress events.
 
+The GUI persists a versioned inventory cache beside the database and validates
+it against both the database and WAL modification times. A stale inventory is
+rebuilt from denormalized chat statistics; only chats explicitly invalidated by
+an importer are rescanned. Structural clustering is reused across ordinary API
+increments and is explicitly invalidated by legacy imports.
+
+The chat viewer is read-only. Conversation pages are limited to 400 rows and
+move using the composite `(chat_id, timestamp_unix, message_id)` index. Sender
+identity aliases are resolved once when a chat opens and reused for subsequent
+page and exact-message navigation. Global and in-chat searches execute on
+background workers against `messages_fts` and report the exact total. Global
+results use a virtual list: a compact ordered row-ID index is retained, while
+only visible 250-row database pages and visible egui rows are materialized;
+nearby pages are fetched automatically during scrolling. Every match remains directly reachable through the scrollbar
+without a “load more” control, even for result sets containing hundreds of
+thousands of rows. In-chat search loads one compact result set with a single
+count and sort. Selecting a match loads a bounded page around that message and
+highlights the matching terms. Outgoing presentation uses stable Telegram sender IDs
+where available and infers legacy sender aliases from linked overlapping
+backups; reply previews may resolve their parent from elsewhere in the local
+database without embedding or duplicating that parent.
+
 The legacy/database boundary is intentional: a filesystem repair cannot
 silently mutate the canonical message store. Database reconciliation is
 explicit. The `database/` commands, direct API exporter, and the explicit
 `media_reorganize.py` maintenance bridge are the only operations that update
 the canonical message store.
+
+## Lossless conversation metadata
+
+The API exporter treats the Telegram TL object as the archival boundary. Each
+message record contains an exact binary TL payload plus a complete JSON form;
+the canonical row keeps both, with the binary hash, Telegram layer, and
+Telethon version. Secondary requests capture every visible reactor and public
+poll voter page. Content-addressed entity snapshots deduplicate message senders
+and the basic/full chat responses, while reference tables connect those
+snapshots to messages, chats, and immutable API-run manifests.
+
+`backup/staging.py` verifies this metadata ledger before staged rows can be
+reused or merged. `db/archive.py` stores it, and `database/importer.py` verifies
+the immutable run records against the current presentation-facing rows. A
+versioned staging key prevents an older partial record from being mistaken for
+a lossless one. These dependencies remain acyclic: record serialization and
+staging do not import the exporter or importer.
+
+The contract is a current API-visible conversation snapshot. Values Telegram
+withholds are represented by explicit `not_exposed` states. Deleted/expired
+pre-capture content, historical edits and membership, secret chats, and
+account/client state are not recoverable from Telegram history. Incremental
+runs preserve this contract for fetched messages; a full rescan is required to
+upgrade legacy rows and refresh mutable metadata on older messages.
 
 ## Media layout
 
