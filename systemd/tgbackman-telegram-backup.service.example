@@ -3,7 +3,11 @@ Description=tgbackman incremental Telegram backup
 
 [Service]
 Type=oneshot
+UMask=0077
 TimeoutStartSec=infinity
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
 WorkingDirectory=%h/Dev/tgbackman
 # Generate a user-specific unit with:
 #   uv run tgbackman-backup install-systemd \

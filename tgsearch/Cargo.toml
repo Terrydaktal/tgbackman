@@ -9,4 +9,13 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 clap = { version = "4.4", features = ["derive"] }
 colored = "2.1"
 chrono = "0.4"
-fuzzy-rank = { path = "../../fuzzy-rank" }
+# Pin the companion library to an immutable revision so clean CI checkouts do
+# not depend on an untracked sibling directory.
+fuzzy-rank = { git = "https://github.com/Terrydaktal/fuzzy-rank.git", rev = "d8288703eb7e9d8c546461332e2df9566315ca8f" }
+
+[profile.release]
+debug = "line-tables-only"
+strip = "none"
+panic = "unwind"
+lto = "thin"
+codegen-units = 1

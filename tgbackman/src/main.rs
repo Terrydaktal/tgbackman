@@ -6,6 +6,7 @@ use eframe::egui;
 mod app;
 mod cache;
 mod database;
+mod diagnostics;
 mod inventory;
 mod matching;
 mod model;
@@ -13,7 +14,9 @@ mod ui;
 mod viewer;
 
 use app::OverlapApp;
-use database::{MESSAGE_SEARCH_PAGE_SIZE, set_chat_ids_blacklisted};
+use database::{
+    MESSAGE_SEARCH_PAGE_SIZE, record_gui_event, record_gui_failure, set_chat_ids_blacklisted,
+};
 use matching::format_unix_to_ts;
 use model::{
     ActiveChatView, CalcMessage, ChatPageRequest, CompareMessage, LoadMessage, MediaCalcMessage,
@@ -48,6 +51,11 @@ impl eframe::App for OverlapApp {
                 Ok(LoadMessage::Finished(groups)) => {
                     self.groups = groups;
                     self.loaded_db_path = self.loading_db_path.take();
+                    diagnostics::write_state(
+                        "ready",
+                        self.loaded_db_path.as_deref(),
+                        self.db_generation,
+                    );
                     self.loading_data = false;
                     self.filtered_groups.clear();
                     self.load_cache();
@@ -57,6 +65,11 @@ impl eframe::App for OverlapApp {
                 }
                 Ok(LoadMessage::Error(err)) => {
                     self.status_msg = err;
+                    diagnostics::write_state(
+                        "load_error",
+                        self.loading_db_path.as_deref(),
+                        self.db_generation,
+                    );
                     self.loading_db_path = None;
                     self.loading_data = false;
                     self.filtered_groups.clear();
@@ -64,6 +77,12 @@ impl eframe::App for OverlapApp {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.status_msg = "Database-load worker stopped unexpectedly; inspect GUI crash/state records.".to_string();
+                    diagnostics::write_state(
+                        "load_worker_disconnected",
+                        self.loading_db_path.as_deref(),
+                        self.db_generation,
+                    );
                     self.loading_data = false;
                     self.loading_db_path = None;
                     self.filtered_groups.clear();
@@ -96,6 +115,14 @@ impl eframe::App for OverlapApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.calculating_overlaps = false;
+                    self.status_msg =
+                        "Overlap worker stopped unexpectedly; inspect GUI crash/state records."
+                            .to_string();
+                    diagnostics::write_state(
+                        "overlap_worker_disconnected",
+                        self.loaded_db_path.as_deref(),
+                        self.db_generation,
+                    );
                     self.rx = None;
                 }
             }
@@ -129,6 +156,14 @@ impl eframe::App for OverlapApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.calculating_media = false;
+                    self.status_msg =
+                        "Media worker stopped unexpectedly; inspect GUI crash/state records."
+                            .to_string();
+                    diagnostics::write_state(
+                        "media_worker_disconnected",
+                        self.loaded_db_path.as_deref(),
+                        self.db_generation,
+                    );
                     self.media_rx = None;
                 }
             }
@@ -155,6 +190,14 @@ impl eframe::App for OverlapApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.loading_comparison = false;
+                    self.status_msg =
+                        "Comparison worker stopped unexpectedly; inspect GUI crash/state records."
+                            .to_string();
+                    diagnostics::write_state(
+                        "comparison_worker_disconnected",
+                        self.loaded_db_path.as_deref(),
+                        self.db_generation,
+                    );
                     self.compare_rx = None;
                 }
             }
@@ -209,6 +252,14 @@ impl eframe::App for OverlapApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.loading_chat_view = false;
+                    self.status_msg =
+                        "Chat worker stopped unexpectedly; inspect GUI crash/state records."
+                            .to_string();
+                    diagnostics::write_state(
+                        "chat_worker_disconnected",
+                        self.loaded_db_path.as_deref(),
+                        self.db_generation,
+                    );
                     self.chat_view_rx = None;
                 }
             }
@@ -272,7 +323,12 @@ impl eframe::App for OverlapApp {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.global_searching = false;
                     self.global_search_error =
-                        Some("Search worker stopped unexpectedly".to_string());
+                        Some("Global-search worker stopped unexpectedly; inspect GUI crash/state records.".to_string());
+                    diagnostics::write_state(
+                        "global_search_worker_disconnected",
+                        self.loaded_db_path.as_deref(),
+                        self.db_generation,
+                    );
                     self.global_search_rx = None;
                 }
             }
@@ -335,8 +391,13 @@ impl eframe::App for OverlapApp {
                         && let Some(chat) = active.as_mut()
                     {
                         chat.searching = false;
-                        chat.search_error = Some("Search worker stopped unexpectedly".to_string());
+                        chat.search_error = Some("Chat-search worker stopped unexpectedly; inspect GUI crash/state records.".to_string());
                     }
+                    diagnostics::write_state(
+                        "chat_search_worker_disconnected",
+                        self.loaded_db_path.as_deref(),
+                        self.db_generation,
+                    );
                     self.chat_search_rx = None;
                 }
             }
@@ -940,10 +1001,22 @@ impl eframe::App for OverlapApp {
                                     self.status_msg = "No mapped Telegram target was found for this chat; refresh mappings before blacklisting it.".to_string();
                                 }
                                 Err(error) => {
+                                    record_gui_failure(
+                                        &active_db_path,
+                                        "chat_blacklist_mutation_failed",
+                                        &chat_ids,
+                                        &error.to_string(),
+                                    );
                                     self.status_msg = format!("Failed to update blacklist: {}", error);
                                 }
                             },
                             Err(error) => {
+                                record_gui_failure(
+                                    &active_db_path,
+                                    "chat_blacklist_mutation_failed",
+                                    &chat_ids,
+                                    &error.to_string(),
+                                );
                                 self.status_msg = format!("Failed to open database: {}", error);
                             }
                         }
@@ -965,6 +1038,12 @@ impl eframe::App for OverlapApp {
                                     rusqlite::params![val, chat_id],
                                 )?;
                             }
+                            record_gui_event(
+                                &tx,
+                                "chat_active_state_changed",
+                                if active { "active" } else { "inactive" },
+                                &chat_ids,
+                            )?;
                             tx.commit()
                         })();
                         match result {
@@ -976,6 +1055,12 @@ impl eframe::App for OverlapApp {
                                 }
                             }
                             Err(error) => {
+                                record_gui_failure(
+                                    &self.active_db_path(),
+                                    "chat_active_state_mutation_failed",
+                                    &chat_ids,
+                                    &error.to_string(),
+                                );
                                 self.status_msg = format!("Failed to update Active state: {error}");
                             }
                         }
@@ -1290,6 +1375,8 @@ impl eframe::App for OverlapApp {
 }
 
 fn main() -> eframe::Result<()> {
+    diagnostics::install_panic_hook();
+    diagnostics::write_state("starting", None, 0);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 750.0])

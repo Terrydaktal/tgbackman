@@ -227,6 +227,7 @@ dependencies = [
 [[package]]
 name = "fuzzy-rank"
 version = "0.1.0"
+source = "git+https://github.com/Terrydaktal/fuzzy-rank.git?rev=d8288703eb7e9d8c546461332e2df9566315ca8f#d8288703eb7e9d8c546461332e2df9566315ca8f"
 dependencies = [
  "smallvec",
 ]

@@ -1032,7 +1032,143 @@ pub(crate) fn ensure_blacklist_schema(conn: &rusqlite::Connection) -> Result<(),
          )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS telegram_backup_diagnostic_events (
+             event_id TEXT PRIMARY KEY,
+             event_unix INTEGER NOT NULL,
+             event_type TEXT NOT NULL,
+             component TEXT NOT NULL,
+             level TEXT NOT NULL DEFAULT 'info',
+             operation_id TEXT,
+             run_key TEXT,
+             target_key TEXT,
+             status TEXT,
+             details_json TEXT NOT NULL,
+             build_revision TEXT NOT NULL,
+             actor TEXT NOT NULL DEFAULT 'local-user',
+             writer_role TEXT NOT NULL DEFAULT 'tgbackman-gui',
+             reason TEXT,
+             outcome TEXT,
+             host_name TEXT NOT NULL DEFAULT '',
+             process_id INTEGER NOT NULL DEFAULT 0,
+             previous_hash TEXT,
+             integrity_sha256 TEXT
+         )",
+        [],
+    )?;
+    for (name, definition) in [
+        ("actor", "TEXT NOT NULL DEFAULT 'local-user'"),
+        ("writer_role", "TEXT NOT NULL DEFAULT 'tgbackman-gui'"),
+        ("reason", "TEXT"),
+        ("outcome", "TEXT"),
+        ("host_name", "TEXT NOT NULL DEFAULT ''"),
+        ("process_id", "INTEGER NOT NULL DEFAULT 0"),
+        ("previous_hash", "TEXT"),
+        ("integrity_sha256", "TEXT"),
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('telegram_backup_diagnostic_events')
+                 WHERE name = ?1
+             )",
+            [name],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE telegram_backup_diagnostic_events ADD COLUMN {name} {definition}"
+                ),
+                [],
+            )?;
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn record_gui_event(
+    conn: &rusqlite::Connection,
+    event_type: &str,
+    status: &str,
+    chat_ids: &[String],
+) -> Result<(), rusqlite::Error> {
+    record_gui_event_with_reason(
+        conn,
+        event_type,
+        status,
+        chat_ids,
+        "user-requested GUI mutation",
+        None,
+    )
+}
+
+pub(crate) fn record_gui_event_with_reason(
+    conn: &rusqlite::Connection,
+    event_type: &str,
+    status: &str,
+    chat_ids: &[String],
+    reason: &str,
+    error: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    ensure_blacklist_schema(conn)?;
+    let now = Utc::now().timestamp();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let event_id = format!("gui-{}-{}", unique, std::process::id());
+    let details = serde_json::json!({
+        "chat_count": chat_ids.len(),
+        "chat_ids": chat_ids.iter().take(1000).collect::<Vec<_>>(),
+        "error": error.map(|value| value.chars().take(512).collect::<String>()),
+    });
+    let actor = std::env::var("TGBACKMAN_ACTOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "local-user".to_string());
+    let host_name = std::env::var("HOSTNAME").unwrap_or_default();
+    conn.execute(
+        "INSERT OR IGNORE INTO telegram_backup_diagnostic_events (
+             event_id, event_unix, event_type, component, level, operation_id,
+             run_key, target_key, status, details_json, build_revision,
+             actor, writer_role, reason, outcome, host_name, process_id
+         ) VALUES (?, ?, ?, 'tgbackman-gui', ?, NULL, NULL, NULL, ?, ?, ?,
+                   ?, 'tgbackman-gui', ?, ?, ?, ?)",
+        rusqlite::params![
+            event_id,
+            now,
+            event_type,
+            if status == "failed" { "error" } else { "info" },
+            status,
+            details.to_string(),
+            option_env!("TGBACKMAN_BUILD_REVISION").unwrap_or("unknown"),
+            actor,
+            reason,
+            status,
+            host_name,
+            std::process::id(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn record_gui_failure(
+    db_path: &str,
+    event_type: &str,
+    chat_ids: &[String],
+    error: &str,
+) {
+    if let Ok(conn) = rusqlite::Connection::open(db_path) {
+        let _ = record_gui_event_with_reason(
+            &conn,
+            event_type,
+            "failed",
+            chat_ids,
+            "GUI mutation failed",
+            Some(error),
+        );
+    }
 }
 
 pub(crate) fn blacklisted_chat_ids(
@@ -1103,6 +1239,16 @@ pub(crate) fn set_chat_ids_blacklisted(
             )?;
         }
     }
+    record_gui_event(
+        &tx,
+        if blacklisted {
+            "chat_blacklisted"
+        } else {
+            "chat_blacklist_removed"
+        },
+        "completed",
+        chat_ids,
+    )?;
     tx.commit()?;
     Ok(affected)
 }
@@ -1916,8 +2062,9 @@ pub(crate) fn run_inventory(
 #[cfg(test)]
 mod reply_tests {
     use super::{
-        load_chat_messages, load_chat_page, load_chat_page_with_aliases,
-        load_search_results_by_rowids, search_message_rowids, search_messages,
+        ensure_blacklist_schema, load_chat_messages, load_chat_page, load_chat_page_with_aliases,
+        load_search_results_by_rowids, record_gui_event_with_reason, search_message_rowids,
+        search_messages,
     };
     use crate::model::ChatPageRequest;
 
@@ -1977,6 +2124,55 @@ mod reply_tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn gui_mutation_events_record_success_and_failure_context() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_blacklist_schema(&conn).unwrap();
+        let chat_ids = vec!["chat-1".to_string()];
+        record_gui_event_with_reason(
+            &conn,
+            "chat_active_state_changed",
+            "active",
+            &chat_ids,
+            "user-requested GUI mutation",
+            None,
+        )
+        .unwrap();
+        record_gui_event_with_reason(
+            &conn,
+            "chat_blacklist_mutation_failed",
+            "failed",
+            &chat_ids,
+            "GUI mutation failed",
+            Some("database busy"),
+        )
+        .unwrap();
+        let row = conn
+            .query_row(
+                "SELECT level, status, outcome, details_json, actor, process_id
+                 FROM telegram_backup_diagnostic_events
+                 WHERE event_type='chat_blacklist_mutation_failed'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "error");
+        assert_eq!(row.1, "failed");
+        assert_eq!(row.2, "failed");
+        assert!(row.3.contains("database busy"));
+        assert!(!row.4.is_empty());
+        assert!(row.5 > 0);
     }
 
     #[test]

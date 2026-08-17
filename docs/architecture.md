@@ -10,6 +10,7 @@ src/tgbackup/
   media_reorganize.py    dry-run/resumable legacy-to-per-chat reflink migration
   models.py              exporter value objects
   errors.py              public exporter exception types
+  diagnostics.py         build identity, bounded events, active snapshots, crash hooks
   progress.py            journal-friendly progress and process locking
   db/
     connection.py        SQLite validation and connection policy
@@ -59,6 +60,13 @@ The GUI does not duplicate exporter logic. It reads the canonical SQLite
 database; a future background-run button should launch the `tgbackman-backup`
 console process with an explicit database/config/session path and consume its
 stdout as progress events.
+
+Diagnostics are intentionally orthogonal to the data path. Export run and
+attempt rows retain typed failure context and the canonical database appends a
+small lifecycle ledger; the optional JSONL sink records operation boundaries.
+The Rust GUI names worker threads, writes a bounded state snapshot, and uses a
+panic hook that preserves build identity. See `docs/debuggability.md` for the
+evidence locations, privacy contract and performance tiers.
 
 The GUI persists a versioned inventory cache beside the database and validates
 it against both the database and WAL modification times. A stale inventory is
@@ -133,10 +141,11 @@ launchers for existing automation; they are not the implementation modules.
 ```bash
 uv sync
 uv run python -m pytest
-cargo test --manifest-path tgbackman/Cargo.toml -- \
+cargo test --locked --manifest-path tgbackman/Cargo.toml -- \
   --skip test_run_inventory_performance \
   --skip test_compute_media_stats_split_and_unofficial
-cargo test --manifest-path tgsearch/Cargo.toml
+cargo test --locked --manifest-path tgsearch/Cargo.toml
+cargo build --locked --release --manifest-path tgbackman/Cargo.toml
 ```
 
 The two skipped GUI tests are intentionally live-database performance tests;

@@ -14,6 +14,7 @@ use crate::database::{
     MESSAGE_SEARCH_PAGE_SIZE, count_search_messages, load_chat_page_with_aliases,
     load_search_results_by_rowids, run_inventory, search_message_page, search_message_rowids,
 };
+use crate::diagnostics;
 use crate::matching::{clean_text_for_match, count_missing_messages, format_unix_to_ts};
 use crate::model::{
     ActiveChatView, ActiveComparison, AlignedMessageRow, BackupMessage, CalcMessage, ChatGroup,
@@ -159,6 +160,16 @@ impl Default for OverlapApp {
         }
     }
 }
+
+impl Drop for OverlapApp {
+    fn drop(&mut self) {
+        diagnostics::write_state(
+            "stopped",
+            self.loaded_db_path.as_deref(),
+            self.db_generation,
+        );
+    }
+}
 impl OverlapApp {
     fn group_cache_key(group: &crate::model::ChatGroup) -> String {
         let mut ids: Vec<&str> = group
@@ -230,7 +241,7 @@ impl OverlapApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.media_rx = Some(rx);
 
-        std::thread::spawn(move || {
+        diagnostics::spawn_named("media-stats", move || {
             let mut all_stats = HashMap::new();
 
             // Collect all backups
@@ -300,7 +311,7 @@ impl OverlapApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
 
-        std::thread::spawn(move || {
+        diagnostics::spawn_named("overlap-calculation", move || {
             let conn = match rusqlite::Connection::open(&db_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -467,10 +478,11 @@ impl OverlapApp {
         let db_path = self.db_path.clone();
         self.loading_db_path = Some(db_path.clone());
         self.db_generation = self.db_generation.wrapping_add(1);
+        diagnostics::write_state("loading_database", Some(&db_path), self.db_generation);
         let (tx, rx) = std::sync::mpsc::channel();
         self.load_rx = Some(rx);
 
-        std::thread::spawn(move || {
+        diagnostics::spawn_named("load-database", move || {
             let _ = tx.send(LoadMessage::Loading("Connecting to SQLite...".to_string()));
             ctx.request_repaint();
 
@@ -691,7 +703,7 @@ impl OverlapApp {
             let (tx, rx) = std::sync::mpsc::channel();
             self.compare_rx = Some(rx);
 
-            std::thread::spawn(move || {
+            diagnostics::spawn_named("comparison-load", move || {
                 let _ = tx.send(CompareMessage::Loading(
                     "Connecting to database...".to_string(),
                 ));
@@ -1007,7 +1019,7 @@ impl OverlapApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.chat_view_rx = Some(rx);
 
-        std::thread::spawn(move || {
+        diagnostics::spawn_named("chat-load", move || {
             let _ = tx.send(SingleChatMessage::Loading(
                 "Fetching a bounded message page from SQLite...".to_string(),
             ));
@@ -1088,7 +1100,7 @@ impl OverlapApp {
         let db_path = self.active_db_path();
         let (tx, rx) = std::sync::mpsc::channel();
         self.global_search_rx = Some(rx);
-        std::thread::spawn(move || {
+        diagnostics::spawn_named("global-search", move || {
             let conn = match open_readonly_database(&db_path) {
                 Ok(conn) => conn,
                 Err(error) => {
@@ -1172,7 +1184,7 @@ impl OverlapApp {
         let db_path = self.active_db_path();
         let (tx, rx) = std::sync::mpsc::channel();
         self.chat_search_rx = Some(rx);
-        std::thread::spawn(move || {
+        diagnostics::spawn_named("chat-search", move || {
             let conn = match open_readonly_database(&db_path) {
                 Ok(conn) => conn,
                 Err(error) => {

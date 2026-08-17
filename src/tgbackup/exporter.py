@@ -64,8 +64,18 @@ from .config import (
     write_credentials,
 )
 from .errors import ExportError
+from .diagnostics import (
+    DiagnosticEvent,
+    DiagnosticRecorder,
+    OperationRegistry,
+    build_identity,
+    exception_details,
+    install_runtime_hooks,
+    snapshot as diagnostics_snapshot,
+)
 from .db import (
     active_chats,
+    append_diagnostic_event,
     ensure_targets_schema as canonical_ensure_targets_schema,
     refresh_chat_statistics as canonical_refresh_chat_statistics,
     upsert_archival_message,
@@ -76,6 +86,7 @@ from .db import (
     row_to_target,
     runnable_targets,
     set_target_blacklisted,
+    verify_diagnostic_event_chain,
 )
 from .db.connection import open_database
 from .models import (
@@ -143,6 +154,7 @@ from .backup.targets import (
 ensure_targets_schema = canonical_ensure_targets_schema
 refresh_chat_statistics = canonical_refresh_chat_statistics
 
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -162,7 +174,9 @@ def upsert_target(*args: Any, **kwargs: Any) -> Target:
     return target_mapping_service.upsert_target(*args, **kwargs)
 
 
-def auto_map_database_chats(*args: Any, **kwargs: Any) -> tuple[int, int, int, list[tuple[DatabaseChat, str]]]:
+def auto_map_database_chats(
+    *args: Any, **kwargs: Any
+) -> tuple[int, int, int, list[tuple[DatabaseChat, str]]]:
     target_mapping_service.entity_description = entity_description
     target_mapping_service.target_key = target_key
     return _auto_map_database_chats(*args, **kwargs)
@@ -510,8 +524,7 @@ async def _reaction_metadata(
     if summary is None:
         return {"status": "not_applicable"}
     expected_summary = sum(
-        int(getattr(result, "count", 0) or 0)
-        for result in (getattr(summary, "results", None) or [])
+        int(getattr(result, "count", 0) or 0) for result in (getattr(summary, "results", None) or [])
     )
     metadata: dict[str, Any] = {
         "status": "complete" if expected_summary == 0 else "pending",
@@ -562,9 +575,7 @@ async def _reaction_metadata(
         page_count = int(getattr(page, "count", fetched) or 0)
         api_count = page_count if api_count is None else api_count
         if progress and (page_count > 100 or getattr(page, "next_offset", None)):
-            progress.phase(
-                f"metadata message {message.id}: reactors {fetched:,}/{page_count:,}"
-            )
+            progress.phase(f"metadata message {message.id}: reactors {fetched:,}/{page_count:,}")
         next_offset = getattr(page, "next_offset", None)
         if not next_offset:
             break
@@ -642,9 +653,7 @@ async def _poll_vote_metadata(
         page_count = int(getattr(page, "count", fetched) or 0)
         api_count = page_count if api_count is None else api_count
         if progress and (page_count > 100 or getattr(page, "next_offset", None)):
-            progress.phase(
-                f"metadata message {message.id}: poll voters {fetched:,}/{page_count:,}"
-            )
+            progress.phase(f"metadata message {message.id}: poll voters {fetched:,}/{page_count:,}")
         next_offset = getattr(page, "next_offset", None)
         if not next_offset:
             break
@@ -670,12 +679,8 @@ async def expanded_message_metadata(
     """Fetch secondary metadata needed to reconstruct all API-visible details."""
     return {
         "schema_version": 1,
-        "reactions": await _reaction_metadata(
-            client, entity, message, request_delay, progress
-        ),
-        "poll_votes": await _poll_vote_metadata(
-            client, entity, message, request_delay, progress
-        ),
+        "reactions": await _reaction_metadata(client, entity, message, request_delay, progress),
+        "poll_votes": await _poll_vote_metadata(client, entity, message, request_delay, progress),
     }
 
 
@@ -709,12 +714,8 @@ async def full_chat_metadata(
     )
     envelope = tl_object_envelope(response, require_binary=True)
     if envelope is None:
-        raise ExportError(
-            f"Telegram returned no serializable full metadata for {target.source_name}"
-        )
-    full_object = getattr(response, "full_user", None) or getattr(
-        response, "full_chat", None
-    )
+        raise ExportError(f"Telegram returned no serializable full metadata for {target.source_name}")
+    full_object = getattr(response, "full_user", None) or getattr(response, "full_chat", None)
     full_peer_id = getattr(full_object, "id", None)
     if full_peer_id is None or abs(int(full_peer_id)) != abs(int(target.peer_id)):
         raise ExportError(
@@ -782,9 +783,7 @@ async def iter_message_records(
             query_min_id = baseline_id
         if resume_after_id is not None:
             query_min_id = max(query_min_id, int(resume_after_id))
-        iterator = client.iter_messages(
-            entity, min_id=query_min_id, reverse=True, wait_time=request_delay
-        )
+        iterator = client.iter_messages(entity, min_id=query_min_id, reverse=True, wait_time=request_delay)
         async for message in iterator:
             message_id = int(message.id)
             if resume_after_id is not None and message_id <= int(resume_after_id):
@@ -799,7 +798,8 @@ async def iter_message_records(
                     or (
                         cutoff
                         and getattr(message, "date", None) is not None
-                        and int(message.date.replace(tzinfo=message.date.tzinfo or timezone.utc).timestamp()) >= cutoff
+                        and int(message.date.replace(tzinfo=message.date.tzinfo or timezone.utc).timestamp())
+                        >= cutoff
                     )
                 )
             )
@@ -920,7 +920,9 @@ async def write_export_stream(
     stats = ExportStats()
     result_path = staging_dir / "result.json"
     with result_path.open("w", encoding="utf-8") as handle:
-        handle.write('{\n  "chats": {\n    "about": "Incremental export created by tgbackman Telegram API exporter",\n    "list": [{\n')
+        handle.write(
+            '{\n  "chats": {\n    "about": "Incremental export created by tgbackman Telegram API exporter",\n    "list": [{\n'
+        )
         handle.write(f'      "id": {json.dumps(target.chat_id)},\n')
         handle.write(f'      "name": {json.dumps(target.title, ensure_ascii=False)},\n')
         handle.write(
@@ -962,9 +964,7 @@ async def write_export_stream(
         "media_errors": stats.media_errors,
     }
     metadata_path = staging_dir / ".backman_export_meta.json"
-    metadata_path.write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    metadata_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     with contextlib.suppress(OSError):
         metadata_path.chmod(0o600)
     with contextlib.suppress(FileNotFoundError):
@@ -991,29 +991,78 @@ async def write_database_stream(
     activate_chat: bool = True,
     chat_entity_snapshot: Optional[dict[str, Any]] = None,
     chat_full_snapshot: Optional[dict[str, Any]] = None,
+    operation_id: Optional[str] = None,
+    operation_registry: Optional[OperationRegistry] = None,
 ) -> ExportStats:
     """Stage a resumable fetch, then atomically merge messages and watermark."""
     target_dir.mkdir(parents=True, exist_ok=True)
     attempt_key = hashlib.sha256(f"{run_key}\0{time.time_ns()}".encode("utf-8")).hexdigest()
+    identity = build_identity()
+    started_unix = unix_now()
     conn.execute(
-        f"INSERT INTO {RUN_ATTEMPTS_TABLE}(attempt_key, run_key, started_unix, status) VALUES (?, ?, ?, 'running')",
-        (attempt_key, run_key, unix_now()),
+        f"""INSERT INTO {RUN_ATTEMPTS_TABLE}(
+                attempt_key, run_key, started_unix, heartbeat_unix, status,
+                build_revision, operation_id
+            ) VALUES (?, ?, ?, ?, 'running', ?, ?)""",
+        (attempt_key, run_key, started_unix, started_unix, identity.get("revision"), operation_id),
     )
     conn.execute(
         f"""INSERT INTO {RUNS_TABLE}(
                 run_key, target_key, chat_id, baseline_message_id, baseline_unix,
-                full_rescan, status, started_unix
-            ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
-            ON CONFLICT(run_key) DO UPDATE SET status='running', error=NULL""",
+                full_rescan, status, started_unix, heartbeat_unix, build_revision, operation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
+            ON CONFLICT(run_key) DO UPDATE SET status='running', error=NULL,
+                error_type=NULL, error_phase=NULL, error_traceback=NULL,
+                diagnostic_json=NULL, build_revision=excluded.build_revision,
+                operation_id=excluded.operation_id, heartbeat_unix=excluded.heartbeat_unix,
+                purged_unix=NULL, purge_key=NULL""",
         (
-            run_key, target.target_key, target.chat_id, baseline_id, baseline_unix,
-            int(full_rescan), unix_now(),
+            run_key,
+            target.target_key,
+            target.chat_id,
+            baseline_id,
+            baseline_unix,
+            int(full_rescan),
+            started_unix,
+            started_unix,
+            identity.get("revision"),
+            operation_id,
         ),
     )
-    conn.commit()
     staged_since_commit = 0
+    staged_total = 0
     merging = False
+
+    def heartbeat(status: Optional[str] = None) -> None:
+        """Persist a lease heartbeat after a durable staging boundary."""
+        heartbeat_unix = unix_now()
+        conn.execute(
+            f"UPDATE {RUN_ATTEMPTS_TABLE} SET heartbeat_unix=? WHERE attempt_key=? AND status='running'",
+            (heartbeat_unix, attempt_key),
+        )
+        conn.execute(
+            f"UPDATE {RUNS_TABLE} SET heartbeat_unix=? WHERE run_key=? AND status='running'",
+            (heartbeat_unix, run_key),
+        )
+        if status is not None and operation_registry is not None:
+            operation_registry.update(status, staged_messages=staged_total)
+
     try:
+        append_diagnostic_event(
+            conn,
+            event_id=f"{attempt_key}:started",
+            event_type="backup_attempt_started",
+            component="exporter",
+            level="info",
+            operation_id=operation_id,
+            run_key=run_key,
+            target_key=target.target_key,
+            status="running",
+            details_json=json.dumps({"baseline_id": baseline_id, "full_rescan": full_rescan}, sort_keys=True),
+            build_revision=str(identity.get("revision", "unknown")),
+            event_unix=unix_now(),
+        )
+        conn.commit()
         async for record, error in records:
             conn.execute(
                 f"""INSERT INTO {RUN_MESSAGES_TABLE}(run_key, message_id, record_json, media_error)
@@ -1027,12 +1076,17 @@ async def write_database_stream(
                 ),
             )
             staged_since_commit += 1
+            staged_total += 1
             if staged_since_commit >= 250:
                 conn.commit()
                 staged_since_commit = 0
+                heartbeat("running")
+                conn.commit()
         conn.commit()
         if progress:
             progress.phase("fetch complete; verifying staged records and media")
+        heartbeat("verifying")
+        conn.commit()
 
         stats = ExportStats()
         digest = hashlib.sha256()
@@ -1055,13 +1109,9 @@ async def write_database_stream(
 
         if stats.message_count == 0 and not full_rescan:
             if chat_entity_snapshot is not None:
-                upsert_chat_entity_snapshot(
-                    conn, target.chat_id, chat_entity_snapshot, None, role="entity"
-                )
+                upsert_chat_entity_snapshot(conn, target.chat_id, chat_entity_snapshot, None, role="entity")
             if chat_full_snapshot is not None:
-                upsert_chat_entity_snapshot(
-                    conn, target.chat_id, chat_full_snapshot, None, role="full"
-                )
+                upsert_chat_entity_snapshot(conn, target.chat_id, chat_full_snapshot, None, role="full")
             record_chat_backup_run(conn, target, "completed_no_new_messages")
             conn.execute(
                 f"UPDATE {RUNS_TABLE} SET status='completed', completed_unix=? WHERE run_key=?",
@@ -1072,12 +1122,24 @@ async def write_database_stream(
                 (unix_now(), attempt_key),
             )
             prune_completed_staging(conn, run_key=run_key, commit=False)
+            append_diagnostic_event(
+                conn,
+                event_id=f"{attempt_key}:completed",
+                event_type="backup_attempt_completed",
+                component="exporter",
+                level="info",
+                operation_id=operation_id,
+                run_key=run_key,
+                target_key=target.target_key,
+                status="completed_no_new_messages",
+                details_json=json.dumps({"message_count": 0}, sort_keys=True),
+                build_revision=str(identity.get("revision", "unknown")),
+                event_unix=unix_now(),
+            )
             conn.commit()
             return stats
 
-        if run_metadata_schema_version >= 2 and (
-            chat_entity_snapshot is None or chat_full_snapshot is None
-        ):
+        if run_metadata_schema_version >= 2 and (chat_entity_snapshot is None or chat_full_snapshot is None):
             raise ExportError(
                 f"lossless Telegram metadata for {target.source_name} has no complete chat snapshot"
             )
@@ -1085,15 +1147,9 @@ async def write_database_stream(
         records_sha256 = digest.hexdigest()
         chat_snapshot_hashes = {
             "entity": (
-                str(chat_entity_snapshot["snapshot_sha256"])
-                if chat_entity_snapshot is not None
-                else None
+                str(chat_entity_snapshot["snapshot_sha256"]) if chat_entity_snapshot is not None else None
             ),
-            "full": (
-                str(chat_full_snapshot["snapshot_sha256"])
-                if chat_full_snapshot is not None
-                else None
-            ),
+            "full": (str(chat_full_snapshot["snapshot_sha256"]) if chat_full_snapshot is not None else None),
         }
         source_key = hashlib.sha256(
             (
@@ -1112,11 +1168,10 @@ async def write_database_stream(
                 "message_count": stats.message_count,
                 "metadata_schema_version": run_metadata_schema_version,
                 "chat_metadata_schema_version": (
-                    1
-                    if chat_entity_snapshot is not None and chat_full_snapshot is not None
-                    else 0
+                    1 if chat_entity_snapshot is not None and chat_full_snapshot is not None else 0
                 ),
                 "chat_snapshot_sha256": chat_snapshot_hashes,
+                "build": build_identity(),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1125,6 +1180,8 @@ async def write_database_stream(
         now = unix_now()
         if progress:
             progress.phase("verification complete; committing messages and watermark atomically")
+        heartbeat("committing")
+        conn.commit()
         merging = True
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
@@ -1135,8 +1192,13 @@ async def write_database_stream(
                ) VALUES (?, 'telegram_api', ?, ?, ?, ?, 'zlib', ?, ?, ?)
                ON CONFLICT(source_key) DO UPDATE SET imported_unix=excluded.imported_unix""",
             (
-                source_key, f"telegram://{target.peer_kind}/{target.peer_id}/{run_key}",
-                records_sha256, len(manifest), len(payload), sqlite3.Binary(payload), now,
+                source_key,
+                f"telegram://{target.peer_kind}/{target.peer_id}/{run_key}",
+                records_sha256,
+                len(manifest),
+                len(payload),
+                sqlite3.Binary(payload),
+                now,
                 stats.message_count,
             ),
         )
@@ -1150,8 +1212,12 @@ async def write_database_stream(
                    imported_messages=excluded.imported_messages,
                    completed_unix=excluded.completed_unix""",
             (
-                source_key, f"telegram://{target.peer_kind}/{target.peer_id}/{run_key}",
-                target.chat_id, stats.message_count, stats.message_count, now,
+                source_key,
+                f"telegram://{target.peer_kind}/{target.peer_id}/{run_key}",
+                target.chat_id,
+                stats.message_count,
+                stats.message_count,
+                now,
             ),
         )
         conn.execute(
@@ -1164,8 +1230,12 @@ async def write_database_stream(
                    imported_messages=excluded.imported_messages,
                    completed_unix=excluded.completed_unix""",
             (
-                source_key, f"telegram://{target.peer_kind}/{target.peer_id}/{run_key}",
-                target.chat_id, stats.message_count, stats.message_count, now,
+                source_key,
+                f"telegram://{target.peer_kind}/{target.peer_id}/{run_key}",
+                target.chat_id,
+                stats.message_count,
+                stats.message_count,
+                now,
             ),
         )
         register_chat_backup(
@@ -1203,8 +1273,12 @@ async def write_database_stream(
                 (run_key, int(row["message_id"]), str(row["record_json"]), row["media_error"]),
             )
             upsert_archival_message(
-                conn, target.chat_id, json.loads(str(row["record_json"])),
-                str(target_dir), source_key, "telegram_api",
+                conn,
+                target.chat_id,
+                json.loads(str(row["record_json"])),
+                str(target_dir),
+                source_key,
+                "telegram_api",
             )
         if full_rescan:
             # Preserve previously archived rows, but record messages no longer
@@ -1230,20 +1304,31 @@ async def write_database_stream(
                    indexed_unix=excluded.indexed_unix,
                    applied_unix=excluded.applied_unix""",
             (
-                run_key, target.target_key, target.source_name, target.chat_id,
-                f"sqlite:{run_key}", stats.message_count, stats.first_message_id,
-                stats.last_message_id, stats.first_message_unix, stats.last_message_unix,
-                now, now, now,
+                run_key,
+                target.target_key,
+                target.source_name,
+                target.chat_id,
+                f"sqlite:{run_key}",
+                stats.message_count,
+                stats.first_message_id,
+                stats.last_message_id,
+                stats.first_message_unix,
+                stats.last_message_unix,
+                now,
+                now,
+                now,
             ),
         )
         new_watermark_id = (
-            (stats.last_message_id if full_rescan else max(target.last_message_id or 0, stats.last_message_id or 0))
-            or None
-        )
+            stats.last_message_id
+            if full_rescan
+            else max(target.last_message_id or 0, stats.last_message_id or 0)
+        ) or None
         new_watermark_unix = (
-            (stats.last_message_unix if full_rescan else max(target.last_message_unix or 0, stats.last_message_unix or 0))
-            or None
-        )
+            stats.last_message_unix
+            if full_rescan
+            else max(target.last_message_unix or 0, stats.last_message_unix or 0)
+        ) or None
         conn.execute(
             f"""UPDATE {TARGETS_TABLE} SET
                    last_message_id=?, last_message_unix=?, last_export_unix=?, updated_unix=?
@@ -1251,7 +1336,9 @@ async def write_database_stream(
             (
                 new_watermark_id,
                 new_watermark_unix,
-                now, now, target.target_key,
+                now,
+                now,
+                target.target_key,
             ),
         )
         conn.execute(
@@ -1263,24 +1350,67 @@ async def write_database_stream(
             (now, attempt_key),
         )
         prune_completed_staging(conn, run_key=run_key, commit=False)
+        append_diagnostic_event(
+            conn,
+            event_id=f"{attempt_key}:completed",
+            event_type="backup_attempt_completed",
+            component="exporter",
+            level="info",
+            operation_id=operation_id,
+            run_key=run_key,
+            target_key=target.target_key,
+            status="completed",
+            details_json=json.dumps(
+                {"message_count": stats.message_count, "media_count": stats.media_count}, sort_keys=True
+            ),
+            build_revision=str(identity.get("revision", "unknown")),
+            event_unix=now,
+        )
         conn.commit()
         return stats
-    except Exception as exc:
+    except BaseException as exc:
         if merging:
             conn.rollback()
         else:
             # Fetch-stage rows are safe resume data and must survive a network,
             # media, or process-level failure before the canonical merge starts.
             conn.commit()
+        phase = "database-merge" if merging else "fetch-or-verify"
+        details = exception_details(exc, phase=phase, fields={"run_key": run_key, "attempt_key": attempt_key})
+        details_json = json.dumps(details, ensure_ascii=False, sort_keys=True)
         conn.execute(
-            f"UPDATE {RUNS_TABLE} SET status='failed', error=? WHERE run_key=?",
-            (str(exc), run_key),
+            f"""UPDATE {RUNS_TABLE} SET status='failed', error=?, error_type=?,
+                       error_phase=?, error_traceback=?, diagnostic_json=? WHERE run_key=?""",
+            (str(exc), type(exc).__name__, phase, details["traceback"], details_json, run_key),
         )
         conn.execute(
-            f"UPDATE {RUN_ATTEMPTS_TABLE} SET status='failed', completed_unix=?, error=? WHERE attempt_key=?",
-            (unix_now(), str(exc), attempt_key),
+            f"""UPDATE {RUN_ATTEMPTS_TABLE} SET status='failed', completed_unix=?, error=?,
+                       error_type=?, error_phase=?, error_traceback=?, diagnostic_json=? WHERE attempt_key=?""",
+            (
+                unix_now(),
+                str(exc),
+                type(exc).__name__,
+                phase,
+                details["traceback"],
+                details_json,
+                attempt_key,
+            ),
         )
         record_chat_backup_run(conn, target, "failed")
+        append_diagnostic_event(
+            conn,
+            event_id=f"{attempt_key}:failed",
+            event_type="backup_attempt_failed",
+            component="exporter",
+            level="error",
+            operation_id=operation_id,
+            run_key=run_key,
+            target_key=target.target_key,
+            status="failed",
+            details_json=details_json,
+            build_revision=str(identity.get("revision", "unknown")),
+            event_unix=unix_now(),
+        )
         conn.commit()
         raise
 
@@ -1416,6 +1546,76 @@ def register_chat_backup(
         conn.commit()
 
 
+def reap_stale_attempts_command(args: argparse.Namespace) -> int:
+    """Mark abandoned attempts failed after a conservative lease interval."""
+    if args.older_than <= 0:
+        raise ExportError("--older-than must be greater than zero")
+    db_path = Path(args.db).expanduser().resolve()
+    lock = ExportLock(db_path.parent / f".{db_path.name}.tgbackman.lock")
+    lock.acquire()
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = open_db(db_path)
+        cutoff = unix_now() - int(args.older_than)
+        details = json.dumps(
+            {
+                "schema": 1,
+                "phase": "stale-attempt-reaper",
+                "exception_type": "StaleAttempt",
+                "message": f"attempt had no heartbeat for {args.older_than} seconds",
+                "build": build_identity(),
+            },
+            sort_keys=True,
+        )
+        rows = conn.execute(
+            f"""SELECT attempt_key, run_key FROM {RUN_ATTEMPTS_TABLE}
+                WHERE status='running' AND COALESCE(heartbeat_unix, started_unix) < ?""",
+            (cutoff,),
+        ).fetchall()
+        if not rows:
+            print("No stale running attempts found.")
+            return 0
+        now = unix_now()
+        for row in rows:
+            conn.execute(
+                f"""UPDATE {RUN_ATTEMPTS_TABLE} SET status='failed', completed_unix=?,
+                           error=?, error_type='StaleAttempt', error_phase='stale-attempt-reaper',
+                           diagnostic_json=? WHERE attempt_key=? AND status='running'""",
+                (now, "attempt expired without a heartbeat", details, row["attempt_key"]),
+            )
+            conn.execute(
+                f"""UPDATE {RUNS_TABLE} SET status='failed', completed_unix=?,
+                           error=?, error_type='StaleAttempt', error_phase='stale-attempt-reaper',
+                           diagnostic_json=? WHERE run_key=? AND status='running'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM {RUN_ATTEMPTS_TABLE}
+                               WHERE run_key=? AND status='running'
+                           )""",
+                (now, "attempt expired without a heartbeat", details, row["run_key"], row["run_key"]),
+            )
+            append_diagnostic_event(
+                conn,
+                event_id=f"{row['attempt_key']}:stale",
+                event_type="backup_attempt_reaped",
+                component="exporter",
+                level="warning",
+                operation_id=None,
+                run_key=row["run_key"],
+                target_key=None,
+                status="failed",
+                details_json=details,
+                build_revision=str(build_identity().get("revision", "unknown")),
+                event_unix=now,
+            )
+        conn.commit()
+        print(f"Marked {len(rows):,} stale attempt(s) as failed.")
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
+        lock.release()
+
+
 def print_targets(conn: sqlite3.Connection) -> None:
     targets = load_targets(conn)
     if not targets:
@@ -1435,9 +1635,12 @@ def print_targets(conn: sqlite3.Connection) -> None:
     }
     for target in targets:
         status = (
-            "blacklist" if target.target_key in blocked_keys
-            else "disabled" if not target.enabled
-            else "active" if target.target_key in active_keys
+            "blacklist"
+            if target.target_key in blocked_keys
+            else "disabled"
+            if not target.enabled
+            else "active"
+            if target.target_key in active_keys
             else "inactive"
         )
         watermark = target.last_message_id if target.last_message_id is not None else "none"
@@ -1524,10 +1727,7 @@ def _original_asset_max_mtime(path: Path, conversion_unix: int) -> tuple[Optiona
         walker = os.walk(path, followlinks=False)
         for directory, dirnames, filenames in walker:
             base = Path(directory)
-            dirnames[:] = [
-                name for name in dirnames
-                if not (base / name).is_symlink()
-            ]
+            dirnames[:] = [name for name in dirnames if not (base / name).is_symlink()]
             for filename in filenames:
                 if filename == ".backman_export_meta.json" or re.fullmatch(
                     r"messages\d*\.html", filename, flags=re.IGNORECASE
@@ -1628,9 +1828,9 @@ def calculate_backup_date_repairs(
             source = "telegram_api_nonempty_commit"
             confidence = "high"
             evidence = "Latest committed API run containing one or more processed messages"
-        elif (
-            int(row["msg_count"] or 0) == 0 and chat_id in mapped_target_chat_ids
-        ) or (path is not None and (path / ".tgbackman_target.json").is_file()):
+        elif (int(row["msg_count"] or 0) == 0 and chat_id in mapped_target_chat_ids) or (
+            path is not None and (path / ".tgbackman_target.json").is_file()
+        ):
             source = "telegram_api_no_content_commit"
             confidence = "exact"
             evidence = "Mapped API target has zero archived messages and no non-empty committed run"
@@ -1663,9 +1863,7 @@ def calculate_backup_date_repairs(
                     if candidate.is_file() and not candidate.is_symlink():
                         candidates.append((candidate, "legacy_html_mtime", "medium"))
             if candidates:
-                selected, source, confidence = max(
-                    candidates, key=lambda item: item[0].stat().st_mtime
-                )
+                selected, source, confidence = max(candidates, key=lambda item: item[0].stat().st_mtime)
                 timestamp = int(selected.stat().st_mtime)
                 evidence = str(selected)
             elif path.is_dir():
@@ -1688,9 +1886,7 @@ def calculate_backup_date_repairs(
             source = "timestamp_predates_messages"
             confidence = "unknown"
 
-        decisions.append(
-            BackupDateDecision(chat_id, timestamp, source, confidence, evidence)
-        )
+        decisions.append(BackupDateDecision(chat_id, timestamp, source, confidence, evidence))
     return decisions
 
 
@@ -1716,10 +1912,10 @@ def repair_backup_dates_command(args: argparse.Namespace) -> int:
             )
         }
         changed = [
-            decision for decision in decisions
-            if existing.get(decision.chat_id) != (
-                decision.timestamp, decision.source, decision.confidence, decision.evidence
-            )
+            decision
+            for decision in decisions
+            if existing.get(decision.chat_id)
+            != (decision.timestamp, decision.source, decision.confidence, decision.evidence)
         ]
         counts: dict[str, int] = {}
         for decision in decisions:
@@ -1727,16 +1923,14 @@ def repair_backup_dates_command(args: argparse.Namespace) -> int:
             if args.list_all:
                 value = (
                     datetime.fromtimestamp(decision.timestamp, timezone.utc).isoformat()
-                    if decision.timestamp is not None else "unknown"
+                    if decision.timestamp is not None
+                    else "unknown"
                 )
                 print(
                     f"{decision.chat_id}: {value} [{decision.confidence}; {decision.source}] "
                     f"{decision.evidence}"
                 )
-        print(
-            f"Backup-date repair: {len(decisions):,} chat row(s) evaluated; "
-            f"{len(changed):,} would change."
-        )
+        print(f"Backup-date repair: {len(decisions):,} chat row(s) evaluated; {len(changed):,} would change.")
         print("Evidence summary: " + ", ".join(f"{key}={value:,}" for key, value in sorted(counts.items())))
         if args.dry_run:
             print("Dry run only; no cached backup dates were changed.")
@@ -1869,8 +2063,7 @@ def matching_target_marker(path: Path, target: Target, chat_ids: set[str]) -> bo
     except (OSError, ValueError, TypeError):
         return False
     return (
-        str(payload.get("target_key", "")) == target.target_key
-        or str(payload.get("chat_id", "")) in chat_ids
+        str(payload.get("target_key", "")) == target.target_key or str(payload.get("chat_id", "")) in chat_ids
     )
 
 
@@ -1969,18 +2162,33 @@ def plan_chat_purge(
         chat_ids,
     ).fetchall()
     chat_names = sorted({str(row["chat_name"] or row["chat_id"]) for row in chat_rows})
-    bases = {str(row["chat_id"]): str(row["backup_path"]) if row["backup_path"] else None for row in chat_rows}
+    bases = {
+        str(row["chat_id"]): str(row["backup_path"]) if row["backup_path"] else None for row in chat_rows
+    }
     message_count = int(
         conn.execute(
-            f"SELECT count(*) FROM messages WHERE chat_id IN ({placeholders}) AND COALESCE(is_deleted, 0)=0", chat_ids
+            f"SELECT count(*) FROM messages WHERE chat_id IN ({placeholders}) AND COALESCE(is_deleted, 0)=0",
+            chat_ids,
         ).fetchone()[0]
     )
     exclusive_sources, retained_sources, raw_source_paths = archival_source_scope(conn, chat_ids)
 
     if not delete_media:
         return PurgePlan(
-            target, chat_ids, chat_names, message_count, backup_root, [], [], [], [], [],
-            exclusive_sources, retained_sources, raw_source_paths, 0,
+            target,
+            chat_ids,
+            chat_names,
+            message_count,
+            backup_root,
+            [],
+            [],
+            [],
+            [],
+            [],
+            exclusive_sources,
+            retained_sources,
+            raw_source_paths,
+            0,
         )
     if backup_root is None:
         raise ExportError(
@@ -2032,7 +2240,8 @@ def plan_chat_purge(
             continue
         directories.add(path)
     directories = {
-        path for path in directories
+        path
+        for path in directories
         if not any(path != other and path_within(path, other) for other in directories)
     }
 
@@ -2074,15 +2283,15 @@ def plan_chat_purge(
                         owned_files.add(primary)
 
     files_outside_directories = {
-        path for path in owned_files
-        if not any(path_within(path, directory) for directory in directories)
+        path for path in owned_files if not any(path_within(path, directory) for directory in directories)
     }
     bytes_to_delete = sum(path.stat().st_size for path in files_outside_directories)
     for directory in directories:
         _, _, directory_bytes = scan_directory_without_links(directory, backup_root)
         bytes_to_delete += directory_bytes
     raw_source_paths = [
-        value for value in raw_source_paths
+        value
+        for value in raw_source_paths
         if not any(
             path_within(Path(os.path.abspath(Path(value).expanduser())), directory)
             for directory in directories
@@ -2170,8 +2379,13 @@ def delete_planned_media(plan: PurgePlan) -> None:
 
 def delete_manifest_media(manifest: dict[str, Any], backup_root: Path) -> None:
     """Finish a previously committed purge without touching database rows."""
-    files = [Path(os.path.abspath(Path(str(value)).expanduser())) for value in manifest.get("media_files", [])]
-    directories = [Path(os.path.abspath(Path(str(value)).expanduser())) for value in manifest.get("media_directories", [])]
+    files = [
+        Path(os.path.abspath(Path(str(value)).expanduser())) for value in manifest.get("media_files", [])
+    ]
+    directories = [
+        Path(os.path.abspath(Path(str(value)).expanduser()))
+        for value in manifest.get("media_directories", [])
+    ]
     for path in [*files, *directories]:
         if not path_within(path, backup_root) or path == backup_root:
             raise ExportError(f"purge recovery path is outside backup root: {path}")
@@ -2235,13 +2449,22 @@ def delete_purge_database_rows(
                 f"DELETE FROM {RUN_ARCHIVE_TABLE} WHERE run_key IN ({run_placeholders})",
                 run_keys,
             )
+            # Keep the run/attempt ledger as durable provenance.  Message
+            # payloads and staging rows are removed above, but retaining the
+            # lifecycle rows makes it possible to explain when and why the
+            # chat was exported before it was purged.  Do not rewrite the
+            # original status, completion time, or error: purge is a separate
+            # mutation and must not falsify the export's outcome.
+            purged_unix = unix_now()
             conn.execute(
-                f"DELETE FROM {RUN_ATTEMPTS_TABLE} WHERE run_key IN ({run_placeholders})",
-                run_keys,
+                f"UPDATE {RUN_ATTEMPTS_TABLE} SET purged_unix=?, purge_key=? "
+                f"WHERE run_key IN ({run_placeholders})",
+                (purged_unix, purge_key_value, *run_keys),
             )
             conn.execute(
-                f"DELETE FROM {RUNS_TABLE} WHERE run_key IN ({run_placeholders})",
-                run_keys,
+                f"UPDATE {RUNS_TABLE} SET purged_unix=?, purge_key=? "
+                f"WHERE run_key IN ({run_placeholders})",
+                (purged_unix, purge_key_value, *run_keys),
             )
         conn.execute(
             f"DELETE FROM message_sources WHERE chat_id IN ({chat_placeholders})",
@@ -2316,6 +2539,34 @@ def delete_purge_database_rows(
                 WHERE target_key=?""",
             (unix_now(), plan.target.target_key),
         )
+        append_diagnostic_event(
+            conn,
+            event_id=f"{purge_key_value}:database-committed",
+            event_type=("chat_purge_database_committed" if delete_media else "chat_purge_completed"),
+            component="exporter",
+            level="warning",
+            operation_id=None,
+            run_key=None,
+            target_key=plan.target.target_key,
+            status=("database_committed" if delete_media else "completed"),
+            details_json=json.dumps(
+                {
+                    "chat_ids": plan.chat_ids,
+                    "run_keys": run_keys,
+                    "delete_media": delete_media,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            build_revision=str(build_identity().get("revision", "unknown")),
+            event_unix=unix_now(),
+            reason="explicit user-confirmed chat purge",
+            outcome=(
+                "database rows removed; media deletion pending"
+                if delete_media
+                else "database rows and selected media removed"
+            ),
+        )
         # Keep a blacklisted purge visible as an inert zero-message row in the
         # viewer. Disabled targets without a blacklist rule remain absent.
         materialize_unbacked_target_chats(conn)
@@ -2344,9 +2595,7 @@ def purge_chat_command(args: argparse.Namespace) -> int:
         conn = open_db(db_path)
         target = purge_target(conn, args.target)
         if args.confirm and args.confirm != target.target_key:
-            raise ExportError(
-                f"Confirmation mismatch: expected --confirm {target.target_key}"
-            )
+            raise ExportError(f"Confirmation mismatch: expected --confirm {target.target_key}")
         backup_root = infer_purge_backup_root(target, args.backup_root) if args.delete_media else None
         if not args.dry_run:
             # Freeze retained-message/media ownership while the destructive plan
@@ -2384,6 +2633,22 @@ def purge_chat_command(args: argparse.Namespace) -> int:
                     f"UPDATE {PURGES_TABLE} SET status='media-incomplete', error=? WHERE purge_key=?",
                     (str(exc), purge_key_value),
                 )
+                append_diagnostic_event(
+                    conn,
+                    event_id=f"{purge_key_value}:media-failed",
+                    event_type="chat_purge_media_failed",
+                    component="exporter",
+                    level="error",
+                    operation_id=None,
+                    run_key=None,
+                    target_key=target.target_key,
+                    status="media-incomplete",
+                    details_json=json.dumps({"error": str(exc)}, ensure_ascii=False, sort_keys=True),
+                    build_revision=str(build_identity().get("revision", "unknown")),
+                    event_unix=unix_now(),
+                    reason="media deletion failed after database purge",
+                    outcome="database purge retained; recovery manifest available",
+                )
                 conn.commit()
                 raise ExportError(
                     f"Database purge committed, but media deletion stopped: {exc}. "
@@ -2393,14 +2658,33 @@ def purge_chat_command(args: argparse.Namespace) -> int:
                 f"UPDATE {PURGES_TABLE} SET status='completed', completed_unix=?, error=NULL WHERE purge_key=?",
                 (unix_now(), purge_key_value),
             )
+            append_diagnostic_event(
+                conn,
+                event_id=f"{purge_key_value}:completed",
+                event_type="chat_purge_completed",
+                component="exporter",
+                level="warning",
+                operation_id=None,
+                run_key=None,
+                target_key=target.target_key,
+                status="completed",
+                details_json=json.dumps({"delete_media": True}, sort_keys=True),
+                build_revision=str(build_identity().get("revision", "unknown")),
+                event_unix=unix_now(),
+                reason="media deletion completed after database purge",
+                outcome="database rows and selected media removed",
+            )
             conn.commit()
         print(
             f"Purged {plan.message_count:,} message(s) for {target.title}; "
             f"target {target.target_key} is disabled. Purge ledger: {purge_key_value}"
         )
         if (
-            plan.shared_media or plan.missing_media or plan.unsafe_media
-            or plan.retained_source_keys or plan.retained_source_paths
+            plan.shared_media
+            or plan.missing_media
+            or plan.unsafe_media
+            or plan.retained_source_keys
+            or plan.retained_source_paths
         ):
             print(
                 "Warning: shared, missing, unsafe, or raw archive items listed above were retained; "
@@ -2504,8 +2788,7 @@ def doctor_offline(args: argparse.Namespace) -> int:
         if missing:
             problems += len(missing)
             print(
-                "unmapped active chats: "
-                + ", ".join(f"{chat.name} [{chat.chat_id}]" for chat in missing),
+                "unmapped active chats: " + ", ".join(f"{chat.name} [{chat.chat_id}]" for chat in missing),
                 file=sys.stderr,
             )
         output = Path(args.output).expanduser()
@@ -2617,7 +2900,9 @@ def verify_exports(args: argparse.Namespace) -> int:
                             candidate.relative_to(path.parent.resolve())
                         except ValueError:
                             problems += 1
-                            print(f"verify: media path escapes export: {path} -> {media_path}", file=sys.stderr)
+                            print(
+                                f"verify: media path escapes export: {path} -> {media_path}", file=sys.stderr
+                            )
                         else:
                             if not candidate.is_file() or candidate.stat().st_size == 0:
                                 problems += 1
@@ -2643,11 +2928,17 @@ def verify_exports(args: argparse.Namespace) -> int:
                                         actual_hash = sha256_file(candidate)
                                     except OSError as exc:
                                         problems += 1
-                                        print(f"verify: could not hash media {candidate}: {exc}", file=sys.stderr)
+                                        print(
+                                            f"verify: could not hash media {candidate}: {exc}",
+                                            file=sys.stderr,
+                                        )
                                     else:
                                         if actual_hash != str(expected_hash):
                                             problems += 1
-                                            print(f"verify: media hash mismatch: {path} -> {media_path}", file=sys.stderr)
+                                            print(
+                                                f"verify: media hash mismatch: {path} -> {media_path}",
+                                                file=sys.stderr,
+                                            )
                     elif row.get("media_skipped"):
                         skipped += 1
                         if not args.allow_skipped:
@@ -2666,7 +2957,9 @@ def verify_exports(args: argparse.Namespace) -> int:
                             )
                     else:
                         problems += 1
-                        print(f"verify: media message has neither file nor skip reason: {path}", file=sys.stderr)
+                        print(
+                            f"verify: media message has neither file nor skip reason: {path}", file=sys.stderr
+                        )
         file_summaries[path.resolve()] = summary
 
     partials = [path for path in root.rglob(".partial-*") if path.is_dir()]
@@ -2682,6 +2975,10 @@ def verify_exports(args: argparse.Namespace) -> int:
         else:
             conn = open_db(db_path)
             try:
+                chain_valid, chain_error = verify_diagnostic_event_chain(conn)
+                if not chain_valid:
+                    problems += 1
+                    print(f"verify: diagnostic event chain invalid: {chain_error}", file=sys.stderr)
                 rows = conn.execute(f"SELECT * FROM {EXPORTS_TABLE}").fetchall()
                 ledger_by_path = {
                     Path(str(row["output_path"])).resolve(): row
@@ -2691,7 +2988,10 @@ def verify_exports(args: argparse.Namespace) -> int:
                 for result_path in file_summaries:
                     if result_path.parent not in ledger_by_path:
                         problems += 1
-                        print(f"verify: completed export is absent from ledger: {result_path.parent}", file=sys.stderr)
+                        print(
+                            f"verify: completed export is absent from ledger: {result_path.parent}",
+                            file=sys.stderr,
+                        )
                 for row in rows:
                     export_path = Path(str(row["output_path"]))
                     if not path_is_under(export_path, root):
@@ -2702,7 +3002,10 @@ def verify_exports(args: argparse.Namespace) -> int:
                         print(f"verify: ledger export is missing: {export_path}", file=sys.stderr)
                     elif summary is None:
                         problems += 1
-                        print(f"verify: ledger export JSON could not be summarized: {export_path}", file=sys.stderr)
+                        print(
+                            f"verify: ledger export JSON could not be summarized: {export_path}",
+                            file=sys.stderr,
+                        )
                     else:
                         if int(row["message_count"] or 0) != int(summary["count"]):
                             problems += 1
@@ -2715,10 +3018,15 @@ def verify_exports(args: argparse.Namespace) -> int:
                         dates = summary["dates"]
                         if ids and int(row["last_message_id"] or 0) != max(ids):
                             problems += 1
-                            print(f"verify: ledger last message ID mismatch for {export_path}", file=sys.stderr)
+                            print(
+                                f"verify: ledger last message ID mismatch for {export_path}", file=sys.stderr
+                            )
                         if dates and int(row["last_message_unix"] or 0) != max(dates):
                             problems += 1
-                            print(f"verify: ledger last message date mismatch for {export_path}", file=sys.stderr)
+                            print(
+                                f"verify: ledger last message date mismatch for {export_path}",
+                                file=sys.stderr,
+                            )
                     if row["indexed_unix"] is None and not args.allow_unindexed:
                         problems += 1
                         print(f"verify: export is not indexed: {export_path}", file=sys.stderr)
@@ -2731,14 +3039,24 @@ def verify_exports(args: argparse.Namespace) -> int:
                     ).fetchone()
                     if target is None:
                         problems += 1
-                        print(f"verify: export target is missing from target ledger: {export_path}", file=sys.stderr)
+                        print(
+                            f"verify: export target is missing from target ledger: {export_path}",
+                            file=sys.stderr,
+                        )
                     elif row["applied_unix"] is not None:
-                        if row["last_message_id"] is not None and int(target["last_message_id"] or 0) < int(row["last_message_id"]):
+                        if row["last_message_id"] is not None and int(target["last_message_id"] or 0) < int(
+                            row["last_message_id"]
+                        ):
                             problems += 1
                             print(f"verify: target watermark is behind export {export_path}", file=sys.stderr)
-                        if row["last_message_unix"] is not None and int(target["last_message_unix"] or 0) < int(row["last_message_unix"]):
+                        if row["last_message_unix"] is not None and int(
+                            target["last_message_unix"] or 0
+                        ) < int(row["last_message_unix"]):
                             problems += 1
-                            print(f"verify: target date watermark is behind export {export_path}", file=sys.stderr)
+                            print(
+                                f"verify: target date watermark is behind export {export_path}",
+                                file=sys.stderr,
+                            )
                     if summary is not None and row["indexed_unix"] is not None:
                         for chat_id, message_ids in summary["keys"].items():
                             placeholders = ",".join("?" for _ in message_ids)
@@ -2819,13 +3137,10 @@ async def map_targets(args: argparse.Namespace) -> None:
 
         if args.name:
             matches = [
-                item for item in active
-                if normalized_chat_name(item.name) == normalized_chat_name(args.name)
+                item for item in active if normalized_chat_name(item.name) == normalized_chat_name(args.name)
             ]
             if not matches:
-                raise ExportError(
-                    f"{args.name!r} is not currently marked active in the master database"
-                )
+                raise ExportError(f"{args.name!r} is not currently marked active in the master database")
             if len(matches) > 1 and not args.chat_id:
                 raise ExportError(
                     f"{args.name!r} appears in {len(matches)} active database rows; "
@@ -2834,9 +3149,7 @@ async def map_targets(args: argparse.Namespace) -> None:
             if args.chat_id:
                 selected = [item for item in matches if item.chat_id == args.chat_id]
                 if not selected:
-                    raise ExportError(
-                        f"{args.chat_id!r} is not an active database chat named {args.name!r}"
-                    )
+                    raise ExportError(f"{args.chat_id!r} is not an active database chat named {args.name!r}")
             else:
                 selected = matches
             entity = await resolve_peer(client, args.peer)
@@ -2907,11 +3220,12 @@ def invoke_indexer(output_root: Path, db_path: Path) -> int:
 
 
 def validate_pending_export_paths(rows: list[sqlite3.Row]) -> None:
-    missing = [str(row["output_path"]) for row in rows if not Path(str(row["output_path"]), "result.json").is_file()]
+    missing = [
+        str(row["output_path"]) for row in rows if not Path(str(row["output_path"]), "result.json").is_file()
+    ]
     if missing:
         raise ExportError(
-            "pending export files are missing; refusing to advance watermarks: "
-            + ", ".join(missing[:3])
+            "pending export files are missing; refusing to advance watermarks: " + ", ".join(missing[:3])
         )
 
 
@@ -2926,18 +3240,16 @@ async def run_exports(args: argparse.Namespace) -> int:
         raise ExportError("--all cannot be combined with --target")
     if args.run_all and args.chat_output_dir:
         raise ExportError("--all cannot be combined with --chat-output-dir")
-    direct_output = (
-        Path(args.chat_output_dir).expanduser().resolve()
-        if args.chat_output_dir
-        else None
-    )
+    direct_output = Path(args.chat_output_dir).expanduser().resolve() if args.chat_output_dir else None
     if direct_output is not None and not args.target:
         raise ExportError("--chat-output-dir requires one explicit --target")
     output_root = direct_output or Path(args.output).expanduser().resolve()
     if args.max_messages is not None and args.max_messages <= 0:
         raise ExportError("--max-messages must be a positive integer")
     if args.max_messages is not None and not args.dry_run:
-        raise ExportError("--max-messages is restricted to --dry-run so a test cannot advance a real watermark")
+        raise ExportError(
+            "--max-messages is restricted to --dry-run so a test cannot advance a real watermark"
+        )
     mount_point = infer_mount_point(output_root)
     if mount_point is not None and not mount_point.is_mount():
         raise ExportError(f"refusing to write backup: expected mountpoint is not mounted: {mount_point}")
@@ -2951,19 +3263,29 @@ async def run_exports(args: argparse.Namespace) -> int:
     # watermark ledger.
     lock = ExportLock(db_path.parent / f".{db_path.name}.tgbackman.lock")
     lock.acquire()
+    operation = OperationRegistry()
+    recorder = DiagnosticRecorder()
+    operation.update("running", command="run", scope="all" if args.run_all else "active")
+    recorder.emit(
+        DiagnosticEvent(
+            event="backup_started",
+            component="exporter",
+            operation_id=operation.operation_id,
+            fields={"scope": "all" if args.run_all else "active", "dry_run": bool(args.dry_run)},
+        )
+    )
     conn: Optional[sqlite3.Connection] = None
     client: Optional[Any] = None
     exported = 0
     tested = 0
     failures = 0
+    run_error: Optional[BaseException] = None
     try:
         conn = open_db(db_path)
         if not args.dry_run:
             pruned_staging = prune_completed_staging(conn)
             if pruned_staging:
-                print(
-                    f"Pruned {pruned_staging:,} staged message record(s) from completed runs."
-                )
+                print(f"Pruned {pruned_staging:,} staged message record(s) from completed runs.")
         if args.legacy_json_export and args.index and not args.dry_run:
             pending = pending_exports(conn, output_root)
             if pending:
@@ -2994,12 +3316,14 @@ async def run_exports(args: argparse.Namespace) -> int:
         if args.target:
             wanted = args.target.strip().casefold()
             requested = [
-                target for target in all_targets
-                if target.source_name.strip().casefold() == wanted
-                or target.target_key.casefold() == wanted
+                target
+                for target in all_targets
+                if target.source_name.strip().casefold() == wanted or target.target_key.casefold() == wanted
             ]
             if any(target.target_key in blocked_keys for target in requested):
-                names = ", ".join(sorted(target.target_key for target in requested if target.target_key in blocked_keys))
+                names = ", ".join(
+                    sorted(target.target_key for target in requested if target.target_key in blocked_keys)
+                )
                 raise ExportError(
                     f"Refusing to back up blacklisted target(s): {names}. "
                     "Remove the blacklist rule in tgbackman or with `blacklist-chat --remove`."
@@ -3029,7 +3353,9 @@ async def run_exports(args: argparse.Namespace) -> int:
         selected_media = parse_media_selection(media_value)
         configured_size = os.environ.get("TG_MAX_FILE_SIZE", config_values.get("TG_MAX_FILE_SIZE", "0"))
         try:
-            max_file_size = args.max_file_size if args.max_file_size is not None else parse_size(configured_size)
+            max_file_size = (
+                args.max_file_size if args.max_file_size is not None else parse_size(configured_size)
+            )
         except argparse.ArgumentTypeError as exc:
             raise ExportError(f"Invalid TG_MAX_FILE_SIZE: {exc}") from exc
         if args.media_retries < 0:
@@ -3041,7 +3367,9 @@ async def run_exports(args: argparse.Namespace) -> int:
         if args.progress_every <= 0:
             raise ExportError("--progress-every must be a positive integer")
         if args.full_rescan and args.max_messages:
-            raise ExportError("--full-rescan cannot be combined with --max-messages; a partial walk cannot reconcile deletions")
+            raise ExportError(
+                "--full-rescan cannot be combined with --max-messages; a partial walk cannot reconcile deletions"
+            )
         if args.overlap_ids < 0 or args.overlap_days < 0:
             raise ExportError("--overlap-ids and --overlap-days cannot be negative")
         download_media_enabled = not args.dry_run or args.download_media
@@ -3051,10 +3379,17 @@ async def run_exports(args: argparse.Namespace) -> int:
         summaries: list[dict[str, Any]] = []
         scope_label = (
             "enabled non-blacklisted mapped chat(s), including inactive chats"
-            if args.run_all else "mapped active non-blacklisted chat(s)"
+            if args.run_all
+            else "mapped active non-blacklisted chat(s)"
         )
         print(f"Starting backup for {target_total} {scope_label}.")
         for target_position, target in enumerate(targets, 1):
+            operation.update(
+                "running",
+                chat_position=target_position,
+                chat_total=target_total,
+                target_key=target.target_key,
+            )
             print(
                 f"[{target_position}/{target_total} {target.source_name}] "
                 f"resolving Telegram peer {target.peer_kind}:{target.peer_id}..."
@@ -3066,11 +3401,7 @@ async def run_exports(args: argparse.Namespace) -> int:
                 entity = await client.get_input_entity(target_input_peer(target))
                 chat_entity_snapshot: Optional[dict[str, Any]] = None
                 chat_full_snapshot: Optional[dict[str, Any]] = None
-                if (
-                    not args.legacy_json_export
-                    and not args.dry_run
-                    and hasattr(client, "get_entity")
-                ):
+                if not args.legacy_json_export and not args.dry_run and hasattr(client, "get_entity"):
                     try:
                         chat_entity = await client.get_entity(entity)
                         chat_entity_snapshot = tl_object_envelope(
@@ -3089,19 +3420,16 @@ async def run_exports(args: argparse.Namespace) -> int:
                         raise ExportError(
                             f"Telegram returned only a minimal chat entity for {target.source_name}"
                         )
-                    if (
-                        chat_entity_snapshot.get("peer_kind") != target.peer_kind
-                        or int(chat_entity_snapshot.get("peer_id") or 0) != int(target.peer_id)
-                    ):
+                    if chat_entity_snapshot.get("peer_kind") != target.peer_kind or int(
+                        chat_entity_snapshot.get("peer_id") or 0
+                    ) != int(target.peer_id):
                         raise ExportError(
                             f"Telegram returned the wrong chat entity for {target.source_name}: "
                             f"expected {target.peer_kind}:{target.peer_id}, got "
                             f"{chat_entity_snapshot.get('peer_kind')}:"
                             f"{chat_entity_snapshot.get('peer_id')}"
                         )
-                    print(
-                        f"[{target.source_name}] capturing complete chat metadata..."
-                    )
+                    print(f"[{target.source_name}] capturing complete chat metadata...")
                     chat_full_snapshot = await full_chat_metadata(
                         client,
                         entity,
@@ -3140,23 +3468,27 @@ async def run_exports(args: argparse.Namespace) -> int:
                             (run_key,),
                         ).fetchone()[0]
                     )
-                    resume_after_id, resumed_messages = staged_resume_after_id(
-                        conn, run_key, target_dir
-                    )
-                    progress = ProgressReporter(
-                        target.source_name,
-                        interval=args.progress_interval,
-                        every=args.progress_every,
-                        enabled=not args.no_progress,
-                        chat_position=target_position,
-                        chat_total=target_total,
-                    )
-                    progress.start("direct-to-database backup", resumed_messages)
-                    if resume_after_id is not None:
-                        progress.phase(
-                            f"reusing {resumed_messages:,} staged message(s); "
-                            f"fetching messages after ID {resume_after_id:,}"
+                    resume_after_id, resumed_messages = staged_resume_after_id(conn, run_key, target_dir)
+                    progress = (
+                        None
+                        if args.no_progress
+                        else ProgressReporter(
+                            target.source_name,
+                            interval=args.progress_interval,
+                            every=args.progress_every,
+                            enabled=True,
+                            chat_position=target_position,
+                            chat_total=target_total,
                         )
+                    )
+                    if progress:
+                        progress.start("direct-to-database backup", resumed_messages)
+                    if resume_after_id is not None:
+                        if progress:
+                            progress.phase(
+                                f"reusing {resumed_messages:,} staged message(s); "
+                                f"fetching messages after ID {resume_after_id:,}"
+                            )
                     record_iter = iter_message_records(
                         client,
                         entity,
@@ -3190,9 +3522,12 @@ async def run_exports(args: argparse.Namespace) -> int:
                         activate_chat=not args.run_all,
                         chat_entity_snapshot=chat_entity_snapshot,
                         chat_full_snapshot=chat_full_snapshot,
+                        operation_id=operation.operation_id,
+                        operation_registry=operation,
                     )
                     if stats.message_count == 0:
-                        progress.finish("no new messages; database unchanged")
+                        if progress:
+                            progress.finish("no new messages; database unchanged")
                         summaries.append(
                             {
                                 "position": target_position,
@@ -3204,9 +3539,10 @@ async def run_exports(args: argparse.Namespace) -> int:
                         print(f"[{target.source_name}] no new messages")
                         continue
                     exported += stats.message_count
-                    progress.finish(
-                        f"commit complete; watermark advanced to message {stats.last_message_id}"
-                    )
+                    if progress:
+                        progress.finish(
+                            f"commit complete; watermark advanced to message {stats.last_message_id}"
+                        )
                     summaries.append(
                         {
                             "position": target_position,
@@ -3246,18 +3582,23 @@ async def run_exports(args: argparse.Namespace) -> int:
                             encoding="utf-8",
                         )
                 media_root = staging_dir / "media"
-                progress = ProgressReporter(
-                    target.source_name,
-                    interval=args.progress_interval,
-                    every=args.progress_every,
-                    enabled=not args.no_progress,
-                    chat_position=target_position,
-                    chat_total=target_total,
+                progress = (
+                    None
+                    if args.no_progress
+                    else ProgressReporter(
+                        target.source_name,
+                        interval=args.progress_interval,
+                        every=args.progress_every,
+                        enabled=True,
+                        chat_position=target_position,
+                        chat_total=target_total,
+                    )
                 )
-                progress.start(
-                    "dry-run" if args.dry_run else "legacy JSON backup",
-                    0,
-                )
+                if progress:
+                    progress.start(
+                        "dry-run" if args.dry_run else "legacy JSON backup",
+                        0,
+                    )
                 record_iter = iter_message_records(
                     client,
                     entity,
@@ -3291,7 +3632,8 @@ async def run_exports(args: argparse.Namespace) -> int:
                     if args.dry_run or not staging_preexisting:
                         remove_staging(staging_dir)
                         staging_dir = None
-                    progress.finish("no new messages")
+                    if progress:
+                        progress.finish("no new messages")
                     summaries.append(
                         {
                             "position": target_position,
@@ -3306,7 +3648,8 @@ async def run_exports(args: argparse.Namespace) -> int:
                 if args.dry_run:
                     remove_staging(final_dir)
                     tested += stats.message_count
-                    progress.finish("dry-run complete; temporary files removed")
+                    if progress:
+                        progress.finish("dry-run complete; temporary files removed")
                     summaries.append(
                         {
                             "position": target_position,
@@ -3327,7 +3670,8 @@ async def run_exports(args: argparse.Namespace) -> int:
                         activate_chat=not args.run_all,
                     )
                 exported += stats.message_count
-                progress.finish(f"legacy JSON export complete: {final_dir}")
+                if progress:
+                    progress.finish(f"legacy JSON export complete: {final_dir}")
                 summaries.append(
                     {
                         "position": target_position,
@@ -3351,7 +3695,10 @@ async def run_exports(args: argparse.Namespace) -> int:
                     if args.dry_run:
                         remove_staging(staging_dir)
                     else:
-                        print(f"[{target.source_name}] partial export preserved at {staging_dir}", file=sys.stderr)
+                        print(
+                            f"[{target.source_name}] partial export preserved at {staging_dir}",
+                            file=sys.stderr,
+                        )
                 if not args.dry_run:
                     record_chat_backup_run(conn, target, "failed")
                     conn.commit()
@@ -3360,6 +3707,21 @@ async def run_exports(args: argparse.Namespace) -> int:
                     print(f"Telegram requested a {wait_seconds}s wait before continuing.", file=sys.stderr)
                     await asyncio.sleep(wait_seconds)
                 failures += 1
+                recorder.emit(
+                    DiagnosticEvent(
+                        event="chat_failed",
+                        component="exporter",
+                        level="error",
+                        operation_id=operation.operation_id,
+                        fields={
+                            "target_key": target.target_key,
+                            "chat_position": target_position,
+                            "error": exception_details(
+                                exc, phase="chat", fields={"target_key": target.target_key}
+                            ),
+                        },
+                    )
+                )
                 summaries.append(
                     {
                         "position": target_position,
@@ -3376,7 +3738,10 @@ async def run_exports(args: argparse.Namespace) -> int:
                 conn = None
             if invoke_indexer(output_root, db_path):
                 failures += 1
-                print("Indexer failed; export ledger remains pending and watermarks were not advanced.", file=sys.stderr)
+                print(
+                    "Indexer failed; export ledger remains pending and watermarks were not advanced.",
+                    file=sys.stderr,
+                )
             else:
                 conn = open_db(db_path)
                 try:
@@ -3404,12 +3769,88 @@ async def run_exports(args: argparse.Namespace) -> int:
                     f"  [{item['position']}/{target_total}] {item['name']}: "
                     f"{item['status']}, {item['messages']:,} message(s){suffix}"
                 )
+    except BaseException as exc:
+        # Per-chat failures are handled above so that an all-chat run can
+        # continue.  Anything escaping this block (configuration, connection,
+        # cancellation, Ctrl-C, or an unexpected bug) must still make the
+        # operation ledger truthful before the exception reaches the CLI.
+        run_error = exc
+        failures += 1
+        details = exception_details(exc, phase="run", fields={"exported": exported})
+        operation.update("failed", error=details)
+        recorder.emit(
+            DiagnosticEvent(
+                event="backup_failed",
+                component="exporter",
+                level="error",
+                operation_id=operation.operation_id,
+                fields={"error": details, "exported": exported},
+            )
+        )
+        raise
     finally:
+        cleanup_error: Optional[BaseException] = None
+        active_error = run_error
         if client is not None:
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except BaseException as exc:
+                cleanup_error = exc
+                failures += 1
+                details = exception_details(exc, phase="disconnect", fields={})
+                recorder.emit(
+                    DiagnosticEvent(
+                        event="backup_cleanup_failed",
+                        component="exporter",
+                        level="error",
+                        operation_id=operation.operation_id,
+                        fields={"error": details},
+                    )
+                )
         if conn is not None:
-            conn.close()
-        lock.release()
+            try:
+                conn.close()
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+                failures += 1
+                details = exception_details(exc, phase="database-close", fields={})
+                recorder.emit(
+                    DiagnosticEvent(
+                        event="backup_cleanup_failed",
+                        component="exporter",
+                        level="error",
+                        operation_id=operation.operation_id,
+                        fields={"error": details},
+                    )
+                )
+        try:
+            lock.release()
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+            failures += 1
+            details = exception_details(exc, phase="lock-release", fields={})
+            recorder.emit(
+                DiagnosticEvent(
+                    event="backup_cleanup_failed",
+                    component="exporter",
+                    level="error",
+                    operation_id=operation.operation_id,
+                    fields={"error": details},
+                )
+            )
+        final_status = "failed" if failures else "completed"
+        operation.finish(final_status, failures=failures, exported=exported)
+        recorder.emit(
+            DiagnosticEvent(
+                event="backup_finished",
+                component="exporter",
+                level="error" if failures else "info",
+                operation_id=operation.operation_id,
+                fields={"status": final_status, "failures": failures, "exported": exported},
+            )
+        )
+        if cleanup_error is not None and active_error is None:
+            raise cleanup_error
 
     if failures:
         return 1
@@ -3449,7 +3890,9 @@ def install_systemd_example(args: argparse.Namespace) -> None:
     config = Path(args.config).expanduser().resolve()
     session = Path(args.session).expanduser().resolve()
     python = Path(sys.executable).resolve()
-    mount_point = Path(args.mount_point).expanduser().resolve() if args.mount_point else infer_mount_point(output)
+    mount_point = (
+        Path(args.mount_point).expanduser().resolve() if args.mount_point else infer_mount_point(output)
+    )
     command = shlex.join(
         [
             str(python),
@@ -3477,6 +3920,9 @@ Description=tgbackman incremental Telegram backup
 Type=oneshot
 UMask=0077
 TimeoutStartSec=infinity
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
 WorkingDirectory={SCRIPT_DIR}
 ExecStart={command}
 """
@@ -3506,9 +3952,24 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tgbackman-backup",
         description="Incremental Telegram user-account backup and current-db index integration.",
     )
-    parser.add_argument("--db", default=os.environ.get("TGBACKMAN_DB", str(DEFAULT_DB)), help="Master SQLite database")
-    parser.add_argument("--config", default=os.environ.get("TGBACKMAN_CONFIG", str(DEFAULT_CONFIG)), help="Credentials env file")
-    parser.add_argument("--session", default=os.environ.get("TGBACKMAN_SESSION", str(DEFAULT_SESSION)), help="Telethon session path")
+    parser.add_argument(
+        "--db", default=os.environ.get("TGBACKMAN_DB", str(DEFAULT_DB)), help="Master SQLite database"
+    )
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("TGBACKMAN_CONFIG", str(DEFAULT_CONFIG)),
+        help="Credentials env file",
+    )
+    parser.add_argument(
+        "--session",
+        default=os.environ.get("TGBACKMAN_SESSION", str(DEFAULT_SESSION)),
+        help="Telethon session path",
+    )
+    parser.add_argument(
+        "--diagnostics-file",
+        default=os.environ.get("TGBACKMAN_DIAGNOSTICS_FILE", ""),
+        help="Override the default JSONL diagnostic event file (known credentials/message fields are redacted; paths and titles may remain)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_common_after_command(command_parser: argparse.ArgumentParser) -> None:
@@ -3519,6 +3980,11 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--db", default=argparse.SUPPRESS, help="Master SQLite database")
         command_parser.add_argument("--config", default=argparse.SUPPRESS, help="Credentials env file")
         command_parser.add_argument("--session", default=argparse.SUPPRESS, help="Telethon session path")
+        command_parser.add_argument(
+            "--diagnostics-file",
+            default=argparse.SUPPRESS,
+            help="Override the default JSONL diagnostic event file",
+        )
 
     configure = sub.add_parser("configure", help="Securely save API ID and API hash")
     add_common_after_command(configure)
@@ -3528,13 +3994,29 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_after_command(auth)
     targets = sub.add_parser("targets", help="List saved target mappings and watermarks")
     add_common_after_command(targets)
+    snapshot_parser = sub.add_parser("snapshot", help="Print the active operation diagnostic snapshot")
+    add_common_after_command(snapshot_parser)
+    reap = sub.add_parser("reap-stale", help="Mark abandoned running attempts as failed")
+    add_common_after_command(reap)
+    reap.add_argument(
+        "--older-than",
+        type=int,
+        default=24 * 60 * 60,
+        help="Only reap attempts older than this many seconds (default: 86400)",
+    )
     dialogs = sub.add_parser("dialogs", help="List Telegram dialogs for mapping")
     add_common_after_command(dialogs)
 
-    doctor_parser = sub.add_parser("doctor", help="Check credentials, database, mappings, output, and optionally the network")
+    doctor_parser = sub.add_parser(
+        "doctor", help="Check credentials, database, mappings, output, and optionally the network"
+    )
     add_common_after_command(doctor_parser)
-    doctor_parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="Incremental export root to test")
-    doctor_parser.add_argument("--network", action="store_true", help="Authenticate and resolve Telegram peers")
+    doctor_parser.add_argument(
+        "--output", default=str(DEFAULT_OUTPUT), help="Incremental export root to test"
+    )
+    doctor_parser.add_argument(
+        "--network", action="store_true", help="Authenticate and resolve Telegram peers"
+    )
 
     verify_parser = sub.add_parser("verify", help="Verify completed exports and all downloaded media paths")
     add_common_after_command(verify_parser)
@@ -3631,8 +4113,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable periodic progress lines (errors and final summaries remain)",
     )
-    run.add_argument("--overlap-ids", type=int, default=0, help="Older IDs to re-read for media/edit retries (default: 0, exact boundary)")
-    run.add_argument("--overlap-days", type=int, default=0, help="Date overlap window for date-only baselines (default: 0, exact)")
+    run.add_argument(
+        "--overlap-ids",
+        type=int,
+        default=0,
+        help="Older IDs to re-read for media/edit retries (default: 0, exact boundary)",
+    )
+    run.add_argument(
+        "--overlap-days",
+        type=int,
+        default=0,
+        help="Date overlap window for date-only baselines (default: 0, exact)",
+    )
     run.add_argument(
         "--discard-overlap",
         action="store_true",
@@ -3640,8 +4132,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--max-messages", type=int, help="Limit messages per target (testing only)")
     run.add_argument("--full-rescan", action="store_true", help="Ignore watermarks and walk full history")
-    run.add_argument("--allow-media-errors", action="store_true", help="Write messages even if media cannot download")
-    run.add_argument("--dry-run", action="store_true", help="Fetch and count without writing DB state or lasting files")
+    run.add_argument(
+        "--allow-media-errors", action="store_true", help="Write messages even if media cannot download"
+    )
+    run.add_argument(
+        "--dry-run", action="store_true", help="Fetch and count without writing DB state or lasting files"
+    )
     run.add_argument(
         "--download-media",
         action="store_true",
@@ -3652,8 +4148,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Write dated result.json folders and index them instead of committing directly to SQLite",
     )
-    run.add_argument("--index", dest="index", action="store_true", help="Index legacy JSON exports (the default)")
-    run.add_argument("--no-index", dest="index", action="store_false", help="Do not index legacy JSON exports")
+    run.add_argument(
+        "--index", dest="index", action="store_true", help="Index legacy JSON exports (the default)"
+    )
+    run.add_argument(
+        "--no-index", dest="index", action="store_false", help="Do not index legacy JSON exports"
+    )
     run.set_defaults(index=True)
 
     purge = sub.add_parser(
@@ -3775,7 +4275,10 @@ async def async_main(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    install_runtime_hooks()
     args = build_parser().parse_args()
+    if args.diagnostics_file:
+        os.environ["TGBACKMAN_DIAGNOSTICS_FILE"] = str(Path(args.diagnostics_file).expanduser())
     try:
         if args.command == "configure":
             api_id = args.api_id or input("Telegram API ID: ").strip()
@@ -3789,6 +4292,11 @@ def main() -> int:
             finally:
                 conn.close()
             return 0
+        if args.command == "snapshot":
+            print(json.dumps(diagnostics_snapshot(), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        if args.command == "reap-stale":
+            return reap_stale_attempts_command(args)
         if args.command == "verify":
             return verify_exports(args)
         if args.command == "purge-chat":
@@ -3804,10 +4312,24 @@ def main() -> int:
             return 0
         return asyncio.run(async_main(args))
     except (ExportError, KeyboardInterrupt) as exc:
+        details = exception_details(exc, phase="cli", fields={"command": args.command})
+        DiagnosticRecorder().emit(
+            DiagnosticEvent(
+                event="cli_failed" if not isinstance(exc, KeyboardInterrupt) else "cli_interrupted",
+                component="exporter",
+                level="warning" if isinstance(exc, KeyboardInterrupt) else "error",
+                fields={"error": details, "command": args.command},
+            )
+        )
         if isinstance(exc, KeyboardInterrupt):
             print("Interrupted.", file=sys.stderr)
             return 130
-        print(f"error: {exc}", file=sys.stderr)
+        identity = build_identity()
+        code = getattr(exc, "code", type(exc).__name__.lower())
+        print(
+            f"error [{code}; {type(exc).__name__}; build {identity.get('revision', 'unknown')}]: {exc}",
+            file=sys.stderr,
+        )
         return 2
 
 

@@ -8,11 +8,15 @@ import an application-level importer.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import os
 import sqlite3
+import socket
 
 from ..config import (
     BLACKLIST_TABLE,
+    DIAGNOSTIC_EVENTS_TABLE,
     DIALOGS_TABLE,
     EXPORTS_TABLE,
     PURGES_TABLE,
@@ -25,18 +29,40 @@ from ..config import (
 )
 
 ARCHIVAL_MESSAGE_COLUMNS = {
-    "message_type": "TEXT", "edit_timestamp": "TEXT", "edit_timestamp_unix": "INTEGER",
-    "media_size": "INTEGER", "media_sha256": "TEXT", "media_status": "TEXT",
-    "grouped_id": "TEXT", "entities_json": "TEXT", "reactions_json": "TEXT",
-    "reply_markup_json": "TEXT", "action_json": "TEXT", "forward_json": "TEXT",
-    "reply_to_chat_id": "TEXT", "reply_to_peer_kind": "TEXT", "reply_to_peer_id": "INTEGER",
-    "reply_to_top_id": "INTEGER", "reply_to_story_id": "INTEGER", "reply_quote_text": "TEXT",
-    "reply_quote_entities_json": "TEXT", "reply_quote_offset": "INTEGER", "reply_media_json": "TEXT",
-    "raw_tl_payload": "BLOB", "raw_tl_sha256": "TEXT", "raw_tl_layer": "INTEGER",
-    "raw_tl_library": "TEXT", "expanded_metadata_json": "TEXT",
-    "extra_json": "TEXT", "raw_payload": "BLOB", "source_key": "TEXT",
-    "source_format": "TEXT", "is_deleted": "INTEGER NOT NULL DEFAULT 0", "deleted_unix": "INTEGER",
+    "message_type": "TEXT",
+    "edit_timestamp": "TEXT",
+    "edit_timestamp_unix": "INTEGER",
+    "media_size": "INTEGER",
+    "media_sha256": "TEXT",
+    "media_status": "TEXT",
+    "grouped_id": "TEXT",
+    "entities_json": "TEXT",
+    "reactions_json": "TEXT",
+    "reply_markup_json": "TEXT",
+    "action_json": "TEXT",
+    "forward_json": "TEXT",
+    "reply_to_chat_id": "TEXT",
+    "reply_to_peer_kind": "TEXT",
+    "reply_to_peer_id": "INTEGER",
+    "reply_to_top_id": "INTEGER",
+    "reply_to_story_id": "INTEGER",
+    "reply_quote_text": "TEXT",
+    "reply_quote_entities_json": "TEXT",
+    "reply_quote_offset": "INTEGER",
+    "reply_media_json": "TEXT",
+    "raw_tl_payload": "BLOB",
+    "raw_tl_sha256": "TEXT",
+    "raw_tl_layer": "INTEGER",
+    "raw_tl_library": "TEXT",
+    "expanded_metadata_json": "TEXT",
+    "extra_json": "TEXT",
+    "raw_payload": "BLOB",
+    "source_key": "TEXT",
+    "source_format": "TEXT",
+    "is_deleted": "INTEGER NOT NULL DEFAULT 0",
+    "deleted_unix": "INTEGER",
 }
+MAX_DATABASE_DIAGNOSTIC_EVENTS = 100_000
 
 
 def _add_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
@@ -56,14 +82,27 @@ def ensure_archive_schema(conn: sqlite3.Connection) -> None:
             last_backup_run_unix INTEGER, last_backup_run_status TEXT
         )"""
     )
-    _add_columns(conn, "chats", {
-        "backup_path": "TEXT", "is_active": "INTEGER DEFAULT 0", "last_backup_unix": "INTEGER",
-        "last_backup_source": "TEXT", "last_backup_confidence": "TEXT", "last_backup_evidence": "TEXT",
-        "last_backup_run_unix": "INTEGER", "last_backup_run_status": "TEXT",
-        "min_msg_id": "INTEGER", "max_msg_id": "INTEGER", "msg_count": "INTEGER",
-        "min_timestamp": "TEXT", "max_timestamp": "TEXT", "min_timestamp_unix": "INTEGER",
-        "max_timestamp_unix": "INTEGER",
-    })
+    _add_columns(
+        conn,
+        "chats",
+        {
+            "backup_path": "TEXT",
+            "is_active": "INTEGER DEFAULT 0",
+            "last_backup_unix": "INTEGER",
+            "last_backup_source": "TEXT",
+            "last_backup_confidence": "TEXT",
+            "last_backup_evidence": "TEXT",
+            "last_backup_run_unix": "INTEGER",
+            "last_backup_run_status": "TEXT",
+            "min_msg_id": "INTEGER",
+            "max_msg_id": "INTEGER",
+            "msg_count": "INTEGER",
+            "min_timestamp": "TEXT",
+            "max_timestamp": "TEXT",
+            "min_timestamp_unix": "INTEGER",
+            "max_timestamp_unix": "INTEGER",
+        },
+    )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL, chat_id TEXT NOT NULL,
@@ -223,7 +262,8 @@ def ensure_targets_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS {RUNS_TABLE} (
           run_key TEXT PRIMARY KEY, target_key TEXT NOT NULL, chat_id TEXT NOT NULL,
           baseline_message_id INTEGER, baseline_unix INTEGER, full_rescan INTEGER NOT NULL DEFAULT 0,
-          status TEXT NOT NULL, started_unix INTEGER NOT NULL, completed_unix INTEGER, error TEXT
+          status TEXT NOT NULL, started_unix INTEGER NOT NULL, heartbeat_unix INTEGER,
+          completed_unix INTEGER, error TEXT, purged_unix INTEGER, purge_key TEXT
         );
         CREATE TABLE IF NOT EXISTS {RUN_MESSAGES_TABLE} (
           run_key TEXT NOT NULL, message_id INTEGER NOT NULL, record_json TEXT NOT NULL,
@@ -236,7 +276,8 @@ def ensure_targets_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE TABLE IF NOT EXISTS {RUN_ATTEMPTS_TABLE} (
           attempt_key TEXT PRIMARY KEY, run_key TEXT NOT NULL, started_unix INTEGER NOT NULL,
-          completed_unix INTEGER, status TEXT NOT NULL, error TEXT
+          heartbeat_unix INTEGER, completed_unix INTEGER, status TEXT NOT NULL, error TEXT,
+          purged_unix INTEGER, purge_key TEXT
         );
         CREATE TABLE IF NOT EXISTS {EXPORTS_TABLE} (
           export_key TEXT PRIMARY KEY, target_key TEXT NOT NULL, source_name TEXT NOT NULL,
@@ -254,7 +295,68 @@ def ensure_targets_schema(conn: sqlite3.Connection) -> None:
           target_key TEXT PRIMARY KEY, peer_kind TEXT NOT NULL, peer_id INTEGER NOT NULL, title TEXT NOT NULL,
           reason TEXT, created_unix INTEGER NOT NULL, UNIQUE(peer_kind, peer_id)
         );
+        CREATE TABLE IF NOT EXISTS {DIAGNOSTIC_EVENTS_TABLE} (
+          event_id TEXT PRIMARY KEY, event_unix INTEGER NOT NULL, event_type TEXT NOT NULL,
+          component TEXT NOT NULL, level TEXT NOT NULL DEFAULT 'info', operation_id TEXT,
+          run_key TEXT, target_key TEXT, status TEXT, details_json TEXT NOT NULL,
+          build_revision TEXT NOT NULL, actor TEXT NOT NULL DEFAULT 'local-process',
+          writer_role TEXT NOT NULL DEFAULT 'application', reason TEXT,
+          outcome TEXT, host_name TEXT NOT NULL DEFAULT '', process_id INTEGER NOT NULL DEFAULT 0,
+          previous_hash TEXT, integrity_sha256 TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_{DIAGNOSTIC_EVENTS_TABLE}_operation
+          ON {DIAGNOSTIC_EVENTS_TABLE}(operation_id, event_unix);
+        CREATE INDEX IF NOT EXISTS idx_{DIAGNOSTIC_EVENTS_TABLE}_run
+          ON {DIAGNOSTIC_EVENTS_TABLE}(run_key, event_unix);
         """
+    )
+    # Diagnostic columns are additive and intentionally retain the concise
+    # human-readable ``error`` column for older tooling.  The structured fields
+    # make post-mortem failures joinable to a build and operation without
+    # changing the exporter transaction model.
+    _add_columns(
+        conn,
+        RUNS_TABLE,
+        {
+            "error_type": "TEXT",
+            "error_phase": "TEXT",
+            "error_traceback": "TEXT",
+            "diagnostic_json": "TEXT",
+            "build_revision": "TEXT",
+            "operation_id": "TEXT",
+            "heartbeat_unix": "INTEGER",
+            "purged_unix": "INTEGER",
+            "purge_key": "TEXT",
+        },
+    )
+    _add_columns(
+        conn,
+        RUN_ATTEMPTS_TABLE,
+        {
+            "error_type": "TEXT",
+            "error_phase": "TEXT",
+            "error_traceback": "TEXT",
+            "diagnostic_json": "TEXT",
+            "build_revision": "TEXT",
+            "operation_id": "TEXT",
+            "heartbeat_unix": "INTEGER",
+            "purged_unix": "INTEGER",
+            "purge_key": "TEXT",
+        },
+    )
+    _add_columns(
+        conn,
+        DIAGNOSTIC_EVENTS_TABLE,
+        {
+            "actor": "TEXT NOT NULL DEFAULT 'local-process'",
+            "writer_role": "TEXT NOT NULL DEFAULT 'application'",
+            "reason": "TEXT",
+            "outcome": "TEXT",
+            "host_name": "TEXT NOT NULL DEFAULT ''",
+            "process_id": "INTEGER NOT NULL DEFAULT 0",
+            "previous_hash": "TEXT",
+            "integrity_sha256": "TEXT",
+        },
     )
     # Every application connection must have the same searchable schema.  An
     # older database can have all archival tables but still be missing FTS
@@ -273,15 +375,205 @@ def ensure_targets_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def append_diagnostic_event(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    event_type: str,
+    component: str,
+    level: str,
+    operation_id: str | None,
+    run_key: str | None,
+    target_key: str | None,
+    status: str | None,
+    details_json: str,
+    build_revision: str,
+    event_unix: int,
+    actor: str | None = None,
+    writer_role: str = "",
+    reason: str | None = None,
+    outcome: str | None = None,
+) -> None:
+    """Append one durable lifecycle event without altering canonical rows."""
+    bounded_details = details_json
+    if len(bounded_details) > 12000:
+        try:
+            parsed_details = json.loads(bounded_details)
+        except (TypeError, ValueError):
+            parsed_details = {"raw_prefix": bounded_details[:8000]}
+        bounded_details = json.dumps(
+            {
+                "truncated": True,
+                "sha256": hashlib.sha256(details_json.encode("utf-8")).hexdigest(),
+                "details": parsed_details,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if len(bounded_details) > 12000:
+            digest = hashlib.sha256(details_json.encode("utf-8")).hexdigest()
+            for prefix_length in (4000, 1000, 0):
+                candidate = json.dumps(
+                    {
+                        "truncated": True,
+                        "sha256": digest,
+                        "details_prefix": details_json[:prefix_length],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if len(candidate) <= 12000:
+                    bounded_details = candidate
+                    break
+    resolved_actor = (
+        actor
+        or os.environ.get("TGBACKMAN_ACTOR", "").strip()
+        or os.environ.get("USER", "").strip()
+        or "local-process"
+    )[:256]
+    resolved_writer = (writer_role or component)[:256]
+    resolved_reason = (reason or event_type)[:512]
+    resolved_outcome = (outcome or status)[:256] if (outcome or status) else None
+    previous_row = conn.execute(
+        f"""SELECT integrity_sha256 FROM {DIAGNOSTIC_EVENTS_TABLE}
+            WHERE integrity_sha256 IS NOT NULL
+            ORDER BY rowid DESC LIMIT 1"""
+    ).fetchone()
+    previous_hash = str(previous_row[0]) if previous_row is not None and previous_row[0] else None
+    host_name = socket.gethostname()[:256]
+    process_id = os.getpid()
+    integrity_payload = {
+        "event_id": event_id,
+        "event_unix": event_unix,
+        "event_type": event_type,
+        "component": component,
+        "level": level,
+        "operation_id": operation_id,
+        "run_key": run_key,
+        "target_key": target_key,
+        "status": status,
+        "details_json": bounded_details,
+        "build_revision": build_revision[:256],
+        "actor": resolved_actor,
+        "writer_role": resolved_writer,
+        "reason": resolved_reason,
+        "outcome": resolved_outcome,
+        "host_name": host_name,
+        "process_id": process_id,
+        "previous_hash": previous_hash,
+    }
+    integrity_sha256 = hashlib.sha256(
+        json.dumps(integrity_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    conn.execute(
+        f"""INSERT OR IGNORE INTO {DIAGNOSTIC_EVENTS_TABLE}(
+                event_id, event_unix, event_type, component, level, operation_id,
+                run_key, target_key, status, details_json, build_revision,
+                actor, writer_role, reason, outcome, host_name, process_id,
+                previous_hash, integrity_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            event_id,
+            event_unix,
+            event_type,
+            component,
+            level,
+            operation_id,
+            run_key,
+            target_key,
+            status,
+            bounded_details,
+            build_revision[:256],
+            resolved_actor,
+            resolved_writer,
+            resolved_reason,
+            resolved_outcome,
+            host_name,
+            process_id,
+            previous_hash,
+            integrity_sha256,
+        ),
+    )
+    # Keep the database ledger bounded.  The first retained hashed row carries
+    # its predecessor as an anchor; verification can validate the retained
+    # suffix without pretending that rows outside the retention window exist.
+    conn.execute(
+        f"""DELETE FROM {DIAGNOSTIC_EVENTS_TABLE}
+            WHERE rowid IN (
+                SELECT rowid FROM {DIAGNOSTIC_EVENTS_TABLE}
+                ORDER BY rowid DESC LIMIT -1 OFFSET ?
+            )""",
+        (MAX_DATABASE_DIAGNOSTIC_EVENTS,),
+    )
+
+
+def verify_diagnostic_event_chain(conn: sqlite3.Connection) -> tuple[bool, str | None]:
+    """Validate Python-written diagnostic event hashes in insertion order.
+
+    Legacy rows without hashes are accepted as an unverified prefix.  The
+    function detects edits, deletions, and reordered rows in the hashed suffix;
+    it is deliberately not presented as protection against a privileged
+    database rewrite.
+    """
+    previous_hash: str | None = None
+    seen_hashed = False
+    rows = conn.execute(
+        f"""SELECT event_id, event_unix, event_type, component, level, operation_id,
+                   run_key, target_key, status, details_json, build_revision,
+                   actor, writer_role, reason, outcome, host_name, process_id,
+                   previous_hash, integrity_sha256
+            FROM {DIAGNOSTIC_EVENTS_TABLE} ORDER BY rowid"""
+    )
+    for row in rows:
+        integrity = row[18]
+        if not integrity:
+            # GUI/legacy writers may not have a hash implementation yet.  Do
+            # not break the Python hash chain merely because an unverified row
+            # was inserted between two hashed events.
+            continue
+        payload = {
+            "event_id": row[0],
+            "event_unix": row[1],
+            "event_type": row[2],
+            "component": row[3],
+            "level": row[4],
+            "operation_id": row[5],
+            "run_key": row[6],
+            "target_key": row[7],
+            "status": row[8],
+            "details_json": row[9],
+            "build_revision": row[10],
+            "actor": row[11],
+            "writer_role": row[12],
+            "reason": row[13],
+            "outcome": row[14],
+            "host_name": row[15],
+            "process_id": row[16],
+            "previous_hash": row[17],
+        }
+        expected = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if seen_hashed and row[17] != previous_hash:
+            return False, f"diagnostic event chain break before {row[0]}"
+        if str(integrity) != expected:
+            return False, f"diagnostic event integrity mismatch for {row[0]}"
+        previous_hash = str(integrity)
+        seen_hashed = True
+    return True, None
+
+
 def refresh_chat_statistics(conn: sqlite3.Connection, chat_id: str) -> None:
     row = conn.execute(
         """SELECT MIN(message_id), MAX(message_id), COUNT(*), MIN(timestamp), MAX(timestamp),
                   MIN(timestamp_unix), MAX(timestamp_unix) FROM messages
-           WHERE chat_id=? AND COALESCE(is_deleted, 0)=0""", (chat_id,)
+           WHERE chat_id=? AND COALESCE(is_deleted, 0)=0""",
+        (chat_id,),
     ).fetchone()
     conn.execute(
         """UPDATE chats SET min_msg_id=?, max_msg_id=?, msg_count=?, min_timestamp=?, max_timestamp=?,
-                  min_timestamp_unix=?, max_timestamp_unix=? WHERE chat_id=?""", (*row, chat_id)
+                  min_timestamp_unix=?, max_timestamp_unix=? WHERE chat_id=?""",
+        (*row, chat_id),
     )
 
 

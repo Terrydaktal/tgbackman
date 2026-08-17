@@ -39,9 +39,17 @@ def human_duration(seconds: float) -> str:
 class ProgressReporter:
     """Periodic line-oriented progress suitable for terminals and journals."""
 
-    def __init__(self, target_name: str, *, interval: float = 5.0, every: int = 100,
-                 enabled: bool = True, output: Callable[[str], None] = print,
-                 chat_position: Optional[int] = None, chat_total: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        target_name: str,
+        *,
+        interval: float = 5.0,
+        every: int = 100,
+        enabled: bool = True,
+        output: Callable[[str], None] = print,
+        chat_position: Optional[int] = None,
+        chat_total: Optional[int] = None,
+    ) -> None:
         self.target_name = target_name
         self.interval = max(0.1, interval)
         self.every = max(1, every)
@@ -67,8 +75,11 @@ class ProgressReporter:
     def emit(self, text: str) -> None:
         if not self.enabled:
             return
-        position = (f"chat {self.chat_position}/{self.chat_total}; "
-                    if self.chat_position is not None and self.chat_total is not None else "")
+        position = (
+            f"chat {self.chat_position}/{self.chat_total}; "
+            if self.chat_position is not None and self.chat_total is not None
+            else ""
+        )
         line = f"[{self.target_name}] progress: {position}{text}"
         if self.output is print:
             print(line, flush=True)
@@ -86,6 +97,8 @@ class ProgressReporter:
         self.reused_media += 1
 
     def media_download_progress(self, message_id: int, filename: str, received: int, total: int) -> None:
+        if not self.enabled:
+            return
         now = time.monotonic()
         if self.current_media_id != message_id:
             self.current_media_id = message_id
@@ -97,12 +110,16 @@ class ProgressReporter:
         elapsed = max(0.001, now - self.current_media_started)
         speed = int(received / elapsed)
         total_text = human_bytes(total) if total else "unknown"
-        self.emit(f"media message {message_id} {filename}: {human_bytes(received)}/{total_text} "
-                  f"({percent:.1f}%) at {human_bytes(speed)}/s; total elapsed "
-                  f"{human_duration(now - self.started)}")
+        self.emit(
+            f"media message {message_id} {filename}: {human_bytes(received)}/{total_text} "
+            f"({percent:.1f}%) at {human_bytes(speed)}/s; total elapsed "
+            f"{human_duration(now - self.started)}"
+        )
         self.last_report = now
 
     def observe(self, record: dict[str, Any], error: Optional[str]) -> None:
+        if not self.enabled:
+            return
         self.processed += 1
         if record.get("id") is not None:
             self.latest_message_id = int(record["id"])
@@ -125,13 +142,18 @@ class ProgressReporter:
     def report(self, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
         elapsed = max(0.001, now - self.started)
-        latest_date = (datetime.fromtimestamp(self.latest_message_unix, timezone.utc).isoformat()
-                       if self.latest_message_unix is not None else "unknown")
-        self.emit(f"{self.processed:,} processed; latest id={self.latest_message_id or 'unknown'} "
-                  f"date={latest_date}; {self.processed / elapsed:.1f} msg/s; media seen={self.media_seen:,} "
-                  f"ready={self.media_ready:,} reused={self.reused_media:,} skipped={self.media_skipped:,} "
-                  f"errors={self.media_errors:,} bytes={human_bytes(self.media_bytes)}; "
-                  f"elapsed {human_duration(elapsed)}")
+        latest_date = (
+            datetime.fromtimestamp(self.latest_message_unix, timezone.utc).isoformat()
+            if self.latest_message_unix is not None
+            else "unknown"
+        )
+        self.emit(
+            f"{self.processed:,} processed; latest id={self.latest_message_id or 'unknown'} "
+            f"date={latest_date}; {self.processed / elapsed:.1f} msg/s; media seen={self.media_seen:,} "
+            f"ready={self.media_ready:,} reused={self.reused_media:,} skipped={self.media_skipped:,} "
+            f"errors={self.media_errors:,} bytes={human_bytes(self.media_bytes)}; "
+            f"elapsed {human_duration(elapsed)}"
+        )
         self.last_report = now
 
     def finish(self, outcome: str) -> None:

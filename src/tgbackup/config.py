@@ -63,12 +63,23 @@ TARGET_CHAT_LINKS_TABLE = "telegram_backup_target_chats"
 DIALOGS_TABLE = "telegram_dialogs"
 PURGES_TABLE = "telegram_backup_purges"
 BLACKLIST_TABLE = "telegram_backup_blacklist"
+DIAGNOSTIC_EVENTS_TABLE = "telegram_backup_diagnostic_events"
 MEDIA_TYPES = frozenset({"photo", "video", "voice_message", "audio_file", "sticker", "animation", "file"})
 MEDIA_ALIASES = {
-    "photo": "photo", "photos": "photo", "video": "video", "videos": "video",
-    "voice": "voice_message", "voice_messages": "voice_message", "audio": "audio_file",
-    "audio_files": "audio_file", "sticker": "sticker", "stickers": "sticker",
-    "animation": "animation", "animations": "animation", "file": "file", "files": "file",
+    "photo": "photo",
+    "photos": "photo",
+    "video": "video",
+    "videos": "video",
+    "voice": "voice_message",
+    "voice_messages": "voice_message",
+    "audio": "audio_file",
+    "audio_files": "audio_file",
+    "sticker": "sticker",
+    "stickers": "sticker",
+    "animation": "animation",
+    "animations": "animation",
+    "file": "file",
+    "files": "file",
     "documents": "file",
 }
 
@@ -82,9 +93,19 @@ def parse_size(value: str) -> int:
     number = float(match.group(1))
     unit = match.group(2) or "B"
     multiplier = {
-        "B": 1, "K": 1024, "KB": 1000, "M": 1024**2, "MB": 1000**2,
-        "G": 1024**3, "GB": 1000**3, "T": 1024**4, "TB": 1000**4,
-        "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4,
+        "B": 1,
+        "K": 1024,
+        "KB": 1000,
+        "M": 1024**2,
+        "MB": 1000**2,
+        "G": 1024**3,
+        "GB": 1000**3,
+        "T": 1024**4,
+        "TB": 1000**4,
+        "KIB": 1024,
+        "MIB": 1024**2,
+        "GIB": 1024**3,
+        "TIB": 1024**4,
     }[unit]
     return int(number * multiplier)
 
@@ -127,7 +148,10 @@ def parse_env_file(path: Path) -> dict[str, str]:
         mode = path.stat().st_mode & 0o777
         if mode & 0o077:
             import sys
-            print(f"warning: credentials file {path} is mode {mode:03o}; run chmod 600 on it", file=sys.stderr)
+
+            print(
+                f"warning: credentials file {path} is mode {mode:03o}; run chmod 600 on it", file=sys.stderr
+            )
     except OSError:
         pass
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -142,7 +166,14 @@ def parse_env_file(path: Path) -> dict[str, str]:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
-        values[key.strip()] = value
+        normalized_key = key.strip()
+        values[normalized_key] = value
+        if normalized_key.upper() in {"TG_API_ID", "TG_API_HASH", "TELEGRAM_API_ID", "TELEGRAM_API_HASH"}:
+            # Keep secrets out of later diagnostic tracebacks even when they
+            # came from a dotenv file rather than the process environment.
+            from .diagnostics import register_secret
+
+            register_secret(value)
     return values
 
 
@@ -150,8 +181,14 @@ def credentials(config_path: Path) -> tuple[int, str]:
     values = parse_env_file(config_path)
     api_id_raw = os.environ.get("TG_API_ID", values.get("TG_API_ID", ""))
     api_hash = os.environ.get("TG_API_HASH", values.get("TG_API_HASH", ""))
+    from .diagnostics import register_secret
+
+    register_secret(api_id_raw)
+    register_secret(api_hash)
     if not api_id_raw or not api_hash:
-        raise ExportError(f"Missing TG_API_ID/TG_API_HASH. Run `configure --config {config_path}` or set both environment variables.")
+        raise ExportError(
+            f"Missing TG_API_ID/TG_API_HASH. Run `configure --config {config_path}` or set both environment variables."
+        )
     try:
         api_id = int(api_id_raw)
     except ValueError as exc:
@@ -207,10 +244,34 @@ def write_credentials(config_path: Path, api_id: str, api_hash: str) -> None:
 
 
 __all__ = [
-    "PROJECT_ROOT", "SCRIPT_DIR", "DEFAULT_DB", "DEFAULT_CONFIG", "DEFAULT_SESSION", "DEFAULT_OUTPUT",
-    "TARGETS_TABLE", "EXPORTS_TABLE", "RUNS_TABLE", "RUN_MESSAGES_TABLE", "RUN_ARCHIVE_TABLE", "RUN_ATTEMPTS_TABLE", "TARGET_CHAT_LINKS_TABLE",
-    "DIALOGS_TABLE", "PURGES_TABLE", "BLACKLIST_TABLE", "MEDIA_TYPES", "MEDIA_ALIASES",
-    "database_mtime_ns", "default_database_path", "parse_size", "parse_media_selection", "safe_component",
-    "parse_env_file", "credentials", "ensure_private_dir", "telethon_session_file", "secure_session_file",
+    "PROJECT_ROOT",
+    "SCRIPT_DIR",
+    "DEFAULT_DB",
+    "DEFAULT_CONFIG",
+    "DEFAULT_SESSION",
+    "DEFAULT_OUTPUT",
+    "TARGETS_TABLE",
+    "EXPORTS_TABLE",
+    "RUNS_TABLE",
+    "RUN_MESSAGES_TABLE",
+    "RUN_ARCHIVE_TABLE",
+    "RUN_ATTEMPTS_TABLE",
+    "TARGET_CHAT_LINKS_TABLE",
+    "DIALOGS_TABLE",
+    "PURGES_TABLE",
+    "BLACKLIST_TABLE",
+    "DIAGNOSTIC_EVENTS_TABLE",
+    "MEDIA_TYPES",
+    "MEDIA_ALIASES",
+    "database_mtime_ns",
+    "default_database_path",
+    "parse_size",
+    "parse_media_selection",
+    "safe_component",
+    "parse_env_file",
+    "credentials",
+    "ensure_private_dir",
+    "telethon_session_file",
+    "secure_session_file",
     "write_credentials",
 ]

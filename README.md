@@ -14,6 +14,7 @@ tgbackman/
 ├── uv.lock                            # Reproducible Python dependency lock
 ├── requirements.txt                   # Minimal compatibility install list
 ├── docs/architecture.md               # Module boundaries and development workflow
+├── docs/debuggability.md               # Evidence, privacy, build and overhead contract
 ├── src/tgbackup/                      # Importable Python package
 │   ├── legacy_tree/                   # Filesystem-only legacy export operations
 │   │   ├── split_html.py
@@ -29,6 +30,7 @@ tgbackman/
 │   │   ├── overlap_report.py
 │   │   └── range_repair.py
 │   ├── cli.py                         # `tgbackman-backup` entry point
+│   ├── diagnostics.py                  # Bounded events, snapshots and crash hooks
 │   ├── config.py                      # Credentials, paths, parsers, permissions
 │   ├── media_reorganize.py            # Database-aware legacy/current media migration
 │   ├── db/                            # Canonical schema, archive, provenance, repositories
@@ -45,6 +47,7 @@ tgbackman/
 │       └── staging.py                 # Durable failed-run staging/resume
 ├── systemd/                           # Example/generated user service and timer units
 ├── tests/                              # Offline regression tests for exporter/indexer invariants
+├── tools/                              # Offline performance/diagnostic checks
 ├── tgbackman/                         # Rust backup manager, chat viewer, and coverage visualizer
 │   ├── Cargo.toml                     # Rust GUI project manifest
 │   └── src/                           # Rust GUI source code
@@ -472,8 +475,11 @@ read the archived conversations:
 
 ```bash
 TGBACKMAN_DB="/media/example/backup-volume/sqlitedb/telegram_backup.db" \
-  cargo run --manifest-path tgbackman/Cargo.toml
+  cargo run --release --locked --manifest-path tgbackman/Cargo.toml
 ```
+
+The release profile is optimized while retaining source-line information for
+post-mortem symbolization. Use plain `cargo run` only for development.
 
 The left search field searches conversation titles immediately and searches
 message text across the entire database after a short debounce. Select a
@@ -515,10 +521,33 @@ cargo build --release
 ## 🔒 Security, Privacy & Performance Designs
 
 > [!IMPORTANT]
-> **Performance Optimization**: `tgbackman-db-import` leverages bulk transaction batches (50,000+ operations per transaction) coupled with SQLite write-ahead-logging (`PRAGMA journal_mode=WAL`), asynchronous synchronization (`PRAGMA synchronous=NORMAL`), and large cache allocations to achieve lightning-fast throughput exceeding **200,000 messages/sec**.
+> **Performance Optimization**: `tgbackman-db-import` uses bulk transaction batches, SQLite WAL mode and large cache allocations. Throughput depends on storage, schema state and workload; the repository does not promise a universal **200,000 messages/sec** rate.
 
 > [!NOTE]
-> **Leak-Proof Sanitization**: When querying the master database through `tgsearch` with `--sanitise`, the engine employs automatic name-aliasing. A user's target variations (e.g. system username and its reverse spelling) are linked together dynamically so that substituting one automatically substitutes both in a case-insensitive fashion. This preserves total sender privacy.
+> **Sanitization**: `tgsearch --sanitise` filters configured search output and aliases. It is not a guarantee that paths, filenames, chat titles or diagnostic output contain no personal information.
 
 > [!WARNING]
 > **Database Locks**: While ingestion utilizes WAL mode, always ensure that other handles to the SQLite database (like active search queries) are read-only or closed during heavy write pipelines to prevent database busy lock scenarios (`SQLITE_BUSY`).
+
+## Debugging and incident evidence
+
+The backup engine and viewer include a bounded diagnostic contract documented
+in [`docs/debuggability.md`](docs/debuggability.md). It records build identity,
+atomic active-operation state, structured failure context and uncaught
+exception/panic files. Known credential values and message fields are
+redacted; paths, filenames and chat titles may still be personal information.
+Collect a live Python operation snapshot with:
+
+```bash
+uv run tgbackman-backup snapshot
+```
+
+JSONL lifecycle events are enabled by default at
+`$XDG_STATE_HOME/tgbackman/events.jsonl`; use `--diagnostics-file PATH` (or
+`TGBACKMAN_DIAGNOSTICS_FILE`) to route them elsewhere. `--no-progress` now
+removes per-message and per-media progress callbacks rather than merely hiding
+their output. Release GUI builds
+retain source-line information and expose their source revision in diagnostic
+state; dirty working-tree builds are explicitly marked and should not be used
+as exact source matches. Keep the matching binary and symbols together when
+investigating a crash.

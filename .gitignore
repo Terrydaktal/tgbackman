@@ -21,6 +21,8 @@ tgbackman/target/
 .tgbackman.lock
 *.tgbackman.lock
 credentials.env
+.tgbackman-diagnostics/
+tgbackman-events.jsonl
 .pytest_cache/
 .ruff_cache/
 .coverage

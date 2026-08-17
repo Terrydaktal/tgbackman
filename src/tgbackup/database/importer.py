@@ -20,11 +20,21 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 import urllib.parse
 import zlib
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+from ..diagnostics import (
+    DiagnosticEvent,
+    DiagnosticRecorder,
+    build_identity,
+    exception_details,
+    install_runtime_hooks,
+)
+from ..db.schema import append_diagnostic_event
 
 # Re-use regexes and helpers similar to backman.py
 HTML_CHAT_NAME_RE = re.compile(r'<div class="text bold">\s*(.*?)\s*</div>', re.DOTALL)
@@ -32,18 +42,24 @@ HTML_CHAT_NAME_RE = re.compile(r'<div class="text bold">\s*(.*?)\s*</div>', re.D
 # HTML message class and timestamp regex
 HTML_DIV_MESSAGE_MARKER = '<div class="message'
 HTML_DAY_SEPARATOR_MARKER = '<div class="message service" id="message-'
-HTML_MESSAGE_ID_BYTES_RE = re.compile(
-    br'<div class="message[^"]*" id="message-?\d+"'
-)
-HTML_DAY_SEPARATOR_BYTES_RE = re.compile(
-    br'<div class="message service" id="message-\d+"'
-)
-RANGE_DIR_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$"
-)
+HTML_MESSAGE_ID_BYTES_RE = re.compile(rb'<div class="message[^"]*" id="message-?\d+"')
+HTML_DAY_SEPARATOR_BYTES_RE = re.compile(rb'<div class="message service" id="message-\d+"')
+RANGE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$")
 HTML_VOID_ELEMENTS = {
-    "area", "base", "br", "col", "embed", "hr", "img", "input",
-    "link", "meta", "param", "source", "track", "wbr",
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
 }
 
 # Extract exact Telegram date: "24.05.2026 22:15:30 UTC+01:00" or similar
@@ -169,7 +185,9 @@ def resolve_local_media_path(backup_path: str, media_path: Optional[str]) -> Opt
     root = os.path.abspath(backup_path)
     candidate = os.path.abspath(value) if os.path.isabs(value) else os.path.abspath(os.path.join(root, value))
     try:
-        if os.path.commonpath((root, candidate)) != root or os.path.commonpath((os.path.realpath(root), os.path.realpath(candidate))) != os.path.realpath(root):
+        if os.path.commonpath((root, candidate)) != root or os.path.commonpath(
+            (os.path.realpath(root), os.path.realpath(candidate))
+        ) != os.path.realpath(root):
             raise ValueError(f"media path is outside its declared backup root: {value}")
     except ValueError as exc:
         raise ValueError(f"media path is outside its declared backup root: {value}") from exc
@@ -205,9 +223,7 @@ def archival_message_values(
     message_id = message.get("id")
     if message_id is None:
         raise ValueError("message has no id")
-    media_path = resolve_local_media_path(
-        backup_path, message.get("file") or message.get("photo")
-    )
+    media_path = resolve_local_media_path(backup_path, message.get("file") or message.get("photo"))
     text = flatten_telegram_text(message.get("text", ""))
     media_type = message.get("media_type")
     if not text and media_type:
@@ -227,29 +243,68 @@ def archival_message_values(
     else:
         media_status = None
     known = {
-        "id", "type", "date", "date_unixtime", "from", "actor", "from_id",
-        "actor_id", "text", "media_type", "file", "photo", "media_size",
-        "media_sha256", "media_skipped", "media_error", "reply_to_message_id",
-        "forwarded_from", "edited", "edit_date", "edit_date_unixtime",
-        "entities", "text_entities", "reactions", "reply_markup", "action",
-        "forward", "grouped_id", "raw_message",
+        "id",
+        "type",
+        "date",
+        "date_unixtime",
+        "from",
+        "actor",
+        "from_id",
+        "actor_id",
+        "text",
+        "media_type",
+        "file",
+        "photo",
+        "media_size",
+        "media_sha256",
+        "media_skipped",
+        "media_error",
+        "reply_to_message_id",
+        "forwarded_from",
+        "edited",
+        "edit_date",
+        "edit_date_unixtime",
+        "entities",
+        "text_entities",
+        "reactions",
+        "reply_markup",
+        "action",
+        "forward",
+        "grouped_id",
+        "raw_message",
     }
     extras = {key: value for key, value in message.items() if key not in known}
     raw = json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return (
-        int(message_id), chat_id, message.get("from") or message.get("actor") or "Unknown",
+        int(message_id),
+        chat_id,
+        message.get("from") or message.get("actor") or "Unknown",
         str(message.get("from_id") or message.get("actor_id"))
-        if message.get("from_id") is not None or message.get("actor_id") is not None else None,
-        timestamp, timestamp_unix, text, media_type, media_path,
-        message.get("reply_to_message_id"), message.get("forwarded_from"),
-        message.get("type"), edited, edit_unix, message.get("media_size"),
-        message.get("media_sha256"), media_status,
+        if message.get("from_id") is not None or message.get("actor_id") is not None
+        else None,
+        timestamp,
+        timestamp_unix,
+        text,
+        media_type,
+        media_path,
+        message.get("reply_to_message_id"),
+        message.get("forwarded_from"),
+        message.get("type"),
+        edited,
+        edit_unix,
+        message.get("media_size"),
+        message.get("media_sha256"),
+        media_status,
         str(message.get("grouped_id")) if message.get("grouped_id") is not None else None,
         _json_text(message.get("entities") or message.get("text_entities")),
-        _json_text(message.get("reactions")), _json_text(message.get("reply_markup")),
-        _json_text(message.get("action")), _json_text(message.get("forward")),
-        _json_text(extras) if extras else None, sqlite3.Binary(zlib.compress(raw, 9)),
-        source_key, source_format,
+        _json_text(message.get("reactions")),
+        _json_text(message.get("reply_markup")),
+        _json_text(message.get("action")),
+        _json_text(message.get("forward")),
+        _json_text(extras) if extras else None,
+        sqlite3.Binary(zlib.compress(raw, 9)),
+        source_key,
+        source_format,
     )
 
 
@@ -269,6 +324,7 @@ def upsert_archival_message(
         "INSERT OR IGNORE INTO message_sources(chat_id, message_id, source_key) VALUES (?, ?, ?)",
         (chat_id, int(message["id"]), source_key),
     )
+
 
 def parse_html_timestamp(ts_str: str) -> Tuple[Optional[str], Optional[int]]:
     """
@@ -291,6 +347,7 @@ def parse_html_timestamp(ts_str: str) -> Tuple[Optional[str], Optional[int]]:
     except Exception:
         pass
     return None, None
+
 
 def detect_media(url: str) -> Tuple[Optional[str], Optional[str]]:
     """
@@ -326,6 +383,7 @@ def detect_media(url: str) -> Tuple[Optional[str], Optional[str]]:
             return "animation", u
     return None, None
 
+
 def flatten_telegram_text(text_field: Any) -> str:
     """
     Convert rich Telegram JSON text formatting (strings and format dicts)
@@ -345,6 +403,7 @@ def flatten_telegram_text(text_field: Any) -> str:
         return "".join(parts)
     return ""
 
+
 def _extract_chat_name_from_messages_html(messages_html_path: str) -> Optional[str]:
     """
     Extract the chat title from messages.html header.
@@ -363,10 +422,12 @@ def _extract_chat_name_from_messages_html(messages_html_path: str) -> Optional[s
     raw = html.unescape(raw)
     return raw.strip() or None
 
+
 class TelegramHTMLParser(HTMLParser):
     """
     Optimized, high-performance HTML message parser for Telegram backup HTML files.
     """
+
     def __init__(self, on_message: Optional[Callable[[Dict[str, Any]], None]] = None):
         super().__init__()
         self.in_msg = False
@@ -385,9 +446,11 @@ class TelegramHTMLParser(HTMLParser):
         cls = attrs_dict.get("class", "") or ""
 
         # Detect start of message block
-        is_msg_div = (tag == "div" and
-                      ((" message " in f" {cls} ") or cls.startswith("message")) and
-                      attrs_dict.get("id", "").startswith("message"))
+        is_msg_div = (
+            tag == "div"
+            and ((" message " in f" {cls} ") or cls.startswith("message"))
+            and attrs_dict.get("id", "").startswith("message")
+        )
 
         if is_msg_div:
             self.flush_current()
@@ -480,11 +543,7 @@ class TelegramHTMLParser(HTMLParser):
             self.cur["text"].append(data)
 
     def flush_current(self):
-        if (
-            not self.cur
-            or self.cur.get("message_id") is None
-            or self.cur.get("is_day_separator")
-        ):
+        if not self.cur or self.cur.get("message_id") is None or self.cur.get("is_day_separator"):
             self.cur = None
             return
 
@@ -510,7 +569,7 @@ class TelegramHTMLParser(HTMLParser):
             "media_type": self.cur["media_type"],
             "media_path": self.cur["media_path"],
             "reply_to_id": self.cur["reply_to_id"],
-            "forwarded_from": self.cur["forwarded_from"]
+            "forwarded_from": self.cur["forwarded_from"],
         }
         if self.on_message is not None:
             self.on_message(record)
@@ -571,7 +630,9 @@ def create_post_load_indexes(conn: sqlite3.Connection):
 
     # Standard B-tree indexes for fast filtering and range querying
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp_unix);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_ts_id ON messages(chat_id, timestamp_unix, message_id);")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_chat_ts_id ON messages(chat_id, timestamp_unix, message_id);"
+    )
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp_unix);")
 
@@ -581,7 +642,9 @@ def create_post_load_indexes(conn: sqlite3.Connection):
     fts_columns = {str(row[1]) for row in cursor.execute("PRAGMA table_info(messages_fts)").fetchall()}
     if fts_columns and "media_path" not in fts_columns:
         cursor.execute("DROP TABLE IF EXISTS messages_fts;")
-    cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text, media_path, content='messages', content_rowid='id');")
+    cursor.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text, media_path, content='messages', content_rowid='id');"
+    )
 
     # Synchronization triggers for FTS5 (keeps it updated automatically for any future modifications)
     cursor.execute("DROP TRIGGER IF EXISTS messages_ai;")
@@ -636,7 +699,7 @@ def _parse_json_file_legacy(path: str, conn: sqlite3.Connection, batch_size: int
         if is_multi:
             # Multi-chat JSON export
             with open(path, "rb") as f:
-                chats = ijson.items(f, 'chats.list.item')
+                chats = ijson.items(f, "chats.list.item")
                 for chat in chats:
                     chat_id = str(chat.get("id"))
                     chat_name = chat.get("name") or chat.get("title") or f"chat_{chat_id}"
@@ -645,11 +708,11 @@ def _parse_json_file_legacy(path: str, conn: sqlite3.Connection, batch_size: int
                     backup_path = os.path.abspath(os.path.dirname(path))
                     cursor.execute(
                         "INSERT OR IGNORE INTO chats (chat_id, chat_name, chat_type, backup_path) VALUES (?, ?, ?, ?)",
-                        (chat_id, chat_name, chat_type, backup_path)
+                        (chat_id, chat_name, chat_type, backup_path),
                     )
                     cursor.execute(
                         "UPDATE chats SET backup_path = ? WHERE chat_id = ? AND backup_path IS NULL",
-                        (backup_path, chat_id)
+                        (backup_path, chat_id),
                     )
 
                     msgs = chat.get("messages", [])
@@ -681,14 +744,27 @@ def _parse_json_file_legacy(path: str, conn: sqlite3.Connection, batch_size: int
                                 pass
 
                         media_type = msg.get("media_type")
-                        media_path = resolve_local_media_path(backup_path, msg.get("file") or msg.get("photo"))
+                        media_path = resolve_local_media_path(
+                            backup_path, msg.get("file") or msg.get("photo")
+                        )
                         reply_to_id = msg.get("reply_to_message_id")
                         forwarded_from = msg.get("forwarded_from")
 
-                        messages_batch.append((
-                            msg_id, chat_id, sender, sender_id, ts_iso, ts_unix,
-                            text, media_type, media_path, reply_to_id, forwarded_from
-                        ))
+                        messages_batch.append(
+                            (
+                                msg_id,
+                                chat_id,
+                                sender,
+                                sender_id,
+                                ts_iso,
+                                ts_unix,
+                                text,
+                                media_type,
+                                media_path,
+                                reply_to_id,
+                                forwarded_from,
+                            )
+                        )
 
                         if len(messages_batch) >= batch_size:
                             total_inserted += upsert_message_batch(cursor, messages_batch)
@@ -707,15 +783,15 @@ def _parse_json_file_legacy(path: str, conn: sqlite3.Connection, batch_size: int
             backup_path = os.path.abspath(os.path.dirname(path))
             cursor.execute(
                 "INSERT OR IGNORE INTO chats (chat_id, chat_name, chat_type, backup_path) VALUES (?, ?, ?, ?)",
-                (chat_id, chat_name, "personal_chat", backup_path)
+                (chat_id, chat_name, "personal_chat", backup_path),
             )
             cursor.execute(
                 "UPDATE chats SET backup_path = ? WHERE chat_id = ? AND backup_path IS NULL",
-                (backup_path, chat_id)
+                (backup_path, chat_id),
             )
 
             with open(path, "rb") as f:
-                msgs = ijson.items(f, 'messages.item')
+                msgs = ijson.items(f, "messages.item")
                 for msg in msgs:
                     if not isinstance(msg, dict):
                         continue
@@ -748,10 +824,21 @@ def _parse_json_file_legacy(path: str, conn: sqlite3.Connection, batch_size: int
                     reply_to_id = msg.get("reply_to_message_id")
                     forwarded_from = msg.get("forwarded_from")
 
-                    messages_batch.append((
-                        msg_id, chat_id, sender, sender_id, ts_iso, ts_unix,
-                        text, media_type, media_path, reply_to_id, forwarded_from
-                    ))
+                    messages_batch.append(
+                        (
+                            msg_id,
+                            chat_id,
+                            sender,
+                            sender_id,
+                            ts_iso,
+                            ts_unix,
+                            text,
+                            media_type,
+                            media_path,
+                            reply_to_id,
+                            forwarded_from,
+                        )
+                    )
 
                     if len(messages_batch) >= batch_size:
                         total_inserted += upsert_message_batch(cursor, messages_batch)
@@ -780,11 +867,11 @@ def _parse_json_file_legacy(path: str, conn: sqlite3.Connection, batch_size: int
                 backup_path = os.path.abspath(os.path.dirname(path))
                 cursor.execute(
                     "INSERT OR IGNORE INTO chats (chat_id, chat_name, chat_type, backup_path) VALUES (?, ?, ?, ?)",
-                    (chat_id, chat_name, chat_type, backup_path)
+                    (chat_id, chat_name, chat_type, backup_path),
                 )
                 cursor.execute(
                     "UPDATE chats SET backup_path = ? WHERE chat_id = ? AND backup_path IS NULL",
-                    (backup_path, chat_id)
+                    (backup_path, chat_id),
                 )
 
                 msgs = chat.get("messages", [])
@@ -813,10 +900,21 @@ def _parse_json_file_legacy(path: str, conn: sqlite3.Connection, batch_size: int
                     reply_to_id = msg.get("reply_to_message_id")
                     forwarded_from = msg.get("forwarded_from")
 
-                    messages_batch.append((
-                        msg_id, chat_id, sender, sender_id, ts_iso, ts_unix,
-                        text, media_type, media_path, reply_to_id, forwarded_from
-                    ))
+                    messages_batch.append(
+                        (
+                            msg_id,
+                            chat_id,
+                            sender,
+                            sender_id,
+                            ts_iso,
+                            ts_unix,
+                            text,
+                            media_type,
+                            media_path,
+                            reply_to_id,
+                            forwarded_from,
+                        )
+                    )
 
                     if len(messages_batch) >= batch_size:
                         total_inserted += upsert_message_batch(cursor, messages_batch)
@@ -828,11 +926,11 @@ def _parse_json_file_legacy(path: str, conn: sqlite3.Connection, batch_size: int
             backup_path = os.path.abspath(os.path.dirname(path))
             cursor.execute(
                 "INSERT OR IGNORE INTO chats (chat_id, chat_name, chat_type, backup_path) VALUES (?, ?, ?, ?)",
-                (chat_id, chat_name, "personal_chat", backup_path)
+                (chat_id, chat_name, "personal_chat", backup_path),
             )
             cursor.execute(
                 "UPDATE chats SET backup_path = ? WHERE chat_id = ? AND backup_path IS NULL",
-                (backup_path, chat_id)
+                (backup_path, chat_id),
             )
 
             msgs = data.get("messages", [])
@@ -861,10 +959,21 @@ def _parse_json_file_legacy(path: str, conn: sqlite3.Connection, batch_size: int
                 reply_to_id = msg.get("reply_to_message_id")
                 forwarded_from = msg.get("forwarded_from")
 
-                messages_batch.append((
-                    msg_id, chat_id, sender, sender_id, ts_iso, ts_unix,
-                    text, media_type, media_path, reply_to_id, forwarded_from
-                ))
+                messages_batch.append(
+                    (
+                        msg_id,
+                        chat_id,
+                        sender,
+                        sender_id,
+                        ts_iso,
+                        ts_unix,
+                        text,
+                        media_type,
+                        media_path,
+                        reply_to_id,
+                        forwarded_from,
+                    )
+                )
 
                 if len(messages_batch) >= batch_size:
                     total_inserted += upsert_message_batch(cursor, messages_batch)
@@ -898,7 +1007,9 @@ def infer_json_identity(path: str, root_path: Optional[str] = None) -> Tuple[str
             pass
     if root_path:
         relative = os.path.relpath(chat_root, os.path.abspath(root_path))
-        chat_id = relative.replace(os.sep, "/") if not relative.startswith("..") else os.path.basename(chat_root)
+        chat_id = (
+            relative.replace(os.sep, "/") if not relative.startswith("..") else os.path.basename(chat_root)
+        )
     else:
         chat_id = os.path.basename(chat_root)
     return chat_id or "single_chat", os.path.basename(chat_root) or "Single Chat", chat_root
@@ -990,8 +1101,10 @@ def parse_json_file_archival(
     except ImportError:
         with open(path, "r", encoding="utf-8") as handle:
             probe = json.load(handle)
-        is_multi = isinstance(probe, dict) and isinstance(probe.get("chats"), dict) and isinstance(
-            probe.get("chats", {}).get("list"), list
+        is_multi = (
+            isinstance(probe, dict)
+            and isinstance(probe.get("chats"), dict)
+            and isinstance(probe.get("chats", {}).get("list"), list)
         )
     else:
         is_multi = False
@@ -1042,13 +1155,15 @@ def parse_json_file(path: str, conn: sqlite3.Connection, batch_size: int = 50000
     """Public one-file importer using the canonical rich/provenance path."""
     source_key = archive_source_file(conn, path, "json", archive_payload=False)
     try:
-        imported, chat_ids = parse_json_file_archival(
-            path, conn, batch_size, source_key=source_key
-        )
+        imported, chat_ids = parse_json_file_archival(path, conn, batch_size, source_key=source_key)
         record_import(
-            conn, source_key, "json", path,
+            conn,
+            source_key,
+            "json",
+            path,
             next(iter(chat_ids)) if len(chat_ids) == 1 else None,
-            imported, imported,
+            imported,
+            imported,
         )
         conn.execute(
             "UPDATE backup_sources SET message_count=? WHERE source_key=?",
@@ -1082,11 +1197,10 @@ def parse_html_file(
     backup_path = os.path.abspath(chat_root)
     cursor.execute(
         "INSERT OR IGNORE INTO chats (chat_id, chat_name, chat_type, backup_path) VALUES (?, ?, ?, ?)",
-        (chat_id, chat_name, "personal_chat" if chat_id == "single_chat" else "unknown", backup_path)
+        (chat_id, chat_name, "personal_chat" if chat_id == "single_chat" else "unknown", backup_path),
     )
     cursor.execute(
-        "UPDATE chats SET backup_path = ? WHERE chat_id = ? AND backup_path IS NULL",
-        (backup_path, chat_id)
+        "UPDATE chats SET backup_path = ? WHERE chat_id = ? AND backup_path IS NULL", (backup_path, chat_id)
     )
 
     messages_batch: list[tuple[Any, ...]] = []
@@ -1113,12 +1227,21 @@ def parse_html_file(
 
     def consume_message(msg: Dict[str, Any]) -> None:
         message_id = int(msg["message_id"])
-        messages_batch.append((
-            message_id, chat_id, msg["sender"], msg["sender_id"],
-            msg["timestamp"], msg["timestamp_unix"], msg["text"],
-            msg["media_type"], resolve_local_media_path(parent_dir, msg["media_path"]),
-            msg["reply_to_id"], msg["forwarded_from"],
-        ))
+        messages_batch.append(
+            (
+                message_id,
+                chat_id,
+                msg["sender"],
+                msg["sender_id"],
+                msg["timestamp"],
+                msg["timestamp_unix"],
+                msg["text"],
+                msg["media_type"],
+                resolve_local_media_path(parent_dir, msg["media_path"]),
+                msg["reply_to_id"],
+                msg["forwarded_from"],
+            )
+        )
         message_ids.append(message_id)
         if len(messages_batch) >= batch_size:
             flush_batch()
@@ -1227,11 +1350,11 @@ def parse_sqlite_backup_file(
             backup_path = os.path.abspath(os.path.dirname(path))
             dest_cursor.execute(
                 "INSERT OR IGNORE INTO chats (chat_id, chat_name, chat_type, backup_path) VALUES (?, ?, ?, ?)",
-                (chat_id, chat_name, "personal_chat" if stype == "dialog" else "group", backup_path)
+                (chat_id, chat_name, "personal_chat" if stype == "dialog" else "group", backup_path),
             )
             dest_cursor.execute(
                 "UPDATE chats SET backup_path = ? WHERE chat_id = ? AND backup_path IS NULL",
-                (backup_path, chat_id)
+                (backup_path, chat_id),
             )
     except Exception:
         pass
@@ -1243,8 +1366,15 @@ def parse_sqlite_backup_file(
         raise RuntimeError(f"unsupported SQLite messages schema; missing {sorted(needed - m_cols)}")
 
     optional = [
-        "media_type", "media_file", "message_type", "fwd_from_id", "media_size",
-        "media_json", "markup_json", "data", "api_layer",
+        "media_type",
+        "media_file",
+        "message_type",
+        "fwd_from_id",
+        "media_size",
+        "media_json",
+        "markup_json",
+        "data",
+        "api_layer",
     ]
     selected_optional = [name if name in m_cols else f"NULL AS {name}" for name in optional]
     src_cursor.execute(
@@ -1258,8 +1388,15 @@ def parse_sqlite_backup_file(
     for row in src_cursor:
         mid, sid, stype, sender_id, text, t_val = row[0], row[1], row[2], row[3], row[4], row[5]
         (
-            mtype, mfile, message_type, fwd_from_id, media_size, media_json,
-            markup_json, raw_data, api_layer,
+            mtype,
+            mfile,
+            message_type,
+            fwd_from_id,
+            media_size,
+            media_json,
+            markup_json,
+            raw_data,
+            api_layer,
         ) = row[6:15]
 
         if mid is None or sid is None:
@@ -1287,9 +1424,13 @@ def parse_sqlite_backup_file(
                 mapped_mtype = "photo"
             elif mt_l == "document" and mfile:
                 mfile_l = mfile.lower()
-                if mfile_l.startswith("t_voice") or any(mfile_l.endswith(ext) for ext in (".ogg", ".wav", ".m4a", ".mp3", ".flac")):
+                if mfile_l.startswith("t_voice") or any(
+                    mfile_l.endswith(ext) for ext in (".ogg", ".wav", ".m4a", ".mp3", ".flac")
+                ):
                     mapped_mtype = "voice_message"
-                elif mfile_l.startswith("t_video") or any(mfile_l.endswith(ext) for ext in (".mp4", ".gif", ".3gp", ".avi", ".mov", ".mkv")):
+                elif mfile_l.startswith("t_video") or any(
+                    mfile_l.endswith(ext) for ext in (".mp4", ".gif", ".3gp", ".avi", ".mov", ".mkv")
+                ):
                     mapped_mtype = "video"
                 else:
                     mapped_mtype = "file"
@@ -1315,9 +1456,7 @@ def parse_sqlite_backup_file(
             "unofficial_api_layer": api_layer,
         }
         if source_key:
-            upsert_archival_message(
-                conn, chat_id, message, backup_path, source_key, "sqlite"
-            )
+            upsert_archival_message(conn, chat_id, message, backup_path, source_key, "sqlite")
             if raw_data is not None:
                 raw_bytes = bytes(raw_data)
                 conn.execute(
@@ -1325,11 +1464,21 @@ def parse_sqlite_backup_file(
                     (sqlite3.Binary(zlib.compress(raw_bytes, 9)), chat_id, int(mid)),
                 )
         else:
-            messages_batch.append((
-                int(mid), chat_id, sender, sender_id_s, ts_iso, ts_unix,
-                str(text).strip() if text else "", mapped_mtype, mpath, None,
-                str(fwd_from_id) if fwd_from_id is not None else None,
-            ))
+            messages_batch.append(
+                (
+                    int(mid),
+                    chat_id,
+                    sender,
+                    sender_id_s,
+                    ts_iso,
+                    ts_unix,
+                    str(text).strip() if text else "",
+                    mapped_mtype,
+                    mpath,
+                    None,
+                    str(fwd_from_id) if fwd_from_id is not None else None,
+                )
+            )
             if len(messages_batch) >= batch_size:
                 total_inserted += upsert_message_batch(dest_cursor, messages_batch)
                 messages_batch.clear()
@@ -1385,6 +1534,8 @@ def index_backup_folder(
 
     log_fn(f"Initializing target database at: {db_path}...")
     conn = setup_database(db_path)
+    operation_id = uuid.uuid4().hex
+    build = build_identity()
 
     json_files = []
     html_files = []
@@ -1393,10 +1544,12 @@ def index_backup_folder(
     log_fn("Scanning backup directory recursively...")
     for dirpath, dirnames, filenames in os.walk(root_path):
         dirnames[:] = [
-            name for name in dirnames
-            if not name.startswith(".partial-") and not name.startswith(".dry-run-")
+            name for name in dirnames if not name.startswith(".partial-") and not name.startswith(".dry-run-")
         ]
-        if any(exc in dirpath.replace("\\", "/").split("/") for exc in ("css", "js", "profile_pictures", ".git", ".venv")):
+        if any(
+            exc in dirpath.replace("\\", "/").split("/")
+            for exc in ("css", "js", "profile_pictures", ".git", ".venv")
+        ):
             continue
 
         for fn in filenames:
@@ -1411,7 +1564,9 @@ def index_backup_folder(
                 sqlite_files.append(full_p)
 
     total_files = len(json_files) + len(html_files) + len(sqlite_files)
-    log_fn(f"Discovered {len(json_files)} JSON export files, {len(html_files)} HTML message files, and {len(sqlite_files)} SQLite files.")
+    log_fn(
+        f"Discovered {len(json_files)} JSON export files, {len(html_files)} HTML message files, and {len(sqlite_files)} SQLite files."
+    )
 
     total_messages = 0
     processed_count = 0
@@ -1422,17 +1577,13 @@ def index_backup_folder(
         processed_count += 1
         log_fn(f"[{processed_count}/{total_files}] Ingesting JSON: {os.path.basename(p)}...")
         try:
-            source_key = archive_source_file(
-                conn, p, "json", archive_payload=archive_sources
-            )
+            source_key = archive_source_file(conn, p, "json", archive_payload=archive_sources)
             already_imported = _completed_source_import(conn, source_key)
             if already_imported is not None:
                 total_messages += already_imported
                 log_fn(f"  -> Already indexed {already_imported} messages; reusing completed source.")
                 continue
-            n, chat_ids = parse_json_file_archival(
-                p, conn, root_path=root_path, source_key=source_key
-            )
+            n, chat_ids = parse_json_file_archival(p, conn, root_path=root_path, source_key=source_key)
             record_import(
                 conn,
                 source_key,
@@ -1461,22 +1612,16 @@ def index_backup_folder(
         processed_count += 1
         log_fn(f"[{processed_count}/{total_files}] Ingesting HTML: {os.path.relpath(p, root_path)}...")
         try:
-            source_key = archive_source_file(
-                conn, p, "html", archive_payload=archive_sources
-            )
+            source_key = archive_source_file(conn, p, "html", archive_payload=archive_sources)
             expected = expected_html_messages(p)
             already_imported = _completed_source_import(conn, source_key, expected)
             if already_imported is not None:
                 total_messages += already_imported
                 log_fn(f"  -> Already indexed {already_imported} messages; reusing completed source.")
                 continue
-            n = parse_html_file(
-                p, conn, root_path=root_path, source_key=source_key
-            )
+            n = parse_html_file(p, conn, root_path=root_path, source_key=source_key)
             if n != expected:
-                raise RuntimeError(
-                    f"HTML coverage mismatch: expected {expected} real messages, parsed {n}"
-                )
+                raise RuntimeError(f"HTML coverage mismatch: expected {expected} real messages, parsed {n}")
             chat_id, _chat_name, _chat_root = infer_html_identity(p, root_path)
             record_import(conn, source_key, "html", p, chat_id, expected, n)
             conn.execute(
@@ -1498,15 +1643,13 @@ def index_backup_folder(
         processed_count += 1
         log_fn(f"[{processed_count}/{total_files}] Ingesting SQLite: {os.path.basename(p)}...")
         try:
-            source_key = archive_source_file(
-                conn, p, "sqlite", archive_payload=archive_sources
-            )
+            source_key = archive_source_file(conn, p, "sqlite", archive_payload=archive_sources)
             with sqlite3.connect(f"file:{p}?mode=ro", uri=True) as source_conn:
                 expected = int(
                     source_conn.execute(
                         "SELECT count(*) FROM messages WHERE source_id IS NOT NULL AND source_type IS NOT NULL"
                     ).fetchone()[0]
-                    )
+                )
             already_imported = _completed_source_import(conn, source_key, expected)
             if already_imported is not None:
                 total_messages += already_imported
@@ -1538,9 +1681,11 @@ def index_backup_folder(
     cursor = conn.cursor()
     # Invalidate GUI stats cache in database if those columns exist
     try:
-        cursor.execute("UPDATE chats SET min_msg_id = NULL, max_msg_id = NULL, msg_count = NULL, min_timestamp = NULL, max_timestamp = NULL, min_timestamp_unix = NULL, max_timestamp_unix = NULL;")
+        cursor.execute(
+            "UPDATE chats SET min_msg_id = NULL, max_msg_id = NULL, msg_count = NULL, min_timestamp = NULL, max_timestamp = NULL, min_timestamp_unix = NULL, max_timestamp_unix = NULL;"
+        )
     except sqlite3.OperationalError:
-        pass # Columns don't exist yet in the database (GUI hasn't run yet)
+        pass  # Columns don't exist yet in the database (GUI hasn't run yet)
 
     # Invalidate clusters JSON cache if it exists
     clusters_path = db_path
@@ -1555,13 +1700,37 @@ def index_backup_folder(
             pass
 
     cursor.execute("SELECT count(*) FROM chats;")
-    chats_count = cursor.fetchone()[0];
-
+    chats_count = cursor.fetchone()[0]
     cursor.execute("SELECT count(*) FROM messages;")
     msgs_count = cursor.fetchone()[0]
 
     # The denormalized-stat invalidation above is a real write; commit it
     # before closing so a successful import cannot leave stale cached ranges.
+    ingest_status = "failed" if ingest_errors else "completed"
+    append_diagnostic_event(
+        conn,
+        event_id=f"{operation_id}:finished",
+        event_type="database_import_finished",
+        component="database-importer",
+        level="error" if ingest_errors else "info",
+        operation_id=operation_id,
+        run_key=None,
+        target_key=None,
+        status=ingest_status,
+        details_json=json.dumps(
+            {
+                "root": root_path,
+                "files": total_files,
+                "chats": chats_count,
+                "messages": msgs_count,
+                "errors": ingest_errors[:5],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        build_revision=str(build.get("revision", "unknown")),
+        event_unix=int(time.time()),
+    )
     conn.commit()
     conn.close()
 
@@ -1590,14 +1759,19 @@ def verify_database_archive(
         if integrity != ["ok"]:
             errors.append(f"SQLite integrity_check failed: {integrity[:3]}")
         tables = {
-            str(row[0]) for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
-            )
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")
         }
         required_tables = {
-            "chats", "messages", "backup_sources", "backup_import_files",
-            "message_sources", "message_source_media", "telegram_entity_snapshots",
-            "telegram_message_entity_refs", "telegram_chat_entity_refs",
+            "chats",
+            "messages",
+            "backup_sources",
+            "backup_import_files",
+            "message_sources",
+            "message_source_media",
+            "telegram_entity_snapshots",
+            "telegram_message_entity_refs",
+            "telegram_chat_entity_refs",
             "telegram_chat_snapshot_sources",
         }
         missing_tables = sorted(required_tables - tables)
@@ -1607,9 +1781,7 @@ def verify_database_archive(
                 + ", ".join(missing_tables)
             )
             return errors
-        message_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")
-        }
+        message_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")}
         required_message_columns = {
             "raw_payload",
             "raw_tl_payload",
@@ -1651,18 +1823,14 @@ def verify_database_archive(
                WHERE m.id IS NULL"""
         ).fetchone()[0]
         if orphan_message_entities:
-            errors.append(
-                f"{orphan_message_entities} entity reference(s) refer to absent messages"
-            )
+            errors.append(f"{orphan_message_entities} entity reference(s) refer to absent messages")
         orphan_chat_entities = conn.execute(
             """SELECT count(*) FROM telegram_chat_entity_refs AS r
                LEFT JOIN chats AS c ON c.chat_id=r.chat_id
                WHERE c.chat_id IS NULL"""
         ).fetchone()[0]
         if orphan_chat_entities:
-            errors.append(
-                f"{orphan_chat_entities} entity reference(s) refer to absent chats"
-            )
+            errors.append(f"{orphan_chat_entities} entity reference(s) refer to absent chats")
         orphan_chat_snapshot_sources = conn.execute(
             """SELECT count(*) FROM telegram_chat_snapshot_sources AS s
                LEFT JOIN chats AS c ON c.chat_id=s.chat_id
@@ -1673,9 +1841,7 @@ def verify_database_archive(
                WHERE c.chat_id IS NULL OR r.snapshot_sha256 IS NULL"""
         ).fetchone()[0]
         if orphan_chat_snapshot_sources:
-            errors.append(
-                f"{orphan_chat_snapshot_sources} API-run chat snapshot link(s) are orphaned"
-            )
+            errors.append(f"{orphan_chat_snapshot_sources} API-run chat snapshot link(s) are orphaned")
         if require_archived_sources:
             unprovenanced = conn.execute(
                 """SELECT count(*) FROM messages AS m WHERE NOT EXISTS (
@@ -1732,22 +1898,31 @@ def verify_database_archive(
                         f"FTS row count {fts_count} does not match messages row count {message_count}"
                     )
                 trigger_names = {
-                    str(row[0]) for row in conn.execute(
+                    str(row[0])
+                    for row in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('messages_ai','messages_ad','messages_au')"
                     )
                 }
                 missing_triggers = {"messages_ai", "messages_ad", "messages_au"} - trigger_names
                 if missing_triggers:
-                    errors.append(f"FTS synchronization trigger(s) missing: {', '.join(sorted(missing_triggers))}")
+                    errors.append(
+                        f"FTS synchronization trigger(s) missing: {', '.join(sorted(missing_triggers))}"
+                    )
                 sample = conn.execute(
                     "SELECT text FROM messages WHERE text IS NOT NULL AND trim(text) != '' LIMIT 1"
                 ).fetchone()
                 if sample:
                     token = re.search(r"[\w]{3,}", str(sample[0]), flags=re.UNICODE)
-                    if token and int(conn.execute(
-                        "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?",
-                        (f'"{token.group(0)}"',),
-                    ).fetchone()[0]) == 0:
+                    if (
+                        token
+                        and int(
+                            conn.execute(
+                                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?",
+                                (f'"{token.group(0)}"',),
+                            ).fetchone()[0]
+                        )
+                        == 0
+                    ):
                         errors.append("FTS index contains no searchable term for a non-empty message")
             except sqlite3.DatabaseError as exc:
                 errors.append(f"FTS integrity check failed: {exc}")
@@ -1780,12 +1955,8 @@ def verify_database_archive(
                     try:
                         manifest = json.loads(decoded)
                         run_key = str(manifest["run_key"])
-                        metadata_schema_version = int(
-                            manifest.get("metadata_schema_version") or 0
-                        )
-                        chat_metadata_schema_version = int(
-                            manifest.get("chat_metadata_schema_version") or 0
-                        )
+                        metadata_schema_version = int(manifest.get("metadata_schema_version") or 0)
+                        chat_metadata_schema_version = int(manifest.get("chat_metadata_schema_version") or 0)
                         chat_snapshot_sha256 = manifest.get("chat_snapshot_sha256") or {}
                         if not isinstance(chat_snapshot_sha256, dict):
                             raise ValueError("chat_snapshot_sha256 is not an object")
@@ -1795,7 +1966,11 @@ def verify_database_archive(
                     api_metadata_versions[str(source["source_key"])] = metadata_schema_version
                     digest = hashlib.sha256()
                     count = 0
-                    archive_table = "telegram_backup_run_records" if "telegram_backup_run_records" in tables else "telegram_backup_run_messages"
+                    archive_table = (
+                        "telegram_backup_run_records"
+                        if "telegram_backup_run_records" in tables
+                        else "telegram_backup_run_messages"
+                    )
                     for row in conn.execute(
                         f"SELECT record_json FROM {archive_table} WHERE run_key=? ORDER BY message_id",
                         (run_key,),
@@ -1811,8 +1986,7 @@ def verify_database_archive(
                                 verify_record_metadata(json.loads(record_json))
                             except Exception as exc:
                                 errors.append(
-                                    f"Telegram API metadata record is incomplete "
-                                    f"({run_key}): {exc}"
+                                    f"Telegram API metadata record is incomplete ({run_key}): {exc}"
                                 )
                     if digest.hexdigest() != source["content_sha256"]:
                         errors.append(f"Telegram API run hash mismatch: {run_key}")
@@ -1827,9 +2001,7 @@ def verify_database_archive(
                             errors.append(f"Telegram API run has no chat identity: {run_key}")
                         else:
                             required_roles = (
-                                {"entity", "full"}
-                                if chat_metadata_schema_version >= 1
-                                else {"entity"}
+                                {"entity", "full"} if chat_metadata_schema_version >= 1 else {"entity"}
                             )
                             captured_snapshots = {
                                 (str(row[0]), str(row[1]))
@@ -1847,12 +2019,11 @@ def verify_database_archive(
                                     if (
                                         role,
                                         str(chat_snapshot_sha256.get(role) or ""),
-                                    ) not in captured_snapshots
+                                    )
+                                    not in captured_snapshots
                                 }
                             else:
-                                captured_roles = {
-                                    role for role, _snapshot in captured_snapshots
-                                }
+                                captured_roles = {role for role, _snapshot in captured_snapshots}
                                 missing_roles = required_roles - captured_roles
                             if missing_roles:
                                 errors.append(
@@ -1878,24 +2049,24 @@ def verify_database_archive(
                 record = json.loads(zlib.decompress(bytes(row["raw_payload"])))
                 verify_record_metadata(record)
                 envelope = record["raw_message_tl"]
-                envelope_tl = base64.b64decode(
-                    str(envelope["tl_data"]), validate=True
-                )
+                envelope_tl = base64.b64decode(str(envelope["tl_data"]), validate=True)
                 if envelope_tl != bytes(row["raw_tl_payload"]):
                     raise ValueError("stored TL payload differs from archival record")
                 if int(row["raw_tl_layer"]) != int(envelope["telethon_layer"]):
                     raise ValueError("stored Telegram layer differs from archival record")
                 if str(row["raw_tl_library"]) != str(envelope["telethon_version"]):
                     raise ValueError("stored Telethon version differs from archival record")
-                if record.get("expanded_metadata") != json.loads(
-                    str(row["expanded_metadata_json"])
-                ):
+                if record.get("expanded_metadata") != json.loads(str(row["expanded_metadata_json"])):
                     raise ValueError("expanded metadata differs from archival record")
-                if record.get("sender_entity_status") == "complete" and conn.execute(
-                    """SELECT 1 FROM telegram_message_entity_refs
+                if (
+                    record.get("sender_entity_status") == "complete"
+                    and conn.execute(
+                        """SELECT 1 FROM telegram_message_entity_refs
                        WHERE chat_id=? AND message_id=? AND role='sender' LIMIT 1""",
-                    (row["chat_id"], row["message_id"]),
-                ).fetchone() is None:
+                        (row["chat_id"], row["message_id"]),
+                    ).fetchone()
+                    is None
+                ):
                     raise ValueError("complete sender entity has no database reference")
             except Exception as exc:
                 errors.append(
@@ -1914,9 +2085,7 @@ def verify_database_archive(
         ):
             payload = bytes(row["raw_tl_payload"])
             if hashlib.sha256(payload).hexdigest() != row["raw_tl_sha256"]:
-                errors.append(
-                    f"raw Telegram TL hash mismatch: {row['chat_id']}/{row['message_id']}"
-                )
+                errors.append(f"raw Telegram TL hash mismatch: {row['chat_id']}/{row['message_id']}")
         for row in conn.execute(
             """SELECT snapshot_sha256, entity_json, tl_payload, tl_sha256,
                       telethon_layer, telethon_version
@@ -1931,13 +2100,9 @@ def verify_database_archive(
             if digest != row["snapshot_sha256"]:
                 errors.append(f"Telegram entity snapshot hash mismatch: {row['snapshot_sha256']}")
             if row["tl_payload"] is not None and (
-                digest != row["tl_sha256"]
-                or row["telethon_layer"] is None
-                or not row["telethon_version"]
+                digest != row["tl_sha256"] or row["telethon_layer"] is None or not row["telethon_version"]
             ):
-                errors.append(
-                    f"Telegram entity TL metadata is incomplete: {row['snapshot_sha256']}"
-                )
+                errors.append(f"Telegram entity TL metadata is incomplete: {row['snapshot_sha256']}")
 
         if check_media:
             for row in conn.execute(
@@ -1979,6 +2144,9 @@ def verify_database_archive(
 def main(argv: Optional[List[str]] = None) -> int:
     """Run the legacy-export importer or canonical database verifier."""
     import argparse
+
+    install_runtime_hooks()
+    recorder = DiagnosticRecorder()
 
     class _Ansi:
         RESET = "\033[0m"
@@ -2040,6 +2208,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             require_complete_metadata=args.require_complete_metadata,
         )
         if problems:
+            recorder.emit(
+                DiagnosticEvent(
+                    event="database_verify_failed",
+                    component="database-importer",
+                    level="error",
+                    fields={"problem_count": len(problems), "first_problem": problems[0]},
+                )
+            )
             for problem in problems:
                 print(_c(f"ERROR: {problem}", _Ansi.RED), file=sys.stderr)
             return 4
@@ -2064,7 +2240,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(_c(f"Successfully indexed {msgs_count} messages across {chats_count} chats.", _Ansi.GREEN))
         return 0
     except Exception as e:
-        print(_c(f"Database ingestion failed: {e}", _Ansi.RED), file=sys.stderr)
+        details = exception_details(e, phase="database-import", fields={"path": root, "db": db_path})
+        recorder.emit(
+            DiagnosticEvent(
+                event="database_import_failed",
+                component="database-importer",
+                level="error",
+                fields={"error": details},
+            )
+        )
+        print(_c(f"Database ingestion failed [{type(e).__name__}]: {e}", _Ansi.RED), file=sys.stderr)
         return 3
 
 

@@ -1403,6 +1403,14 @@ class IncrementalExporterTests(unittest.TestCase):
                 VALUES ('run-key', 'purge-key', 'chat_purge', 'failed', 1)"""
             )
             conn.execute(
+                """UPDATE telegram_backup_runs SET error='old error' WHERE run_key='run-key'"""
+            )
+            conn.execute(
+                """INSERT INTO telegram_backup_run_attempts
+                (attempt_key, run_key, started_unix, status, error)
+                VALUES ('attempt-key', 'run-key', 1, 'failed', 'attempt error')"""
+            )
+            conn.execute(
                 """INSERT INTO telegram_backup_run_messages
                 (run_key, message_id, record_json) VALUES ('run-key', 99, '{}')"""
             )
@@ -1469,7 +1477,33 @@ class IncrementalExporterTests(unittest.TestCase):
             self.assertFalse(remapped.enabled)
             self.assertEqual(exporter.materialize_unbacked_target_chats(conn), (0, 0))
             self.assertEqual(conn.execute("SELECT count(*) FROM telegram_backup_target_chats").fetchone()[0], 0)
-            self.assertEqual(conn.execute("SELECT count(*) FROM telegram_backup_runs").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM telegram_backup_runs").fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT status FROM telegram_backup_runs WHERE run_key='run-key'"
+                ).fetchone()[0],
+                "failed",
+            )
+            purge_provenance = conn.execute(
+                "SELECT purged_unix, purge_key, error FROM telegram_backup_runs WHERE run_key='run-key'"
+            ).fetchone()
+            self.assertIsNotNone(purge_provenance[0])
+            self.assertIsNotNone(purge_provenance[1])
+            self.assertEqual(purge_provenance[2], "old error")
+            attempt_provenance = conn.execute(
+                "SELECT status, purged_unix, purge_key, error FROM telegram_backup_run_attempts "
+                "WHERE attempt_key='attempt-key'"
+            ).fetchone()
+            self.assertEqual(attempt_provenance[0], "failed")
+            self.assertIsNotNone(attempt_provenance[1])
+            self.assertIsNotNone(attempt_provenance[2])
+            self.assertEqual(attempt_provenance[3], "attempt error")
+            self.assertIsNotNone(
+                conn.execute(
+                    "SELECT 1 FROM telegram_backup_diagnostic_events "
+                    "WHERE event_type='chat_purge_database_committed'"
+                ).fetchone()
+            )
             self.assertEqual(conn.execute("SELECT count(*) FROM telegram_backup_exports").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT count(*) FROM telegram_message_entity_refs").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT count(*) FROM telegram_chat_entity_refs").fetchone()[0], 0)

@@ -16,6 +16,8 @@ jobs:
       - run: uv run python -m unittest discover -s tests -p 'test_*.py'
       - run: uv run ruff check src tests --select E9,F63,F7,F82
       - run: uv run python -m compileall -q src tests
+      - run: uv run python -m compileall -q tools
+      - run: uv run python tools/benchmark_diagnostics.py --messages 10000 --repeats 2
       - run: uv run python -c "import tgbackup.database.overlap_report"
 
   rust:
@@ -23,9 +25,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
       - run: cargo fmt --manifest-path tgsearch/Cargo.toml -- --check
       - run: cargo fmt --manifest-path tgbackman/Cargo.toml -- --check
       - run: cargo test --locked --manifest-path tgsearch/Cargo.toml
       - run: cargo test --locked --manifest-path tgbackman/Cargo.toml -- --skip test_run_inventory_performance --skip test_compute_media_stats_split_and_unofficial
       - run: cargo clippy --locked --manifest-path tgsearch/Cargo.toml --all-targets
       - run: cargo clippy --locked --manifest-path tgbackman/Cargo.toml --all-targets
+      - run: cargo build --locked --release --manifest-path tgbackman/Cargo.toml
+      - run: readelf -n tgbackman/target/release/tgbackman | grep -q 'Build ID'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tgbackman-release-${{ github.sha }}
+          path: tgbackman/target/release/tgbackman
+          if-no-files-found: error
